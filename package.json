@@ -16,7 +16,7 @@
   "dependencies": {
     "@capacitor/android": "^6.2.1",
     "@capacitor/core": "^6.2.1",
-    "@codetrix-studio/capacitor-google-auth": "^3.4.0",
+    "@codetrix-studio/capacitor-google-auth": "^3.3.0",
     "@deepgram/sdk": "^3.11.0",
     "@ffmpeg/ffmpeg": "^0.12.10",
     "@ffmpeg/util": "^0.12.1",
