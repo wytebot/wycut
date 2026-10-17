@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "audit:files": "node scripts/audit-files.mjs",
     "build:capacitor-web": "node scripts/build-capacitor-web.mjs",
-    "android:debug": "node scripts/build-android.mjs"
+    "android:debug": "node scripts/build-android.mjs",
+    "audit:pwa": "node scripts/audit-pwa.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^6.2.1",

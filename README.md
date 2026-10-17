@@ -114,3 +114,15 @@ The checkout, order ownership, PIN/OTP continuation, verified settlement, idempo
 - `/acceptable-use` — Acceptable Use Policy
 
 Page source files live separately under `app/`. Matching Markdown handoff copies live in `legal/`. These are launch templates; add a monitored support contact and have the terms reviewed for your business and markets before live payments.
+
+## Progressive Web App (PWA)
+
+WyCut includes a web app manifest, generated app icons (including maskable Android icons and an Apple touch icon), an install prompt, and a service worker. Deploy the app over HTTPS for installation; service workers do not work on ordinary insecure origins (localhost is allowed for development).
+
+- Manifest: `public/manifest.webmanifest`
+- Service worker: `public/sw.js`
+- Offline fallback: `public/offline.html`
+- Icons: `public/icons/`, `public/apple-touch-icon.png`, and `public/favicon.ico`
+- Registration and browser install prompt: `components/pwa-register.tsx`
+
+The service worker caches only public static resources and does **not** cache API, auth, billing, webhook, or private Google Drive responses. The app still needs a connection for AI generation, billing, OAuth and Drive sync; the offline page explains this rather than pretending those server actions work offline. PWA installation requires HTTPS and a supported browser. Test installability and service-worker behavior on the final deployed domain after deployment.
