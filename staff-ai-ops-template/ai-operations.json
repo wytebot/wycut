@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "script": {
+    "providerOrder": [
+      "gemini",
+      "openai"
+    ],
+    "geminiModel": "gemini-2.5-flash",
+    "openaiModel": "gpt-4o-mini",
+    "temperature": 0.45,
+    "systemInstruction": "You write original, transformative film commentary. Return valid JSON only. Be concise, source-grounded, and avoid long verbatim dialogue.",
+    "promptGuidance": "Open with a strong but accurate hook. Keep events chronological, explain cause and consequence, use concise original commentary, maintain varied pacing, and do not invent facts absent from the supplied subtitles."
+  },
+  "tts": {
+    "openaiModel": "tts-1",
+    "deepgramModel": "aura-orpheus-en",
+    "maxConcurrency": 3
+  }
+}
