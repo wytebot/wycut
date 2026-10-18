@@ -93,10 +93,19 @@ export async function generateRecapScript(input: ScriptInput): Promise<{ script:
           { model: operations.script.geminiModel, systemInstruction: operations.script.systemInstruction },
           { timeout: timeoutMs },
         );
-        const result = await model.generateContent({
+        // The REST API supports thinkingConfig for Gemini 2.5, but the legacy
+        // @google/generative-ai TypeScript declaration omits it. Keep the API
+        // request field while narrowing at this SDK compatibility boundary.
+        const request = {
           contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: { responseMimeType: 'application/json', temperature: operations.script.temperature, maxOutputTokens: 10000, thinkingConfig: { thinkingBudget: 0 } },
-        });
+          generationConfig: {
+            responseMimeType: 'application/json',
+            temperature: operations.script.temperature,
+            maxOutputTokens: 10000,
+            thinkingConfig: { thinkingBudget: 0 },
+          },
+        } as Parameters<typeof model.generateContent>[0];
+        const result = await model.generateContent(request);
         return { script: validateScript(extractJson(result.response.text()), count, runtime, sourceRanges), provider: 'gemini' };
       } catch (error) {
         errors.push(`Gemini (${operations.script.geminiModel}): ${error instanceof Error ? error.message : 'request failed'}`);
