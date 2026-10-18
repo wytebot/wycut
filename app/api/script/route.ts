@@ -22,8 +22,8 @@ export async function POST(req: NextRequest) {
   try {
     usageId = await reserveRecapCredit(identity.userId, identity.email, body.title, deviceId);
   } catch (e) {
-    if (e instanceof Error && ['FREE_TRIAL_USED_ON_DEVICE', 'FREE_TRIAL_ALREADY_USED'].includes(e.message)) return NextResponse.json({ error: 'The free recap has already been used for this account or device.', code: e.message }, { status: 402 });
-    if (e instanceof Error && e.message === 'FREE_TRIAL_DAILY_CAP') return NextResponse.json({ error: 'Today’s free-trial limit has been reached. Please try again tomorrow.', code: e.message }, { status: 429 });
+    if (e instanceof Error && ['FREE_TRIAL_USED_ON_DEVICE', 'FREE_TRIAL_ALREADY_USED'].includes(e.message)) return NextResponse.json({ error: 'Your two free generations have been used on this account or device. Purchase a recap to continue.', code: e.message, billingUrl: '/billing' }, { status: 402 });
+    if (e instanceof Error && e.message === 'FREE_TRIAL_DAILY_CAP') return NextResponse.json({ error: 'WyCut has reached its daily free-generation safety limit. Please try again tomorrow or purchase a recap.', code: e.message }, { status: 429 });
     if (e instanceof Error && e.message === 'FREE_TRIAL_DEVICE_REQUIRED') return NextResponse.json({ error: 'Device verification is not configured for free trials.', code: e.message }, { status: 503 });
     if (e instanceof Error && e.message === 'NO_RECAP_CREDITS') return NextResponse.json({ error: 'You have no recap credits. Purchase a single recap or a 10-recap pack to continue.', code: 'NO_RECAP_CREDITS', billingUrl: '/billing' }, { status: 402 });
     if (e instanceof Error && e.message === 'SCRIPT_RATE_LIMIT') return NextResponse.json({ error: 'This Google account has reached the five-script-per-10-minute limit. Wait a few minutes before generating again.', code: 'SCRIPT_RATE_LIMIT' }, { status: 429, headers: { 'Retry-After': '600', 'Cache-Control': 'no-store' } });

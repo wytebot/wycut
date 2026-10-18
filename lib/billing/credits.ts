@@ -1,6 +1,14 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import { getAdminDb } from '@/lib/firebase-admin';
+import type { DocumentReference } from 'firebase-admin/firestore';
 import { hasLifetimeFreeAccess } from '@/lib/billing/entitlements';
+
+const FREE_TRIAL_ALLOWANCE = 2; // Fixed product rule: two lifetime free generations per account and device.
+const DEFAULT_DAILY_CAP = 3;
+
+function trialHash(value: string, pepper: string) {
+  return createHmac('sha256', pepper).update(value).digest('hex');
+}
 
 export async function reserveRecapCredit(userId: string, email: string, title: string, deviceId?: string) {
   const db = getAdminDb();
@@ -10,7 +18,7 @@ export async function reserveRecapCredit(userId: string, email: string, title: s
   const usageRef = db.collection('wycut_usage').doc(usageId);
   const lifetimeFree = hasLifetimeFreeAccess(email);
   const pepper = process.env.TRIAL_PEPPER;
-  const hash = (value: string) => createHmac('sha256', pepper || 'wycut-trial-pepper-not-configured').update(value).digest('hex');
+  const hash = (value: string) => trialHash(value, pepper || '');
   const deviceClaimRef = deviceId ? db.collection('wycut_trial_claims').doc(hash(`device:${deviceId}`)) : null;
   const emailClaimRef = db.collection('wycut_trial_claims').doc(hash(`email:${email.trim().toLowerCase()}`));
   const userClaimRef = db.collection('wycut_trial_claims').doc(hash(`user:${userId}`));
@@ -22,26 +30,37 @@ export async function reserveRecapCredit(userId: string, email: string, title: s
     if (!previousWindowStart || now - previousWindowStart >= 10 * 60 * 1000) { windowStart = now; windowCount = 0; }
     if (windowCount >= 5) throw new Error('SCRIPT_RATE_LIMIT');
     const balance = Number(current.recapsAvailable || 0);
-    const useTrial = !lifetimeFree && (!user.exists || balance < 1) && current.freeTrialUsed !== true;
-    if (!lifetimeFree && balance < 1 && !useTrial) throw new Error('NO_RECAP_CREDITS');
+    const useTrial = !lifetimeFree && balance < 1;
+    if (useTrial && !pepper) throw new Error('FREE_TRIAL_DEVICE_REQUIRED');
+    if (!lifetimeFree && balance < 1 && !deviceId) throw new Error('FREE_TRIAL_DEVICE_REQUIRED');
+    const claimRefs = useTrial ? [deviceClaimRef!, emailClaimRef, userClaimRef] : [];
+    const claimSnaps = useTrial ? await Promise.all(claimRefs.map(ref => transaction.get(ref))) : [];
+    let dailyRef: DocumentReference | null = null;
+    let dailyCount = 0;
     if (useTrial) {
-      if (!deviceId || deviceId.length < 16 || deviceId.length > 200 || !pepper) throw new Error('FREE_TRIAL_DEVICE_REQUIRED');
-      const [deviceClaim, emailClaim, userClaim] = await Promise.all([transaction.get(deviceClaimRef!), transaction.get(emailClaimRef), transaction.get(userClaimRef)]);
-      if (deviceClaim.exists) throw new Error('FREE_TRIAL_USED_ON_DEVICE');
-      if (emailClaim.exists || userClaim.exists) throw new Error('FREE_TRIAL_ALREADY_USED');
-      const day = new Date().toISOString().slice(0, 10); const dailyRef = db.collection('wycut_trial_limits').doc(day); const daily = await transaction.get(dailyRef);
-      const cap = Math.max(0, Number(process.env.FREE_TRIAL_DAILY_CAP || 100));
-      if (Number(daily.data()?.count || 0) >= cap) throw new Error('FREE_TRIAL_DAILY_CAP');
-      transaction.create(deviceClaimRef!, { userIdHash: hash(userId), emailHash: hash(email.trim().toLowerCase()), usageId, createdAt: new Date().toISOString() });
-      transaction.create(emailClaimRef, { usageId, createdAt: new Date().toISOString() }); transaction.create(userClaimRef, { usageId, createdAt: new Date().toISOString() });
-      transaction.set(dailyRef, { count: Number(daily.data()?.count || 0) + 1, updatedAt: new Date().toISOString() }, { merge: true });
+      const counts = claimSnaps.map(snap => Number(snap.data()?.count ?? (snap.exists ? 1 : 0)));
+      if (counts[0] >= FREE_TRIAL_ALLOWANCE) throw new Error('FREE_TRIAL_USED_ON_DEVICE');
+      if (counts[1] >= FREE_TRIAL_ALLOWANCE || counts[2] >= FREE_TRIAL_ALLOWANCE) throw new Error('FREE_TRIAL_ALREADY_USED');
+      const day = new Date().toISOString().slice(0, 10);
+      dailyRef = db.collection('wycut_trial_limits').doc(day);
+      const daily = await transaction.get(dailyRef);
+      dailyCount = Number(daily.data()?.count || 0);
+      const configuredCap = Number(process.env.FREE_TRIAL_DAILY_CAP || DEFAULT_DAILY_CAP);
+      const cap = Number.isFinite(configuredCap) && configuredCap > 0 ? Math.floor(configuredCap) : DEFAULT_DAILY_CAP;
+      if (dailyCount >= cap) throw new Error('FREE_TRIAL_DAILY_CAP');
+      for (let i = 0; i < claimRefs.length; i++) {
+        const snap = claimSnaps[i];
+        const old = snap.data() || {};
+        const usageIds = Array.isArray(old.usageIds) ? old.usageIds.filter((id: unknown) => typeof id === 'string') as string[] : (typeof old.usageId === 'string' ? [old.usageId] : []);
+        transaction.set(claimRefs[i], { count: Number(old.count ?? (snap.exists ? 1 : 0)) + 1, usageIds: [...usageIds, usageId], userIdHash: hash(userId), emailHash: hash(email.trim().toLowerCase()), createdAt: old.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString() }, { merge: true });
+      }
+      transaction.set(dailyRef, { count: dailyCount + 1, updatedAt: new Date().toISOString() }, { merge: true });
     }
-    transaction.set(userRef, { email, scriptWindowStartMs: windowStart, scriptWindowCount: windowCount + 1, ...(lifetimeFree ? { lifetimeFreeAccess: true } : useTrial ? { freeTrialUsed: true } : { recapsAvailable: balance - 1 }), updatedAt: new Date().toISOString() }, { merge: true });
-    transaction.create(usageRef, { usageId, userId, email, title: title.slice(0, 160), status: 'reserved', narrationCalls: 0, lifetimeFreeAccess: lifetimeFree, freeTrial: useTrial, ...(useTrial ? { trialClaimIds: [deviceClaimRef!.id, emailClaimRef.id, userClaimRef.id] } : {}), createdAt: new Date().toISOString(), createdAtMs: Date.now() });
+    transaction.set(userRef, { email, scriptWindowStartMs: windowStart, scriptWindowCount: windowCount + 1, ...(lifetimeFree ? { lifetimeFreeAccess: true } : useTrial ? { freeTrialUsed: true, freeTrialGenerationsUsed: Number(current.freeTrialGenerationsUsed || 0) + 1 } : { recapsAvailable: balance - 1 }), updatedAt: new Date().toISOString() }, { merge: true });
+    transaction.create(usageRef, { usageId, userId, email, title: title.slice(0, 160), status: 'reserved', narrationCalls: 0, lifetimeFreeAccess: lifetimeFree, freeTrial: useTrial, ...(useTrial ? { trialClaimIds: claimRefs.map(ref => ref.id), trialDailyLimitId: dailyRef!.id } : {}), createdAt: new Date().toISOString(), createdAtMs: Date.now() });
   });
   return usageId;
 }
-
 
 /** Refund stale reservations on the next credit request; deployments should also schedule this function. */
 async function refundExpiredReservations(db: ReturnType<typeof getAdminDb>) {
@@ -64,7 +83,29 @@ export async function refundRecapCredit(usageId: string) {
     if (!userId) return;
     if (usage.data()?.lifetimeFreeAccess === true) { transaction.set(usageRef, { status: 'refunded', refundedAt: new Date().toISOString() }, { merge: true }); return; }
     if (usage.data()?.freeTrial === true) {
-      if (usage.data()?.script === undefined) { const claims = Array.isArray(usage.data()?.trialClaimIds) ? usage.data()!.trialClaimIds as string[] : []; for (const id of claims) transaction.delete(db.collection('wycut_trial_claims').doc(id)); const userRef = db.collection('wycut_users').doc(userId); transaction.set(userRef, { freeTrialUsed: false, updatedAt: new Date().toISOString() }, { merge: true }); }
+      if (usage.data()?.script === undefined) {
+        const claimIds = Array.isArray(usage.data()?.trialClaimIds) ? usage.data()!.trialClaimIds as string[] : [];
+        const claimRefs = claimIds.map(id => db.collection('wycut_trial_claims').doc(id));
+        const userRef = db.collection('wycut_users').doc(userId);
+        const dailyId = usage.data()?.trialDailyLimitId;
+        const dailyRef = typeof dailyId === 'string' ? db.collection('wycut_trial_limits').doc(dailyId) : null;
+        const [claims, user, daily] = await Promise.all([
+          Promise.all(claimRefs.map(ref => transaction.get(ref))),
+          transaction.get(userRef),
+          dailyRef ? transaction.get(dailyRef) : Promise.resolve(null),
+        ]);
+        for (let i = 0; i < claimRefs.length; i++) {
+          const claim = claims[i]; if (!claim.exists) continue;
+          const data = claim.data() || {};
+          const usageIds = Array.isArray(data.usageIds) ? data.usageIds.filter((id: unknown) => id !== usageId) : (data.usageId === usageId ? [] : (typeof data.usageId === 'string' ? [data.usageId] : []));
+          const count = Math.max(0, Number(data.count ?? (claim.exists ? 1 : 0)) - 1);
+          if (count === 0) transaction.delete(claimRefs[i]);
+          else transaction.set(claimRefs[i], { ...data, count, usageIds, updatedAt: new Date().toISOString() }, { merge: true });
+        }
+        const used = Math.max(0, Number(user.data()?.freeTrialGenerationsUsed ?? 1) - 1);
+        transaction.set(userRef, { freeTrialGenerationsUsed: used, freeTrialUsed: used >= FREE_TRIAL_ALLOWANCE, updatedAt: new Date().toISOString() }, { merge: true });
+        if (dailyRef && daily?.exists) transaction.set(dailyRef, { count: Math.max(0, Number(daily.data()?.count || 0) - 1), updatedAt: new Date().toISOString() }, { merge: true });
+      }
       transaction.set(usageRef, { status: 'refunded', refundedAt: new Date().toISOString() }, { merge: true }); return;
     }
     const userRef = db.collection('wycut_users').doc(userId);
