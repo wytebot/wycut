@@ -39,14 +39,15 @@ async function getFFmpeg(): Promise<FFmpeg> {
 }
 function safeName(value: string): string { return value.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 45) || 'scene'; }
 
-/** Stream-copy trimming is fast and avoids re-encoding. Keyframe boundaries may make cuts imprecise; this is not frame-accurate editing. */
+/** Re-encodes each clip to make trim boundaries frame-accurate. This is slower than stream copy and uses more CPU/memory. */
 export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgress?: (progress: number, current: number, total: number) => void): Promise<SlicedClip[]> {
   return serialized(async () => {
   if (!file || file.size === 0) throw new Error('Choose a non-empty local video file.');
   const extension = (file.name.split('.').pop() || '').toLowerCase();
-  if (!['mp4', 'm4v', 'mov'].includes(extension)) throw new Error('Lossless MP4 stream-copy slicing currently supports MP4, M4V, and MOV sources. Convert other containers locally first or choose a supported file.');
-  const maxBytes = Capacitor.isNativePlatform() ? 100 * 1024 * 1024 : 700 * 1024 * 1024;
-  if (file.size > maxBytes) throw new Error(`This file exceeds the ${Capacitor.isNativePlatform() ? '100 MB Android' : '700 MB browser'} processing safety limit. FFmpeg uses several times the source size in memory; split the source first.`);
+  if (!['mp4', 'm4v', 'mov'].includes(extension)) throw new Error('Frame-accurate re-encoding currently supports MP4, M4V, and MOV sources. Convert other containers locally first or choose a supported file.');
+  const mobileBrowser = typeof navigator !== 'undefined' && (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || Number((navigator as Navigator & { deviceMemory?: number }).deviceMemory || 8) <= 4);
+  const maxBytes = Capacitor.isNativePlatform() ? 80 * 1024 * 1024 : mobileBrowser ? 100 * 1024 * 1024 : 300 * 1024 * 1024;
+  if (file.size > maxBytes) throw new Error(`This file exceeds the ${Capacitor.isNativePlatform() ? '80 MB Android' : mobileBrowser ? '100 MB mobile browser' : '300 MB desktop browser'} processing safety limit. FFmpeg uses several times the source size in memory; split the source first.`);
   if (!ranges.length || ranges.length > 60) throw new Error('Provide between 1 and 60 clip ranges.');
   const sorted = ranges.map((r, i) => ({ ...r, index: Number.isFinite(r.index) ? Math.max(1, Math.floor(r.index)) : i + 1 })).sort((a, b) => a.index - b.index);
   for (const r of sorted) if (!Number.isFinite(r.startSeconds) || !Number.isFinite(r.endSeconds) || r.startSeconds < 0 || r.endSeconds <= r.startSeconds) throw new Error(`Invalid range for ${r.id}.`);
@@ -60,11 +61,11 @@ export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgr
     for (let i = 0; i < sorted.length; i++) {
       const range = sorted[i]; const id = safeName(range.id); const filename = `${String(range.index).padStart(3, '0')}_${id}.mp4`;
       if (range.endSeconds - range.startSeconds > 3600) throw new Error(`Clip ${filename} is over one hour long; split the range before processing.`);
-      // Recreate output name inside FFmpeg FS. -ss before input is fast; stream copy may snap to keyframes.
+      // Re-encode after accurate seeking. All clips use the same H.264/AAC settings so the rough-cut concat is more reliable.
       const output = `out_${i}.mp4`;
       const duration = range.endSeconds - range.startSeconds;
-      const code = await ffmpeg.exec(['-ss', range.startSeconds.toFixed(3), '-i', sourceName, '-t', duration.toFixed(3), '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', '-y', output]);
-      if (code !== 0) throw new Error(`FFmpeg failed while slicing ${filename}. The source codec/container may not support this operation.`);
+      const code = await ffmpeg.exec(['-ss', range.startSeconds.toFixed(3), '-i', sourceName, '-t', duration.toFixed(3), '-map', '0:v:0', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', '-y', output]);
+      if (code !== 0) throw new Error(`FFmpeg failed while frame-accurately re-encoding ${filename}. The source may use an unsupported codec or this device may be out of memory.`);
       const data = await ffmpeg.readFile(output);
       if (typeof data === 'string' || data.length === 0) throw new Error(`FFmpeg produced an empty clip for ${filename}.`);
       const bytes = new Uint8Array(data as Uint8Array);

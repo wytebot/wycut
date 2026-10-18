@@ -13,7 +13,7 @@ The `.env.example` file now contains the Firebase Web SDK values for project `wy
 3. If WyCut should accept only Google sign-ins, disable **Email/Password** and **Phone** under Sign-in method. This prevents those providers from being used for new sign-ins through Firebase.
 4. Under **Authentication → Settings → Authorized domains**, add the production Vercel domain and any custom domain. The Firebase client uses `wycut5.firebaseapp.com` as its auth domain.
 5. In Vercel, set `FIREBASE_SERVICE_ACCOUNT_JSON_BASE64` to the base64-encoded JSON for a Firebase service account from the same `wycut5` project. This must be a server-only environment variable (do not prefix it with `NEXT_PUBLIC_`). Redeploy after changing it. The server uses Firebase Admin to verify Firebase ID tokens.
-6. Keep `GOOGLE_WEB_CLIENT_ID` / `NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID` configured if required by the existing native Google OAuth and Google Drive integration. Firebase web sign-in does not replace the separate Google Drive OAuth permission flow.
+6. Keep `NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID` configured if required by the existing native Google OAuth and Google Drive integration. Firebase web sign-in does not replace the separate Google Drive OAuth permission flow.
 
 ## Behavior and security notes
 

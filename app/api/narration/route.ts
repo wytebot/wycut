@@ -4,7 +4,7 @@ import { generateNarration } from '@/lib/ai/tts-generator';
 import type { NarrativeBeat } from '@/lib/ai/script-generator';
 import { isAllowedApiOrigin } from '@/lib/server/origin';
 import { verifyGoogleIdentity } from '@/lib/billing/google-identity';
-import { reserveNarrationBatch } from '@/lib/billing/credits';
+import { reserveNarrationBatch, releaseNarrationBatch } from '@/lib/billing/credits';
 
 export const runtime = 'nodejs';
 export const maxDuration = 120;
@@ -23,18 +23,17 @@ export async function POST(req: NextRequest) {
     if (!Array.isArray(body.beats) || body.beats.length < 1 || body.beats.length > 2) {
       return NextResponse.json({ error: 'Send one or two script beats per narration request.' }, { status: 400 });
     }
-    const totalCharacters = body.beats.reduce((total, beat) => total + (typeof beat?.narration === 'string' ? beat.narration.length : 0), 0);
-    if (totalCharacters > 3_500) return NextResponse.json({ error: 'Send narration text totalling 3,500 characters or fewer per request.' }, { status: 400 });
-    const beats = body.beats.map((beat, i) => {
-      if (!beat || typeof beat.narration !== 'string' || beat.narration.length > 3_500 || !Number.isFinite(beat.startSeconds) || !Number.isFinite(beat.endSeconds) || beat.endSeconds <= beat.startSeconds) {
-        throw new Error(`Beat ${i + 1} is invalid or too long. Each narration beat must be 3,500 characters or fewer.`);
-      }
-      return beat;
-    });
     const identity = await verifyGoogleIdentity(body.idToken || '');
-    try { await reserveNarrationBatch(body.recapId || '', identity.userId); }
-    catch (e) { const message = e instanceof Error && e.message === 'NARRATION_LIMIT' ? 'This recap has reached its narration request limit. Start a new recap if you need more narration.' : 'This recap is not owned by the signed-in account. Generate a script first.'; return NextResponse.json({ error: message }, { status: 403 }); }
-    const result = await generateNarration(beats, { voice: body.voice || 'onyx' });
+    let beats: NarrativeBeat[];
+    try { beats = await reserveNarrationBatch(body.recapId || '', identity.userId, body.beats.map(beat => ({ index: Number(beat?.index), id: String(beat?.id || '') }))) as NarrativeBeat[]; }
+    catch (e) { const code = e instanceof Error ? e.message : ''; const message = code === 'NARRATION_LIMIT' ? 'This recap has reached its narration request limit. Start a new recap if you need more narration.' : code === 'NARRATION_BEAT_MISMATCH' ? 'The requested narration does not match the saved script. Regenerate the script and retry.' : code === 'SCRIPT_NOT_STORED' ? 'The saved script is unavailable. Generate a new recap first.' : code === 'NARRATION_BATCH_TOO_LARGE' ? 'Choose a smaller narration batch; this batch exceeds 3,500 characters.' : 'This recap is not owned by the signed-in account. Generate a script first.'; return NextResponse.json({ error: message }, { status: 403 }); }
+    const totalCharacters = beats.reduce((total, beat) => total + beat.narration.length, 0);
+    if (totalCharacters > 3_500) return NextResponse.json({ error: 'Send narration in batches totalling 3,500 characters or fewer.' }, { status: 400 });
+    const allowedVoices = new Set(['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer']);
+    const voice = typeof body.voice === 'string' && allowedVoices.has(body.voice) ? body.voice : 'onyx';
+    let result: Awaited<ReturnType<typeof generateNarration>>;
+    try { result = await generateNarration(beats, { voice }); }
+    catch (error) { await releaseNarrationBatch(body.recapId || '', identity.userId).catch(() => undefined); throw error; }
     const b64 = (bytes: Uint8Array) => Buffer.from(bytes).toString('base64');
     return NextResponse.json({
       provider: result.provider,

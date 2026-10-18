@@ -5,7 +5,7 @@ import { ArrowRight, AudioLines, Cloud, Clapperboard, ShieldCheck, Scissors, Che
 const features = [
   { icon: Clapperboard, title: '10-minute multi-act scripts', text: 'Build a structured recap with hooks, act breaks, source timestamps and dialogue cues.' },
   { icon: AudioLines, title: 'Scene-matched narration', text: 'Generate numbered voiceover segments plus a continuous track and SRT captions.' },
-  { icon: Scissors, title: 'Local, stream-copy clips', text: 'Where the source format allows it, FFmpeg runs in your browser and avoids re-encoding.' },
+  { icon: Scissors, title: 'Local, frame-accurate clips', text: 'FFmpeg re-encodes clips locally for precise boundaries; no video bytes are sent to WyCut servers.' },
   { icon: Cloud, title: 'Your Drive, your files', text: 'Export production files directly to a Google Drive folder you authorize.' },
 ];
 

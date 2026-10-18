@@ -3,37 +3,36 @@ import { enforceRateLimit } from '@/lib/server/rate-limit';
 import { isAllowedApiOrigin } from '@/lib/server/origin';
 import { getAdminDb } from '@/lib/firebase-admin';
 import { verifyGoogleIdentity } from '@/lib/billing/google-identity';
+import { getFlutterwaveV4AccessToken, flutterwaveV4BaseUrl } from '@/lib/billing/flutterwave-v4';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-type Input = { txRef?: string; idToken?: string; code?: string; action?: 'otp' | 'pin' };
+type Input = { txRef?: string; idToken?: string; code?: string; action?: 'otp' | 'pin'; nonce?: string; encryptedPin?: string };
 export async function POST(request: NextRequest) {
   const limit = enforceRateLimit(request, 'billing-auth', 8, 10 * 60 * 1000);
   if (!limit.allowed) return NextResponse.json({ error: 'Too many verification attempts. Wait before retrying.' }, { status: 429, headers: { 'Retry-After': String(limit.retryAfterSeconds), 'Cache-Control': 'no-store' } });
   if (!isAllowedApiOrigin(request)) return NextResponse.json({ error: 'Cross-origin request rejected.' }, { status: 403 });
-  const secret = process.env.FLW_SECRET_KEY; const baseUrl = process.env.FLW_V4_API_BASE;
-  if (!secret || !baseUrl) return NextResponse.json({ error: 'Flutterwave billing is not configured.' }, { status: 503 });
-  let input: Input;
-  try { input = await request.json() as Input; } catch { return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 }); }
+  let input: Input; try { input = await request.json() as Input; } catch { return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 }); }
   if (!input.txRef || input.txRef.length > 140) return NextResponse.json({ error: 'Invalid transaction reference.' }, { status: 400 });
-  let identity;
-  try { identity = await verifyGoogleIdentity(input.idToken || ''); } catch (e) { return NextResponse.json({ error: e instanceof Error ? e.message : 'Google authentication failed.' }, { status: 401 }); }
+  let identity; try { identity = await verifyGoogleIdentity(input.idToken || ''); } catch (e) { return NextResponse.json({ error: e instanceof Error ? e.message : 'Google authentication failed.' }, { status: 401 }); }
   const action = input.action === 'pin' ? 'pin' : 'otp';
-  const code = input.code || '';
-  if (!/^\d{4,8}$/.test(code)) return NextResponse.json({ error: `Enter a valid ${action.toUpperCase()}.` }, { status: 400 });
+  let authorization: Record<string, unknown>;
+  if (action === 'otp') { const code = input.code || ''; if (!/^\d{4,8}$/.test(code)) return NextResponse.json({ error: 'Enter a valid 4–8 digit OTP.' }, { status: 400 }); authorization = { type: 'otp', otp: { code } }; }
+  else { if (!/^[A-Za-z0-9]{12}$/.test(String(input.nonce || '')) || !input.encryptedPin || input.encryptedPin.length > 4096) return NextResponse.json({ error: 'Encrypted PIN data is missing or invalid.' }, { status: 400 }); authorization = { type: 'pin', pin: { nonce: input.nonce, encrypted_pin: input.encryptedPin } }; }
   try {
     const db = getAdminDb(); const orderRef = db.collection('wycut_orders').doc(input.txRef); const orderSnap = await orderRef.get();
     if (!orderSnap.exists || orderSnap.data()?.userId !== identity.userId) return NextResponse.json({ error: 'Order not found for this Google account.' }, { status: 404 });
-    const order = orderSnap.data()!;
-    if (!order.providerChargeId) return NextResponse.json({ error: 'The provider has not supplied a charge ID for this order.' }, { status: 409 });
-    if (['successful', 'credited'].includes(String(order.status))) return NextResponse.json({ status: 'SUCCESSFUL', message: 'This order has already been completed.' });
-    const template = process.env.FLW_V4_VALIDATE_PATH_TEMPLATE || '/charges/{id}/validate';
-    if (!template.startsWith('/') || template.startsWith('//')) return NextResponse.json({ error: 'Invalid validation path configuration.' }, { status: 500 });
-    const path = template.replace('{id}', encodeURIComponent(String(order.providerChargeId))).replace('{tx_ref}', encodeURIComponent(input.txRef));
-    const response = await fetch(`${baseUrl.replace(/\/$/, '')}${path}`, { method: 'POST', headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ [action]: code }), cache: 'no-store', signal: AbortSignal.timeout(20000) });
-    const result = await response.json().catch(() => ({})) as { status?: string; message?: string; data?: { status?: string; id?: string | number; tx_ref?: string; [key: string]: unknown } };
-    if (!response.ok) return NextResponse.json({ error: result.message || `${action.toUpperCase()} validation failed. Check the code and try again.` }, { status: 502 });
+    const order = orderSnap.data()!; const chargeId = String(order.providerChargeId || '');
+    if (!chargeId) return NextResponse.json({ error: 'Flutterwave has not returned a charge ID for this order.' }, { status: 409 });
+    if (order.status === 'credited') return NextResponse.json({ status: 'SUCCESSFUL', message: 'This order is already complete.' }, { headers: { 'Cache-Control': 'no-store' } });
+    const token = await getFlutterwaveV4AccessToken(); const base = flutterwaveV4BaseUrl();
+    const response = await fetch(`${base}/charges/${encodeURIComponent(chargeId)}`, { method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ authorization }), cache: 'no-store', signal: AbortSignal.timeout(20000) });
+    const result = await response.json().catch(() => ({})) as { status?: string; message?: string; data?: { id?: string | number; status?: string; next_action?: { type?: string; requires_pin?: boolean; requires_otp?: boolean; redirect_url?: string | { url?: string }; [key: string]: unknown }; redirect_url?: string } };
+    if (!response.ok) return NextResponse.json({ error: result.message || 'Flutterwave authorization failed. Check the code and retry.' }, { status: 502, headers: { 'Cache-Control': 'no-store' } });
     const status = String(result.data?.status || result.status || 'pending').toLowerCase();
-    await orderRef.set({ providerStatus: status, status: status === 'successful' ? 'awaiting_verification' : status, updatedAt: new Date().toISOString() }, { merge: true });
-    return NextResponse.json({ status: status.toUpperCase(), message: result.message || 'Authentication accepted. Verifying settlement before adding recap credits.', txRef: input.txRef }, { headers: { 'Cache-Control': 'no-store' } });
-  } catch { return NextResponse.json({ error: 'Could not validate with Flutterwave. Check transaction status before retrying.' }, { status: 502 }); }
+    const actionText = `${result.data?.next_action?.type || ''} ${result.data?.next_action?.requires_pin ? 'requires_pin' : ''} ${result.data?.next_action?.requires_otp ? 'requires_otp' : ''}`.toLowerCase();
+    const challenge = /pin/.test(actionText) ? 'pin' : /otp/.test(actionText) ? 'otp' : '';
+    const rawRedirect = result.data?.next_action?.redirect_url; const redirectUrl = typeof rawRedirect === 'string' ? rawRedirect : rawRedirect && typeof rawRedirect === 'object' ? rawRedirect.url : result.data?.redirect_url;
+    await db.runTransaction(async transaction => { const latest = await transaction.get(orderRef); const existingStatus = String(latest.data()?.status || ''); transaction.set(orderRef, { providerStatus: status, status: ['credited', 'provider_rejected'].includes(existingStatus) ? existingStatus : challenge ? 'requires_auth' : status === 'succeeded' ? 'awaiting_webhook_verification' : status, updatedAt: new Date().toISOString() }, { merge: true }); });
+    return NextResponse.json({ status: challenge ? `REQUIRES_${challenge.toUpperCase()}` : status.toUpperCase(), challenge, redirectUrl: redirectUrl || null, message: challenge ? `Flutterwave requires ${challenge.toUpperCase()} verification to continue.` : status === 'succeeded' ? 'Authorization accepted. Waiting for WyBuild webhook verification before adding credits.' : result.message || 'Authorization submitted. Checking payment status…', txRef: input.txRef }, { headers: { 'Cache-Control': 'no-store' } });
+  } catch (e) { return NextResponse.json({ error: e instanceof Error ? e.message : 'Could not validate with Flutterwave v4.' }, { status: 502, headers: { 'Cache-Control': 'no-store' } }); }
 }

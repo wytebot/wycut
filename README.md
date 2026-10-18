@@ -4,7 +4,7 @@ WyCut is a Next.js App Router + TypeScript app for generating original recap scr
 
 ## Architecture
 
-- **Web/backend deployment:** deploy the regular Next.js app. This deployment serves `/api/script`, `/api/narration`, Google identity verification, and the Flutterwave webhook/charge endpoints.
+- **Web/backend deployment:** deploy the regular Next.js app. This deployment serves `/api/script`, `/api/narration`, Google identity verification, billing/status endpoints, and the authenticated WyBuild payment-confirmation endpoint. Flutterwave webhooks are registered only on WyBuild.
 - **Capacitor APK:** the APK bundles the static UI in `out/` and calls the deployed API over HTTPS. The APK does not embed server secrets or try to run Next.js API routes locally.
 - **Local media processing:** FFmpeg runs in the browser/WebView. Source videos are not sent to WyCut's API.
 - **Google Drive:** browser/native OAuth requests the limited `drive.file` scope; selected production files are uploaded directly from the device to Drive.
@@ -53,11 +53,11 @@ The APK is created at `android/app/build/outputs/apk/debug/app-debug.apk`. This 
 
 1. Provide a public HTTPS direct video-file URL (MP4/M4V/MOV) that permits browser downloads, or choose an authorized local video file. The URL downloads into device memory; WyCut does not store the source video on its server.
 2. Provide a public SRT/VTT/text transcript URL, or upload a subtitle file. Generate a recap script using the configured fast model and provider fallback.
-3. Generate narration/captions if desired; narration is optional for exporting video cuts.
-4. Slice the source locally with FFmpeg stream copy.
+3. Generate narration/captions if desired; captions are timed to audio segment duration with estimated within-segment timing, not word-level forced alignment.
+4. Slice the source locally with FFmpeg re-encoding for frame-accurate boundaries (slower than stream copy).
 5. Connect Google Drive and export the cut sections (and any generated narration/script) directly into the Drive production-kit folders.
 
-Important URL limits: a YouTube or TikTok watch-page URL is not a direct media file, and their public APIs do not give this app a generic downloadable full-video URL. WyCut therefore does not scrape or bypass those platforms. For content you own or have permission to edit, use the platform's authorized export/download, then select that video file or use a direct-download URL from a host that allows browser access. Direct media/subtitle hosts must allow browser CORS access. The app currently does not auto-discover or download YouTube/TikTok captions from a watch page. On Android, local FFmpeg processing is limited to 100 MB sources; browser processing is limited to 700 MB. Stream-copy cuts are keyframe-limited, and rough-cut concatenation depends on compatible source streams.
+Important URL limits: a YouTube or TikTok watch-page URL is not a direct media file, and their public APIs do not give this app a generic downloadable full-video URL. WyCut therefore does not scrape or bypass those platforms. For content you own or have permission to edit, use the platform's authorized export/download, then select that video file or use a direct-download URL from a host that allows browser access. Direct media/subtitle hosts must allow browser CORS access. The app currently does not auto-discover or download YouTube/TikTok captions from a watch page. Source safety limits are 80 MB in the Android APK, 100 MB in low-memory/mobile browsers, and 300 MB in desktop browsers because frame-accurate re-encoding uses additional memory. Accurate cut points require a timestamped SRT/VTT transcript. Plain-text transcripts can generate a script but cannot provide reliable source cut points.
 
 ## Environment variables
 
@@ -65,24 +65,24 @@ See `.env.example`. Important settings:
 
 - `GEMINI_API_KEY`, `OPENAI_API_KEY`, `DEEPGRAM_API_KEY`: server-side AI provider keys/fallbacks. Keep model overrides blank if you want the operations JSON to control model names.
 - `AI_OPERATIONS_CONFIG_URL`: optional HTTPS URL to `ai-operations.json` in a separate AI operations repository. For a private GitHub repo, use the GitHub Contents API URL and set `AI_OPERATIONS_CONFIG_TOKEN` to a fine-grained token with read-only Contents access. Config is cached for five minutes; local config is the fast fallback. Never put the token in the app or share it with staff. Set `AI_SCRIPT_PROVIDER=openai` or `gemini` only to force provider priority.
-- `NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID` and `GOOGLE_WEB_CLIENT_ID`: Google OAuth client IDs.
+- `NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID`: Google OAuth Web client ID used for native identity and browser Drive access.
 - `FIREBASE_SERVICE_ACCOUNT_JSON_BASE64`: server-only Firebase Admin credentials for payment records.
 - `CAPACITOR_ALLOWED_ORIGINS`: allowed local app origins for API CORS.
 - `NEXT_PUBLIC_API_BASE_URL`: only needed when building the bundled APK.
 - `GOOGLE_SERVICES_JSON_BASE64`: only needed for the APK build workflow; contains Firebase Android config, not a server secret.
-- `FLW_*`: only configure after verifying the exact Flutterwave v4 contract enabled on the merchant account.
+- Flutterwave: `FLW_CLIENT_ID`, `FLW_CLIENT_SECRET`, `FLW_ENCRYPTION_KEY`, and `FLW_V4_BASE_URL`; use the same merchant credentials and matching environment (sandbox or production) in WyCut and WyBuild. WyCut also needs `WYBUILD_WEBHOOK_SHARED_SECRET` for WyBuild-to-WyCut confirmation. WyBuild alone needs `FLW_SECRET_HASH` for the registered webhook.
 
 ## Payments and production blockers
 
-The checkout, order ownership, PIN/OTP continuation, verified settlement, idempotent recap-credit ledger, and generation credit gate are implemented. However, the direct-card encryption and endpoint payload still need a successful sandbox test against the exact Flutterwave v4 product enabled on your merchant account. **Do not enable live payments until that test passes.** See [AUDIT-AND-REMAINING-BLOCKERS.md](./AUDIT-AND-REMAINING-BLOCKERS.md) for the release gate.
+The checkout, order ownership, encrypted card/PIN fields, v4 customer/payment-method/charge flow, PIN/OTP/redirect continuation, WyBuild webhook forwarding, per-user pending-payment lock, idempotent recap-credit ledger, and generation credit gate are implemented in code. The exact merchant v4 payload and encryption contract still require a successful sandbox test against your enabled product. **Do not enable live payments until that test passes.** See [AUDIT-AND-REMAINING-BLOCKERS.md](./AUDIT-AND-REMAINING-BLOCKERS.md) for the release gate.
 
 ## Main files
 
 - `app/page.tsx` — landing page and pricing.
 - `app/dashboard/page.tsx` — direct-video URL/local-file + transcript URL/SRT/VTT workflow, local slicing and Drive export.
 - `lib/ai/script-generator.ts` — validated Gemini/OpenAI script generation.
-- `lib/ai/tts-generator.ts` — bounded TTS, ordered segments, estimated SRT.
-- `lib/ffmpeg/client-slicer.ts` — local FFmpeg stream-copy slicing and rough cut.
+- `lib/ai/tts-generator.ts` — bounded TTS provider calls and ordered narration segments; SRT captions use audio segment durations and estimated within-segment timing.
+- `lib/ffmpeg/client-slicer.ts` — local frame-accurate H.264/AAC re-encoding and rough-cut assembly.
 - `lib/drive/export.ts` — direct Google Drive resumable uploads.
 - `lib/api-client.ts` — API origin resolver for web and bundled APK.
 - `middleware.ts` / `lib/server/origin.ts` — CORS/preflight and allowed-origin checks.
@@ -95,15 +95,15 @@ The checkout, order ownership, PIN/OTP continuation, verified settlement, idempo
 - `/billing` is the checkout page for the single recap and 10-recap pack.
 - The reference rate is fixed at **₦1,400 / USD**. Single recap: $1.99 base = ₦2,786; 2% fee = ₦56; total = **₦2,842**. Ten-pack: $14.99 base = ₦20,986; 2% fee = ₦420; total = **₦21,406**. Fee and total are rounded to whole naira.
 - A Google ID token is verified server-side before an order is created. Orders are tied to the Google `sub`, not to a client-supplied email. PIN/OTP continuation checks order ownership.
-- The webhook and status route retrieve a transaction from Flutterwave using `FLW_V4_VERIFY_URL_TEMPLATE`, check order amount/currency/reference/provider ID, then atomically record the payment and add recap credits to `wycut_users/{google-sub}`. A transaction ID can be credited only once.
-- Set `FLW_SECRET_KEY`, `FLW_V4_API_BASE`, `FLW_V4_CHARGES_PATH`, `FLW_V4_CARD_FIELD`, `FLW_WEBHOOK_SECRET_HASH`, `FLW_V4_VERIFY_URL_TEMPLATE`, `FLW_V4_VALIDATE_PATH_TEMPLATE`, `NEXT_PUBLIC_FLW_CARD_RSA_PUBLIC_KEY`, and `GOOGLE_WEB_CLIENT_ID` / `NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID`. Firebase Admin service credentials must be configured for order and wallet persistence.
-- **Merchant-specific contract gate:** this project keeps the v4 charge path at `/charges`, the card field at `card`, the continuation path at `/charges/{id}/validate`, and browser-side RSA-OAEP/SHA-256 encryption as explicit assumptions/configuration points. Before accepting real money, confirm those exact paths, payload shape, encryption algorithm/key format, validation body and webhook signature with the v4 product enabled in your Flutterwave dashboard. The app must remain in test mode until the exact contract passes a full sandbox run. Never collect or send unencrypted PAN/CVV to WyCut's backend.
-- The script-generation route reserves one recap credit transactionally before generation and refunds it if generation fails. Narration requests require ownership of the generated recap and are capped at 25 batches per recap. The app still needs an end-to-end sandbox test to confirm the provider contract and all credit flows.
+- WyBuild is the only registered Flutterwave webhook. It verifies the transaction against Flutterwave v4, then forwards verified WyCut charges. WyCut validates the shared secret and matches the transaction against its Firestore order before atomically crediting `wycut_users/{google-sub}` once.
+- Set `FLW_CLIENT_ID`, `FLW_CLIENT_SECRET`, `FLW_ENCRYPTION_KEY`, `FLW_V4_BASE_URL`, `WYBUILD_WEBHOOK_SHARED_SECRET`, `NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID`, and `FIREBASE_SERVICE_ACCOUNT_JSON_BASE64`. Set `NEXT_PUBLIC_API_BASE_URL`, `CAPACITOR_ALLOWED_ORIGINS`, and `GOOGLE_SERVICES_JSON_BASE64` only when building the bundled Android app.
+- **Merchant-specific contract gate:** WyCut follows the same v4 customer → payment-method → charge structure used by WyBuild, encrypts card fields with AES-GCM using `FLW_ENCRYPTION_KEY`, and submits PIN/OTP continuation to `/charges/{id}`. These details must still be confirmed against the exact Flutterwave v4 product enabled for your merchant account. Keep test mode until a full sandbox run passes; never send raw PAN/CVV to WyCut’s backend.
+- The script-generation route reserves one recap credit transactionally before generation and refunds it if generation fails. Narration requests require ownership of the generated recap, use the server-stored canonical script rather than client-edited text, and are capped at 25 batches per recap. The app still needs an end-to-end sandbox test to confirm the provider contract and all credit flows.
 
 ## AI speed and model operations
 
 - Script generation uses a configurable provider order, a bounded provider timeout, and fallback to the next configured provider. Keep the provider with the best latency and quota first in `config/ai-operations.json`. Fallbacks improve resilience but cannot make a slow or unavailable provider instant.
-- Narration generation runs up to three batches concurrently in the client; each server request uses bounded TTS concurrency. This aims to improve elapsed time without launching every voice segment at once. Provider quota, output length, network quality and hosting limits still affect response time.
+- Narration generation uses small client batches and two bounded TTS workers per server request to limit cost spikes. This aims to improve elapsed time without launching every voice segment at once. Provider quota, output length, network quality and hosting limits still affect response time.
 - For staff who maintain prompts/model identifiers, use the template in `staff-ai-ops-template/` as a **separate GitHub repository**. Grant staff access to that repository only, not the app repository or deployment secrets. GitHub does not offer secure folder-only permissions inside a single repository. The backend can fetch a private config repo using a read-only token; never put secrets or customer data in the config.
 
 ## Standalone legal pages
@@ -129,8 +129,8 @@ The service worker caches only public static resources and does **not** cache AP
 
 ### Flutterwave webhook (WyCut)
 
-Register this endpoint in the Flutterwave merchant dashboard for the WyCut deployment: `https://YOUR-WYCUT-DOMAIN/api/billing/webhook`. Do not use the WyBuild domain. The endpoint validates the configured webhook secret/signature, fetches the transaction from the configured Flutterwave verification URL, checks the verified transaction against the saved WyCut order (reference, provider ID, amount and NGN currency), and credits recap purchases idempotently. Configure `FLW_WEBHOOK_SECRET_HASH`, `FLW_SECRET_KEY`, and `FLW_V4_VERIFY_URL_TEMPLATE` in WyCut's Vercel environment; the verify URL must match the Flutterwave v4 endpoint enabled for your merchant account.
+Register only WyBuild's webhook in Flutterwave: `https://wybuild-black.vercel.app/api/billing/webhook`. WyBuild retrieves the authoritative charge from Flutterwave v4 and forwards successful WyCut charges for idempotent settlement; verified terminal failures are forwarded only to mark the order rejected. For reference-only webhooks, WyBuild uses a shared-secret read-only lookup to get the stored charge ID before independently verifying it with Flutterwave. WyCut checks the shared secret and stored order before granting credits. See `FLUTTERWAVE-WEBHOOK-SETUP.md` for the minimum variables and sandbox test plan.
 
 ### Lifetime-free account
 
-The account `ilemobayotolulope11092003@gmail.com` has a server-side lifetime-free entitlement in `lib/billing/entitlements.ts`. The exemption is checked only after verifying the signed-in Google/Firebase ID token. It bypasses checkout and recap-credit deductions; it does not weaken verification for other accounts.
+The account `ilemobayotolulope11092003@gmail.com` has a server-side lifetime-free entitlement in `lib/billing/entitlements.ts`. The exemption is checked only after verifying the signed-in Google/Firebase ID token and verified email. An unverified email/password account cannot claim the allowlisted address. It bypasses checkout and recap-credit deductions; it does not weaken verification for other accounts.

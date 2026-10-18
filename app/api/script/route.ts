@@ -21,12 +21,16 @@ export async function POST(req: NextRequest) {
     usageId = await reserveRecapCredit(identity.userId, identity.email, body.title);
   } catch (e) {
     if (e instanceof Error && e.message === 'NO_RECAP_CREDITS') return NextResponse.json({ error: 'You have no recap credits. Purchase a single recap or a 10-recap pack to continue.', code: 'NO_RECAP_CREDITS', billingUrl: '/billing' }, { status: 402 });
+    if (e instanceof Error && e.message === 'SCRIPT_RATE_LIMIT') return NextResponse.json({ error: 'This Google account has reached the five-script-per-10-minute limit. Wait a few minutes before generating again.', code: 'SCRIPT_RATE_LIMIT' }, { status: 429, headers: { 'Retry-After': '600', 'Cache-Control': 'no-store' } });
     return NextResponse.json({ error: 'Could not reserve a recap credit. Please try again.' }, { status: 503 });
   }
   try {
     const result = await generateRecapScript({ title: body.title, transcript: body.transcript, targetRuntimeSeconds: body.targetRuntimeSeconds ?? 600, beatCount: body.beatCount ?? 38 });
-    await markRecapCreditConsumed(usageId);
-    return NextResponse.json({ ...result, recapId: usageId }, { headers: { 'Cache-Control': 'no-store' } });
+    await markRecapCreditConsumed(usageId, result.script);
+    const srtRanges = [...body.transcript.matchAll(/(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})/g)];
+    const vttRanges = [...body.transcript.matchAll(/(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2})\.(\d{3})/g)];
+    const hasSourceTimecodes = srtRanges.some(m => Number(m[5]) * 3600 + Number(m[6]) * 60 + Number(m[7]) + Number(m[8]) / 1000 > Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) + Number(m[4]) / 1000) || vttRanges.some(m => Number(m[4]) * 60 + Number(m[5]) + Number(m[6]) / 1000 > Number(m[1]) * 60 + Number(m[2]) + Number(m[3]) / 1000);
+    return NextResponse.json({ ...result, recapId: usageId, hasSourceTimecodes }, { headers: { 'Cache-Control': 'no-store' } });
   } catch (e) {
     await refundRecapCredit(usageId).catch(() => undefined);
     return NextResponse.json({ error: e instanceof Error ? e.message : 'Script generation failed. Your recap credit was refunded.' }, { status: 502 });

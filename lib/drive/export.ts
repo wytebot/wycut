@@ -38,7 +38,7 @@ async function createFolder(name: string, token: string, parentId?: string): Pro
   const { data } = await driveRequest<{ id: string; webViewLink?: string }>(`${DRIVE_API}?fields=id,webViewLink`, token, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name, mimeType: FOLDER_MIME, ...(parentId ? { parents: [parentId] } : {}) }),
-  });
+  }, 1);
   if (!data.id) throw new Error(`Google Drive did not return an ID for folder ${name}.`);
   return data;
 }
@@ -52,6 +52,7 @@ async function uploadFile(file: DriveExportFile, parentId: string, token: string
   const name = file.name.replace(/[\\/\u0000-\u001f]/g, '_').slice(0, 180);
   if (!name) throw new Error('A Drive export file is missing a valid filename.');
   const blob = bodyBlob(file.body, mimeType);
+  if (blob.size === 0) throw new Error(`${name} is empty and was not uploaded.`);
   if (blob.size > MAX_SINGLE_FILE_BYTES) throw new Error(`${name} exceeds the 5 GB per-file export safety limit.`);
   const metadata = { name, mimeType, parents: [parentId] };
   // Resumable upload handles large video files far more reliably than multipart requests.
@@ -64,15 +65,34 @@ async function uploadFile(file: DriveExportFile, parentId: string, token: string
   if (!start.ok) throw new Error(`Could not start Drive upload for ${name} (HTTP ${start.status}).`);
   const uploadUrl = start.headers.get('location');
   if (!uploadUrl || !uploadUrl.startsWith('https://www.googleapis.com/')) throw new Error('Google Drive did not return a valid resumable upload URL.');
-  const result = await fetchWithTimeout(uploadUrl, { method: 'PUT', headers: { 'Content-Type': mimeType, 'Content-Range': `bytes 0-${blob.size - 1}/${blob.size}` }, body: blob, cache: 'no-store' }, 10 * 60_000, `Uploading ${name}`);
-  if (result.status === 401) throw new Error('Google Drive access token expired or was revoked. Reconnect Google Drive and retry the export.');
-  if (!result.ok) {
-    const detail = (await result.text().catch(() => '')).slice(0, 300);
-    throw new Error(`Drive upload failed for ${name} (HTTP ${result.status}): ${detail || result.statusText}`);
+  const chunkSize = 8 * 1024 * 1024; // Google resumable upload chunks must be multiples of 256 KiB.
+  let offset = 0; let completed: { id?: string; name?: string; webViewLink?: string } | null = null; let retries = 0;
+  while (offset < blob.size && !completed) {
+    const endExclusive = Math.min(blob.size, offset + chunkSize); const chunk = blob.slice(offset, endExclusive);
+    try {
+      const result = await fetchWithTimeout(uploadUrl, { method: 'PUT', headers: { 'Content-Type': mimeType, 'Content-Range': `bytes ${offset}-${endExclusive - 1}/${blob.size}` }, body: chunk, cache: 'no-store' }, 120_000, `Uploading ${name}`);
+      if (result.status === 401) throw new Error('Google Drive access token expired or was revoked. Reconnect Google Drive and retry the export.');
+      if (result.status === 308) {
+        const range = result.headers.get('range') || ''; const match = /bytes=0-(\d+)/i.exec(range);
+        if (!match) { if (retries >= 3) throw new Error(`Google Drive did not confirm the uploaded byte range for ${name}.`); retries++; await new Promise(resolve => setTimeout(resolve, 500 * 2 ** retries)); continue; }
+        const nextOffset = Number(match[1]) + 1;
+        if (!Number.isFinite(nextOffset) || nextOffset <= offset || nextOffset > blob.size) throw new Error(`Google Drive returned an invalid resumable offset for ${name}.`);
+        offset = nextOffset; retries = 0; continue;
+      }
+      if (!result.ok) { const detail = (await result.text().catch(() => '')).slice(0, 300); if ([408, 429, 500, 502, 503, 504].includes(result.status) && retries < 3) throw new Error(`Temporary Drive upload error for ${name} (HTTP ${result.status}); checking resumable offset before retry.`); throw new Error(`Drive upload failed for ${name} (HTTP ${result.status}): ${detail || result.statusText}`); }
+      completed = await result.json() as { id?: string; name?: string; webViewLink?: string };
+    } catch (error) {
+      if (error instanceof Error && /access token expired/i.test(error.message)) throw error;
+      if (retries >= 3) throw error; retries++; await new Promise(resolve => setTimeout(resolve, 500 * 2 ** retries));
+      // Ask Google how many bytes it has accepted before resending anything.
+      const probe = await fetchWithTimeout(uploadUrl, { method: 'PUT', headers: { 'Content-Range': `bytes */${blob.size}` }, cache: 'no-store' }, 30_000, `Resuming ${name}`).catch(() => null);
+      if (probe?.status === 401) throw new Error('Google Drive access token expired or was revoked. Reconnect Google Drive and retry the export.');
+      if (probe?.status === 308) { const match = /bytes=0-(\d+)/i.exec(probe.headers.get('range') || ''); offset = match ? Number(match[1]) + 1 : 0; }
+      else if (probe?.ok) completed = await probe.json().catch(() => null) as { id?: string; name?: string; webViewLink?: string } | null;
+    }
   }
-  const item = await result.json() as { id?: string; name?: string; webViewLink?: string };
-  if (!item.id) throw new Error(`Google Drive upload for ${name} finished without a file ID.`);
-  return { id: item.id, name: item.name || name, webViewLink: item.webViewLink };
+  if (!completed?.id) throw new Error(`Google Drive upload for ${name} finished without a file ID.`);
+  return { id: completed.id, name: completed.name || name, webViewLink: completed.webViewLink };
 }
 /** Browser-direct BYOS upload: file bytes go from the user's browser to Google Drive, not through WyCut's server. */
 export async function exportProductionKit(accessToken: string, movieName: string, files: DriveExportFile[]): Promise<DriveExportResult> {
@@ -80,16 +100,23 @@ export async function exportProductionKit(accessToken: string, movieName: string
   if (!files.length || files.length > MAX_FILE_COUNT) throw new Error(`Provide between 1 and ${MAX_FILE_COUNT} export files.`);
   const cleanTitle = movieName.normalize('NFKD').replace(/[^a-zA-Z0-9 _-]/g, '').trim().replace(/\s+/g, '_').slice(0, 70) || 'Movie';
   const root = await createFolder(`WyCut_${cleanTitle}_10Min_Kit`, accessToken);
-  const folderIds = {
-    video: (await createFolder('01_Video_Clips', accessToken, root.id)).id,
-    voiceover: (await createFolder('02_Voiceover_Segments', accessToken, root.id)).id,
-    master: (await createFolder('03_Master_Tracks', accessToken, root.id)).id,
-  };
+  const folderUrl = root.webViewLink || `https://drive.google.com/drive/folders/${root.id}`;
   const uploaded: DriveExportResult['uploaded'] = [];
-  // Sequential upload avoids several simultaneous video blobs exhausting mobile memory.
-  for (let i = 0; i < files.length; i++) {
-    const item = await uploadFile(files[i], folderIds[files[i].folder], accessToken);
-    uploaded.push({ name: item.name, id: item.id, webViewLink: item.webViewLink });
+  try {
+    const folderIds = {
+      video: (await createFolder('01_Video_Clips', accessToken, root.id)).id,
+      voiceover: (await createFolder('02_Voiceover_Segments', accessToken, root.id)).id,
+      master: (await createFolder('03_Master_Tracks', accessToken, root.id)).id,
+    };
+    // Sequential upload avoids several simultaneous video blobs exhausting mobile memory.
+    for (let i = 0; i < files.length; i++) {
+      const item = await uploadFile(files[i], folderIds[files[i].folder], accessToken);
+      uploaded.push({ name: item.name, id: item.id, webViewLink: item.webViewLink });
+    }
+    return { folderId: root.id, folderUrl, uploaded };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : 'Drive export failed.';
+    const partial = new Error(`${detail} Partial production folder is available at ${folderUrl}; ${uploaded.length} file(s) uploaded before failure.`) as Error & { folderUrl?: string; uploadedCount?: number };
+    partial.folderUrl = folderUrl; partial.uploadedCount = uploaded.length; throw partial;
   }
-  return { folderId: root.id, folderUrl: root.webViewLink || `https://drive.google.com/drive/folders/${root.id}`, uploaded };
 }

@@ -14,6 +14,6 @@
   "tts": {
     "openaiModel": "tts-1",
     "deepgramModel": "aura-orpheus-en",
-    "maxConcurrency": 3
+    "maxConcurrency": 2
   }
 }

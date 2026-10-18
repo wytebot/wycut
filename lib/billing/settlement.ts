@@ -46,7 +46,12 @@ export async function settleVerifiedTransaction(tx: VerifiedFlutterwaveTransacti
     const [paymentSnap, latestOrderSnap, userSnap] = await Promise.all([
       transaction.get(paymentRef), transaction.get(orderRef), transaction.get(userRef),
     ]);
-    if (paymentSnap.exists) return { duplicate: true, creditsGranted: 0, balance: Number(userSnap.data()?.recapsAvailable || 0) };
+    if (paymentSnap.exists) {
+      const payment = paymentSnap.data() || {};
+      if (latestOrderSnap.exists && String(latestOrderSnap.data()?.status || '') !== 'credited') transaction.set(orderRef, { status: 'credited', paymentId, providerTransactionId: String(tx.id), creditsGranted: Number(payment.creditsGranted || price.recaps), creditedAt: payment.verifiedAt || new Date().toISOString(), verifiedAmount: price.totalNgn, verifiedCurrency: 'NGN' }, { merge: true });
+      if (userSnap.data()?.activePaymentRef === tx.tx_ref) transaction.set(userRef, { activePaymentRef: null, updatedAt: new Date().toISOString() }, { merge: true });
+      return { duplicate: true, creditsGranted: 0, balance: Number(userSnap.data()?.recapsAvailable || 0) };
+    }
     if (!latestOrderSnap.exists) throw new Error('Order disappeared during settlement.');
     const latestOrder = latestOrderSnap.data()!;
     if (latestOrder.userId !== order.userId || latestOrder.productId !== price.id) throw new Error('Order ownership or product changed during settlement.');
@@ -65,6 +70,7 @@ export async function settleVerifiedTransaction(tx: VerifiedFlutterwaveTransacti
     transaction.set(userRef, {
       userId: order.userId, email: order.customerEmail, displayName: order.customerName || null,
       recapsAvailable: nextBalance, totalRecapsPurchased: Number(userSnap.data()?.totalRecapsPurchased || 0) + price.recaps,
+      activePaymentRef: userSnap.data()?.activePaymentRef === tx.tx_ref ? null : (userSnap.data()?.activePaymentRef || null),
       updatedAt: new Date().toISOString(), createdAt: userSnap.data()?.createdAt || new Date().toISOString(),
     }, { merge: true });
     transaction.set(orderRef, {

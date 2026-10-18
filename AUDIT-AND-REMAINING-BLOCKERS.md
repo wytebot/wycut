@@ -1,76 +1,59 @@
-# WyCut reliability + Capacitor audit
+# WyCut + WyBuild reliability audit (v18 work)
 
-## Changes applied in this revision
+## Fixes in this revision
 
-### Capacitor / APK architecture
-- Changed the Android app from a remote WebView wrapper to a **bundled static UI**. This keeps the Capacitor bridge on the local app origin and avoids relying on a production `server.url` override.
-- Added a guarded static-export script that temporarily moves server-only API routes and middleware out of the Next.js app, builds `out/`, and restores the API files even when the build fails. The normal server deployment still keeps the API routes.
-- Added `NEXT_PUBLIC_API_BASE_URL` so the APK's bundled UI calls the deployed HTTPS API server.
-- Added explicit CORS/preflight handling for the bundled Android origin and an origin allowlist (`CAPACITOR_ALLOWED_ORIGINS`). The API server must be deployed with `https://localhost,capacitor://localhost` allowed.
-- Added a reproducible Android debug build script and GitHub Actions workflow. It generates the Capacitor Android project, syncs plugins/assets, uses Java 17, and uploads the APK artifact. It fails early when required API/OAuth/Firebase configuration is missing.
-- Added Capacitor Filesystem, Share, and Browser plugins: small files can be saved/shared from Android, and the exported Drive folder opens in the native browser. Large video files should use direct Drive export to avoid base64 memory spikes.
-- Added mobile viewport sizing and conservative Android video memory limits.
+### WyCut environment and billing
+- Removed obsolete WyCut direct-webhook configuration and its receiver. Flutterwave has one registered webhook: WyBuild `/api/billing/webhook`.
+- Removed old/duplicate WyCut variables and code paths: `FLW_SECRET_KEY`, `FLW_V4_API_BASE`, `FLW_V4_CHARGES_PATH`, `FLW_V4_CARD_FIELD`, `FLW_WEBHOOK_SECRET_HASH`, `FLW_V4_VERIFY_URL_TEMPLATE`, `FLW_V4_VALIDATE_PATH_TEMPLATE`, `NEXT_PUBLIC_FLW_CARD_RSA_PUBLIC_KEY`, and `GOOGLE_WEB_CLIENT_ID`.
+- Kept variables still used by live code: Flutterwave v4 client credentials/base URL/encryption key, the WyBuild→WyCut shared secret, Firebase Admin credentials, Google OAuth Web client ID, AI provider keys/optional model overrides, and Capacitor build/origin variables.
+- The lifetime-free allowlist requires a verified Google/Firebase email; an unverified email/password account cannot claim the allowlisted address.
+- WyCut checkout follows the same v4 customer → payment method → charge structure as WyBuild. A Firestore per-user active-payment lock prevents a second charge while a prior order is unresolved; the lock clears on verified success, verified terminal failure, or a pre-charge provider error. Card fields and PIN data are AES-GCM encrypted in the browser. PIN/OTP continuation uses v4 `/charges/{id}`; WyCut does not independently settle payments.
+- Added stable idempotency keys for customer/payment-method/charge creation, and ambiguous charge timeouts now remain `unknown_provider_result` so the UI warns against a duplicate payment.
+- Prevented charge/authorization responses from overwriting a `credited` order if WyBuild's webhook settles it concurrently. Settlement also repairs an order's status if the payment ledger already exists.
+- Narration calls use server-stored script beats rather than trusting client-edited narration text. Failed TTS requests release their narration quota slot.
 
-### Workflow / processing
-- Serialized FFmpeg operations to prevent concurrent jobs from overwriting shared in-memory files; progress listeners and temporary files are cleaned up.
-- Corrected clip duration arguments, added video/audio mapping and fast-start MP4 metadata, and restricted source formats to MP4/M4V/MOV.
-- Native Android local FFmpeg source limit is 100 MB; desktop/mobile browser limit is 700 MB. These are guardrails, not a guarantee that every codec/device combination can process a file.
-- Added source duration validation before slicing to catch subtitle/video timeline mismatches early.
-- Split narration into small API batches, limited batch payload size, removed duplicate full-track base64 from server responses, and assemble ordered audio blobs in the client. This reduces the chance of serverless response-size failures and Android memory spikes.
-- Added an explicit “URL transcript unavailable” state rather than a clickable control that implies URL scraping works. Users must upload authorized SRT subtitles.
-- Added native per-file save/share controls instead of triggering many Android downloads at once.
-- Fixed Google Drive resumable upload to include a `Content-Range` header; kept uploads sequential with timeouts and clear expired-token errors.
-- Added best-effort per-process rate limits to script, narration, charge, and PIN/OTP routes.
+### Google Drive and local media
+- Google Drive sign-in is preloaded and reports OAuth/script/config errors. The access-token popup is requested synchronously from the button click to avoid popup-blocking after an `await`. The Connect button remains clickable and reports the exact configuration problem instead of staying disabled forever.
+- Drive files upload directly from the browser to Google Drive using 8 MiB resumable chunks, offset probing and bounded retries. Uploads are sequential to reduce mobile memory pressure. A full export interrupted between files can still leave a partial folder; whole-kit resume/cleanup is not implemented.
+- Subtitle URL reads are byte-limited while streaming, not after buffering the full response. Direct video URLs remain browser/CORS-dependent; YouTube/TikTok watch pages are not scraped or bypassed.
+- Video cuts are locally re-encoded to H.264/AAC for frame-accurate boundaries; 80 MiB Android / 100 MiB low-memory mobile browser / 300 MiB desktop browser source limits reduce out-of-memory risk. Timestamped SRT/VTT is required before cutting. Model timestamps are snapped to nearby subtitle cue boundaries and validated for range, overlap, duration and source coverage. Review scene selection before export; semantic accuracy cannot be guaranteed by code alone.
+- Captions use each generated audio segment's measured duration and split text proportionally. This is more accurate than word-count-only timing, but it is not word-level forced alignment. The full voiceover still concatenates MP3 segment blobs; validate it in target editors, especially if fallback providers are mixed.
 
-## Static checks performed
+### AI and cost controls
+- Script output is JSON-validated; beat count, narration length, source ranges, overlaps, dialogue-cue ranges and approximate word count are checked. Invalid output triggers provider fallback.
+- TTS is limited to small batches, two workers per server request, 3,500 characters per batch and 25 narration calls per recap. Failed provider calls release their quota slot.
+- The existing IP rate limiter is in-memory per process, but script generation now also enforces a transactional five-script-per-10-minute limit per verified Google account in Firestore. The IP limiter is still not distributed; the per-account guard protects the expensive generation path across instances.
 
-- ZIP extraction and static required-file audit passed.
-- TypeScript/TSX transpile syntax scan: 21 files checked, zero syntax diagnostics.
-- `npm install --ignore-scripts --no-audit --no-fund` timed out in this environment. Consequently, dependencies were unavailable and a full typecheck, lint, Next.js build, Capacitor sync, Gradle APK build, and live integration tests **could not be completed here**. Do not interpret the syntax scan as a successful typecheck or build.
+### WyBuild payment webhook
+- Downstream confirmation failures and Flutterwave lookup/reconciliation exceptions return HTTP 500 so webhook delivery can retry rather than silently returning success. WyCut confirmation URLs must use HTTPS.
+- Idempotency keys are stable per logical write. Payment-method keys now include the unique checkout reference so a later checkout does not accidentally reuse the previous checkout's idempotency key.
+- The webhook still needs a real merchant sandbox test to confirm Flutterwave's signature header/raw-body behavior and exact response payload for this account. Do not treat static code inspection as proof of provider integration.
 
-## APK build setup
+## Environment variables: only keep active ones
 
-1. Deploy the normal Next.js server app (with API routes) to an HTTPS host.
-2. Set the backend environment variable `CAPACITOR_ALLOWED_ORIGINS=https://localhost,capacitor://localhost` on that deployment.
-3. In GitHub repository Actions secrets, add:
-   - `NEXT_PUBLIC_API_BASE_URL`: the deployed API origin, e.g. `https://your-wycut-domain.example` (no `/api` suffix).
-   - `NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID`: the Google Web OAuth client ID used for native Google sign-in and Drive scope.
-   - `GOOGLE_SERVICES_JSON_BASE64`: base64 of the Android `google-services.json` generated for Firebase project `wycut5` and package `app.wycutrecap.vercel`.
-4. Push to `main` or run **Actions → Build WyCut Android APK → Run workflow**. The workflow generates Android sources and publishes an artifact named `wycut-debug-apk`.
-5. The workflow builds a **debug APK**, not a Play Store release. Configure a release keystore/signing workflow separately before distribution.
+WyCut's `.env.example` is the authoritative list for that project. The remaining variables are referenced by code or by the Android build workflow; do not add old `FLW_SECRET_KEY`, `FLW_V4_API_BASE`, `FLW_WEBHOOK_SECRET_HASH`, or RSA card-key variables back. WyBuild retains `FLW_CLIENT_ID`, `FLW_CLIENT_SECRET`, `FLW_ENCRYPTION_KEY`, `FLW_V4_BASE_URL`, and `FLW_SECRET_HASH` because its charge/webhook code uses them. WyBuild also needs `WYCUT_PAYMENT_CONFIRM_URL` and `WYCUT_WEBHOOK_SHARED_SECRET` to forward WyCut payments.
 
-## Critical blockers before public/live launch
+## Checks performed in this workspace
 
-1. **Authentication and ownership:** Google identity verification does not issue a persistent secure WyCut application session. Billing is not linked to an authenticated WyCut account.
-2. **Flutterwave v4 contract:** the configured direct-card, PIN/OTP continuation, webhook signature, and verification URL must match the exact v4 API product enabled for the merchant. No raw card details should pass through WyCut unencrypted. Do not enable live charges until tested end-to-end in sandbox.
-3. **Credit ledger:** verified payments are recorded idempotently, but the webhook intentionally does not credit recaps because there is no secure user-to-order mapping. Implement an account-linked transactional entitlement ledger before selling packs.
-4. **Rate limiting:** the included in-memory limiter is only a best-effort single-process guard; it is not sufficient on serverless/multi-instance deployment. Replace it with a shared store and add authenticated quotas before exposing paid AI endpoints.
-5. **TTS master track:** the full MP3 is assembled from MP3 segment blobs. Many players support this, but validate playback in CapCut and other target editors; normalize/re-encode with FFmpeg if compatibility problems appear.
-6. **Captions timing:** SRT timing is estimated from narration word count, not aligned to actual generated speech. Use provider word timestamps or forced alignment for precise captions.
-7. **Video cuts:** stream-copy cuts may snap to keyframes and are not frame-accurate. Rough-cut concatenation may fail when codecs/stream layouts differ. Test representative source files on the target Android devices.
-8. **Drive recovery:** if an upload is interrupted after folders/files are created, a partial kit remains in Drive; session persistence and resume/cleanup UI are not yet implemented.
-9. **Transcript URL ingestion:** intentionally not implemented. Use user-provided SRT or integrate an authorized transcript provider.
-10. **Android OAuth config:** the Firebase Android config must match package `app.wycutrecap.vercel`, and Google Cloud OAuth must include the correct Android signing fingerprints. A debug build does not prove native Google sign-in works until installed and tested on a real device.
-11. **Deployment limits:** test the chosen hosting plan's request duration, request-body limits, and AI provider quotas. The in-memory rate limiter is not distributed.
+- ZIP structure/required-file and PWA audits are run before packaging.
+- JavaScript syntax checks run for WyBuild's API and utility scripts.
+- TypeScript/TSX files are transpiled with the installed TypeScript compiler to catch syntax diagnostics.
+- `tsc --noEmit`, ESLint, Next.js production build, Capacitor/Gradle build and live provider tests are not considered passed unless dependencies are installed and those commands complete successfully. This environment did not have the app dependencies installed, so those full checks remain a release gate.
 
-## Release gate
+## Required real-world release tests
 
-After configuring secrets, run `npm install`, `npm run typecheck`, `npm run lint`, `npm run build`, and `npm run android:debug` in a network-enabled environment. Then install the APK and test SRT upload, AI fallback, narration batching, file picker, FFmpeg, local save/share, Drive OAuth/upload, expired token handling, CORS, and all provider sandbox flows. Do not switch to live payments until payment verification and account crediting are transactional and idempotent.
+1. `npm install`, `npm run typecheck`, `npm run lint`, `npm run build`, and `npm run android:debug` in a network-enabled environment.
+2. Web Google Drive: authorize an OAuth Web client, ensure Drive API is enabled, upload one small and one >8 MiB test file, revoke access, and confirm clear expired-token errors.
+3. Android Google Drive: install the built APK signed with the configured SHA-1/SHA-256, authorize the Android OAuth client, and confirm a Drive access token is returned.
+4. AI: test Gemini success, Gemini failure → OpenAI fallback, OpenAI failure → configured fallback, malformed/short AI output, and timeout errors.
+5. Media: use a licensed sample MP4 with matching SRT/VTT; inspect several clips for exact boundaries, audio continuity, rough-cut playback, and out-of-memory handling on a target Android device. Plain-text transcript timing cannot be considered accurate.
+6. Captions: compare SRT segment timing against the exported voiceover in CapCut/Premiere; use word-level alignment if exact syllable timing is required.
+7. Flutterwave sandbox: success, PIN, OTP, redirect/3DS, pending, failed, duplicate webhook, mismatched amount/currency/reference/charge ID, downstream WyCut 5xx, and charge timeout. Confirm credits are granted once and only after WyBuild verifies the charge.
+8. Check that `ilemobayotolulope11092003@gmail.com` receives WyCut free access after Google identity verification and that other accounts still require purchased credits.
 
+## Honest limitations
 
-## Billing implementation update
-
-The billing update adds `/billing`, fixed-rate NGN price calculation, Google identity verification on charge/OTP/status requests, server-created Firestore orders, PIN/OTP continuation, transaction verification, idempotent credit settlement, and transactional recap-credit reservation/refund. Script generation now consumes one recap credit and refunds it if generation fails; narration requests must belong to that generated recap. The exact Flutterwave v4 card-encryption and endpoint payload contract remains merchant-specific and must be confirmed with a sandbox transaction before live charges.
-
-
-## AI latency, operations and legal pages (this revision)
-
-- Added configurable provider priority, bounded timeouts, output token ceilings, and automatic fallback for script generation. Default model names and safe prompt instructions are in `config/ai-operations.json`; optional remote config is validated, size-limited, cached for five minutes, and falls back locally on errors.
-- Increased client narration batch concurrency from two to three while retaining bounded TTS workers on the server. Real-world latency depends on provider availability, quotas, source length and deployment limits; this is an optimization, not a latency guarantee.
-- Added standalone `/privacy`, `/terms`, `/refunds`, and `/acceptable-use` pages and links in landing, dashboard and billing UI. Legal text is a template and needs business contact details and jurisdiction-specific review before launch.
-- Added `staff-ai-ops-template/` for a separate repository containing only non-secret AI model/prompt configuration. Staff can receive access to that separate repository without access to app source. GitHub permissions are repository-level, so do not give them write access to the main app repository if they must not modify the app.
-
-
-## URL source workflow (v7)
-
-The dashboard now downloads direct HTTPS MP4/M4V/MOV URLs into device memory when the host permits browser CORS, accepts public SRT/VTT/text transcript URLs, and allows subtitle-file upload. The source is sliced locally with FFmpeg, then cut sections can be uploaded directly to Drive even if narration has not been generated. YouTube/TikTok watch-page URLs are detected and explained rather than scraped: this project does not use a platform-bypass downloader, and automatic platform transcript discovery remains unsupported.
+- Google OAuth client setup, authorized origins, Android fingerprints, Drive API enablement, provider quotas and merchant account settings cannot be validated from source code alone.
+- Frame-accurate re-encoding makes the cut boundaries precise relative to selected timestamps, but AI scene selection still requires review.
+- Browser CORS prevents downloading from some otherwise public hosts; WyCut intentionally does not proxy large video files through its server.
+- The complete Flutterwave, Drive and native Android flows must pass the real sandbox/device tests above before production/live billing.
