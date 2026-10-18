@@ -24,8 +24,10 @@ export async function POST(request: NextRequest) {
   if (!price) return error('Unknown product.');
   if (!input.encryptedCard || input.encryptedCard.length > 20000) return error('Missing encrypted card payload. Card data must be encrypted in the browser before submission.');
   let identity;
-  try { identity = await verifyGoogleIdentity(input.idToken || ''); }
-  catch (e) { return error(e instanceof Error ? e.message : 'Google authentication failed.', 401); }
+  try {
+    identity = await verifyGoogleIdentity(input.idToken || '');
+    if (identity.email.endsWith('@phone.wycut.invalid')) return error('This phone-only account needs an email address for checkout. Sign in with an email or Google account to purchase credits.', 400);
+  } catch (e) { return error(e instanceof Error ? e.message : 'Authentication failed.', 401); }
   let db;
   try { db = getAdminDb(); } catch { return error('Secure payment storage is not configured. Contact the app owner.', 503); }
   const chargesPath = process.env.FLW_V4_CHARGES_PATH || '/charges';

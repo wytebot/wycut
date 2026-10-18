@@ -13,7 +13,7 @@ export default function HomePage() {
   return <main className="min-h-screen overflow-hidden bg-[#080a10] text-white">
     <header className="mx-auto flex max-w-7xl items-center justify-between px-6 py-6">
       <Link href="/" className="flex items-center gap-2 text-xl font-black tracking-tight"><span className="grid h-9 w-9 place-items-center rounded-xl bg-violet-500"><Clapperboard size={21}/></span>WyCut</Link>
-      <nav className="flex items-center gap-3"><Link href="/dashboard" className="hidden rounded-xl px-4 py-2 text-sm text-slate-300 hover:text-white sm:inline">Open studio</Link><Link href="/dashboard" className="rounded-xl bg-white px-4 py-2.5 text-sm font-bold text-black hover:bg-violet-100">Launch Generator <ArrowRight className="ml-1 inline" size={15}/></Link></nav>
+      <nav className="flex items-center gap-3"><Link href="/login" className="rounded-xl px-3 py-2 text-sm text-slate-300 hover:text-white">Sign in</Link><Link href="/dashboard" className="hidden rounded-xl px-4 py-2 text-sm text-slate-300 hover:text-white sm:inline">Open studio</Link><Link href="/dashboard" className="rounded-xl bg-white px-4 py-2.5 text-sm font-bold text-black hover:bg-violet-100">Launch Generator <ArrowRight className="ml-1 inline" size={15}/></Link></nav>
     </header>
     <section className="mx-auto grid max-w-7xl items-center gap-12 px-6 pb-20 pt-14 lg:grid-cols-[1.05fr_.95fr] lg:pt-24">
       <div><div className="mb-6 inline-flex items-center gap-2 rounded-full border border-violet-400/30 bg-violet-400/10 px-3 py-1.5 text-xs font-semibold text-violet-200"><span className="h-2 w-2 rounded-full bg-emerald-400"/> YOUR LOCAL-FIRST RECAP STUDIO</div>

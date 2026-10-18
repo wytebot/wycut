@@ -30,7 +30,8 @@
     "firebase-admin": "^13.0.2",
     "@capacitor/filesystem": "^5.0.7",
     "@capacitor/share": "^5.0.7",
-    "@capacitor/browser": "^5.0.7"
+    "@capacitor/browser": "^5.0.7",
+    "firebase": "^11.0.2"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
