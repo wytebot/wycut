@@ -134,3 +134,15 @@ Register only WyBuild's webhook in Flutterwave: `https://wybuild-black.vercel.ap
 ### Lifetime-free account
 
 The account `ilemobayotolulope11092003@gmail.com` has a server-side lifetime-free entitlement in `lib/billing/entitlements.ts`. The exemption is checked only after verifying the signed-in Google/Firebase ID token and verified email. An unverified email/password account cannot claim the allowlisted address. It bypasses checkout and recap-credit deductions; it does not weaken verification for other accounts.
+
+## Separate recap input flows
+
+- `/dashboard/url` — direct HTTPS video-file URLs plus a public subtitle URL or an uploaded subtitle file.
+- `/dashboard/file` — choose an MP4/M4V/MOV from the device and upload matching SRT/VTT/TXT subtitles.
+- `/dashboard/subtitles` — generate the original recap script, narration, and captions from subtitles without requiring a video file. Video slicing becomes available only after loading the matching authorized source video in the video-file flow.
+
+A YouTube watch-page URL is not a direct video-file URL. WyCut does not bypass YouTube's download restrictions and cannot reliably obtain a complete transcript from a watch link alone. To generate a recap from a YouTube video, provide a transcript/subtitle file you are authorized to use or a public subtitle URL; to cut clips, also provide the matching source video through an authorized download or local file. Direct video URLs must be accessible to the browser and the host must permit cross-origin downloads.
+
+### Recap-writing standards
+
+The AI is instructed to create original, transformative commentary grounded in the supplied subtitles; explain story cause-and-effect, character decisions, important turns, climax and resolution; distribute beats across the full source timeline; prioritize scenes viewers need to understand the story; and avoid long verbatim dialogue, lyrics, copied summaries, invented details, or claims that any wording guarantees copyright clearance. This is a writing-quality safeguard, not a guarantee against copyright claims or a legal determination of fair use.

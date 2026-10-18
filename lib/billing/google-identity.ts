@@ -2,6 +2,7 @@ import { OAuth2Client } from 'google-auth-library';
 import { getAdminAuth } from '@/lib/firebase-admin';
 
 const client = new OAuth2Client(process.env.NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID);
+function normalizeEmail(value: string): string { const email = value.trim().toLowerCase(); const match = email.match(/^([^@]+)@gmail\.com$/); return match ? `${match[1].split('+')[0].replace(/\./g, '')}@gmail.com` : email; }
 export type VerifiedIdentity = { userId: string; email: string; name: string | null; phoneNumber?: string | null };
 
 /** Accepts legacy Google OAuth ID tokens (native app) and Firebase Auth ID tokens (web providers). */
@@ -13,7 +14,7 @@ export async function verifyGoogleIdentity(idToken: string): Promise<VerifiedIde
       const ticket = await client.verifyIdToken({ idToken, audience });
       const payload = ticket.getPayload();
       if (payload?.sub && payload.email && payload.email_verified === true) {
-        return { userId: payload.sub, email: payload.email.toLowerCase(), name: payload.name || null };
+        return { userId: payload.sub, email: normalizeEmail(payload.email), name: payload.name || null };
       }
     } catch { /* This may be a Firebase Auth token; try Firebase Admin verification below. */ }
   }
@@ -30,7 +31,7 @@ export async function verifyGoogleIdentity(idToken: string): Promise<VerifiedIde
     }
     const legacyGoogleId = Array.isArray(googleIdentityIds) && typeof googleIdentityIds[0] === 'string' ? googleIdentityIds[0] : null;
     const email = typeof decoded.email === 'string' && decoded.email.trim()
-      ? decoded.email.toLowerCase()
+      ? decoded.normalizeEmail(decoded.email)
       : `${uid}@phone.wycut.invalid`;
     return {
       userId: legacyGoogleId || uid,

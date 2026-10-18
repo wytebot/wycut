@@ -82,9 +82,9 @@ export async function generateRecapScript(input: ScriptInput): Promise<{ script:
   const validRangesForPrompt = sourceRanges.filter(range => Number.isFinite(range.startSeconds) && Number.isFinite(range.endSeconds) && range.startSeconds >= 0 && range.endSeconds > range.startSeconds);
   const sourceDuration = validRangesForPrompt.length ? Math.max(...validRangesForPrompt.map(range => range.endSeconds)) : undefined;
   const operations = await getAiOperationsConfig();
-  const prompt = `Act as an experienced film-recap writer. Create an original, analytical recap script using only the source context below. Avoid long verbatim dialogue and avoid claiming the recap is guaranteed to qualify for monetization. Additional writing guidance: ${operations.script.promptGuidance}. Target runtime: ${runtime} seconds (${Math.round(runtime / 60)} minutes); beats: ${count}; target narration length: about ${Math.round(runtime / 60 * 130)}–${Math.round(runtime / 60 * 160)} words. Film/source title: ${title}. Source transcript duration: ${sourceDuration ? `${Math.round(sourceDuration)} seconds` : 'NOT PROVIDED; do not invent exact timestamps and clearly label timing as estimates'}. When timestamped cues are present, choose beat and dialogue-cue boundaries very close to actual subtitle cue boundaries and distribute beats across the full source timeline; do not use the 10-minute narration runtime as the source-video timeline.\n\n${schema}\n\nSOURCE TRANSCRIPT / SUBTITLES:\n${transcript}`;
+  const prompt = `Write a compelling, original, transformative film recap with commentary—not a substitute for the film and not a reproduction of its dialogue or another recap. Explain the important story events, character goals, turning points, cause-and-effect, stakes, climax and resolution so viewers can follow the story and understand why key scenes matter. Prioritize relevant scenes that meet normal viewer expectations, omit repetitive filler, and cover the full timeline rather than only the opening. Use fresh phrasing and concise analysis; do not copy distinctive dialogue, lyrics, screenplay text, or existing summaries. Do not make claims that wording can evade copyright detection or guarantees fair use/monetization. Do not invent facts or visual details not supported by the transcript. Additional writing guidance: ${operations.script.promptGuidance}. Target runtime: ${runtime} seconds (${Math.round(runtime / 60)} minutes); beats: ${count}; target narration length: about ${Math.round(runtime / 60 * 130)}–${Math.round(runtime / 60 * 160)} words. Film/source title: ${title}. Source transcript duration: ${sourceDuration ? `${Math.round(sourceDuration)} seconds` : 'NOT PROVIDED; do not invent exact timestamps and clearly label timing as estimates'}. When timestamped cues are present, align beat boundaries to real subtitle cues, distribute beats across the full source timeline, and never use the recap narration runtime as the source-video timeline. Every beat should contribute a distinct plot fact, character decision, consequence, or useful interpretation.\n\n${schema}\n\nSOURCE TRANSCRIPT / SUBTITLES:\n${transcript}`;
   const errors: string[] = [];
-  const timeoutMs = Math.min(60_000, Math.max(12_000, Number(process.env.AI_PROVIDER_TIMEOUT_MS) || 35_000));
+  const timeoutMs = Math.min(90_000, Math.max(12_000, Number(process.env.AI_PROVIDER_TIMEOUT_MS) || 75_000));
   for (const provider of operations.script.providerOrder) {
     if (provider === 'gemini' && process.env.GEMINI_API_KEY) {
       try {
@@ -95,7 +95,7 @@ export async function generateRecapScript(input: ScriptInput): Promise<{ script:
         );
         const result = await model.generateContent({
           contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: { responseMimeType: 'application/json', temperature: operations.script.temperature, maxOutputTokens: 6000 },
+          generationConfig: { responseMimeType: 'application/json', temperature: operations.script.temperature, maxOutputTokens: 10000, thinkingConfig: { thinkingBudget: 0 } },
         });
         return { script: validateScript(extractJson(result.response.text()), count, runtime, sourceRanges), provider: 'gemini' };
       } catch (error) {
@@ -108,7 +108,7 @@ export async function generateRecapScript(input: ScriptInput): Promise<{ script:
         const result = await openai.chat.completions.create({
           model: operations.script.openaiModel,
           temperature: operations.script.temperature,
-          max_tokens: 6000,
+          max_tokens: 10000,
           response_format: { type: 'json_object' },
           messages: [
             { role: 'system', content: operations.script.systemInstruction },

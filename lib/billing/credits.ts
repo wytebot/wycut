@@ -1,13 +1,19 @@
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { getAdminDb } from '@/lib/firebase-admin';
 import { hasLifetimeFreeAccess } from '@/lib/billing/entitlements';
 
-export async function reserveRecapCredit(userId: string, email: string, title: string) {
+export async function reserveRecapCredit(userId: string, email: string, title: string, deviceId?: string) {
   const db = getAdminDb();
+  await refundExpiredReservations(db);
   const userRef = db.collection('wycut_users').doc(userId);
   const usageId = randomUUID();
   const usageRef = db.collection('wycut_usage').doc(usageId);
   const lifetimeFree = hasLifetimeFreeAccess(email);
+  const pepper = process.env.TRIAL_PEPPER;
+  const hash = (value: string) => createHmac('sha256', pepper || 'wycut-trial-pepper-not-configured').update(value).digest('hex');
+  const deviceClaimRef = deviceId ? db.collection('wycut_trial_claims').doc(hash(`device:${deviceId}`)) : null;
+  const emailClaimRef = db.collection('wycut_trial_claims').doc(hash(`email:${email.trim().toLowerCase()}`));
+  const userClaimRef = db.collection('wycut_trial_claims').doc(hash(`user:${userId}`));
   await db.runTransaction(async transaction => {
     const user = await transaction.get(userRef);
     const now = Date.now(); const current = user.data() || {};
@@ -16,11 +22,32 @@ export async function reserveRecapCredit(userId: string, email: string, title: s
     if (!previousWindowStart || now - previousWindowStart >= 10 * 60 * 1000) { windowStart = now; windowCount = 0; }
     if (windowCount >= 5) throw new Error('SCRIPT_RATE_LIMIT');
     const balance = Number(current.recapsAvailable || 0);
-    if (!lifetimeFree && (!user.exists || balance < 1)) throw new Error('NO_RECAP_CREDITS');
-    transaction.set(userRef, { email, scriptWindowStartMs: windowStart, scriptWindowCount: windowCount + 1, ...(lifetimeFree ? { lifetimeFreeAccess: true } : { recapsAvailable: balance - 1 }), updatedAt: new Date().toISOString() }, { merge: true });
-    transaction.create(usageRef, { usageId, userId, email, title: title.slice(0, 160), status: 'reserved', narrationCalls: 0, lifetimeFreeAccess: lifetimeFree, createdAt: new Date().toISOString() });
+    const useTrial = !lifetimeFree && (!user.exists || balance < 1) && current.freeTrialUsed !== true;
+    if (!lifetimeFree && balance < 1 && !useTrial) throw new Error('NO_RECAP_CREDITS');
+    if (useTrial) {
+      if (!deviceId || deviceId.length < 16 || deviceId.length > 200 || !pepper) throw new Error('FREE_TRIAL_DEVICE_REQUIRED');
+      const [deviceClaim, emailClaim, userClaim] = await Promise.all([transaction.get(deviceClaimRef!), transaction.get(emailClaimRef), transaction.get(userClaimRef)]);
+      if (deviceClaim.exists) throw new Error('FREE_TRIAL_USED_ON_DEVICE');
+      if (emailClaim.exists || userClaim.exists) throw new Error('FREE_TRIAL_ALREADY_USED');
+      const day = new Date().toISOString().slice(0, 10); const dailyRef = db.collection('wycut_trial_limits').doc(day); const daily = await transaction.get(dailyRef);
+      const cap = Math.max(0, Number(process.env.FREE_TRIAL_DAILY_CAP || 100));
+      if (Number(daily.data()?.count || 0) >= cap) throw new Error('FREE_TRIAL_DAILY_CAP');
+      transaction.create(deviceClaimRef!, { userIdHash: hash(userId), emailHash: hash(email.trim().toLowerCase()), usageId, createdAt: new Date().toISOString() });
+      transaction.create(emailClaimRef, { usageId, createdAt: new Date().toISOString() }); transaction.create(userClaimRef, { usageId, createdAt: new Date().toISOString() });
+      transaction.set(dailyRef, { count: Number(daily.data()?.count || 0) + 1, updatedAt: new Date().toISOString() }, { merge: true });
+    }
+    transaction.set(userRef, { email, scriptWindowStartMs: windowStart, scriptWindowCount: windowCount + 1, ...(lifetimeFree ? { lifetimeFreeAccess: true } : useTrial ? { freeTrialUsed: true } : { recapsAvailable: balance - 1 }), updatedAt: new Date().toISOString() }, { merge: true });
+    transaction.create(usageRef, { usageId, userId, email, title: title.slice(0, 160), status: 'reserved', narrationCalls: 0, lifetimeFreeAccess: lifetimeFree, freeTrial: useTrial, ...(useTrial ? { trialClaimIds: [deviceClaimRef!.id, emailClaimRef.id, userClaimRef.id] } : {}), createdAt: new Date().toISOString(), createdAtMs: Date.now() });
   });
   return usageId;
+}
+
+
+/** Refund stale reservations on the next credit request; deployments should also schedule this function. */
+async function refundExpiredReservations(db: ReturnType<typeof getAdminDb>) {
+  const cutoff = Date.now() - 5 * 60 * 1000;
+  const stale = await db.collection('wycut_usage').where('status', '==', 'reserved').where('createdAtMs', '<=', cutoff).limit(50).get();
+  for (const doc of stale.docs) await refundRecapCredit(doc.id);
 }
 
 export async function markRecapCreditConsumed(usageId: string, script?: unknown) {
@@ -36,6 +63,10 @@ export async function refundRecapCredit(usageId: string) {
     const userId = String(usage.data()?.userId || '');
     if (!userId) return;
     if (usage.data()?.lifetimeFreeAccess === true) { transaction.set(usageRef, { status: 'refunded', refundedAt: new Date().toISOString() }, { merge: true }); return; }
+    if (usage.data()?.freeTrial === true) {
+      if (usage.data()?.script === undefined) { const claims = Array.isArray(usage.data()?.trialClaimIds) ? usage.data()!.trialClaimIds as string[] : []; for (const id of claims) transaction.delete(db.collection('wycut_trial_claims').doc(id)); const userRef = db.collection('wycut_users').doc(userId); transaction.set(userRef, { freeTrialUsed: false, updatedAt: new Date().toISOString() }, { merge: true }); }
+      transaction.set(usageRef, { status: 'refunded', refundedAt: new Date().toISOString() }, { merge: true }); return;
+    }
     const userRef = db.collection('wycut_users').doc(userId);
     const user = await transaction.get(userRef);
     transaction.set(userRef, { recapsAvailable: Number(user.data()?.recapsAvailable || 0) + 1, updatedAt: new Date().toISOString() }, { merge: true });
@@ -62,7 +93,7 @@ export async function reserveNarrationBatch(usageId: string, userId: string, req
     const beats = matched as Array<NonNullable<(typeof matched)[number]>>;
     if (beats.reduce((sum, beat) => sum + beat.narration.length, 0) > 3500) throw new Error('NARRATION_BATCH_TOO_LARGE');
     const count = Number(usage.data()?.narrationCalls || 0);
-    if (count >= 25) throw new Error('NARRATION_LIMIT');
+    if (count >= 80) throw new Error('NARRATION_LIMIT');
     transaction.set(ref, { narrationCalls: count + 1, lastNarrationRequestedAt: new Date().toISOString() }, { merge: true });
     return beats;
   });

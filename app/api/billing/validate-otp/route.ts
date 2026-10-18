@@ -12,7 +12,7 @@ export async function POST(request: NextRequest) {
   if (!limit.allowed) return NextResponse.json({ error: 'Too many verification attempts. Wait before retrying.' }, { status: 429, headers: { 'Retry-After': String(limit.retryAfterSeconds), 'Cache-Control': 'no-store' } });
   if (!isAllowedApiOrigin(request)) return NextResponse.json({ error: 'Cross-origin request rejected.' }, { status: 403 });
   let input: Input; try { input = await request.json() as Input; } catch { return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 }); }
-  if (!input.txRef || input.txRef.length > 140) return NextResponse.json({ error: 'Invalid transaction reference.' }, { status: 400 });
+  if (!input.txRef || !/^[A-Za-z0-9_-]{12,140}$/.test(input.txRef)) return NextResponse.json({ error: 'Invalid transaction reference.' }, { status: 400 });
   let identity; try { identity = await verifyGoogleIdentity(input.idToken || ''); } catch (e) { return NextResponse.json({ error: e instanceof Error ? e.message : 'Google authentication failed.' }, { status: 401 }); }
   const action = input.action === 'pin' ? 'pin' : 'otp';
   let authorization: Record<string, unknown>;
@@ -23,6 +23,7 @@ export async function POST(request: NextRequest) {
     if (!orderSnap.exists || orderSnap.data()?.userId !== identity.userId) return NextResponse.json({ error: 'Order not found for this Google account.' }, { status: 404 });
     const order = orderSnap.data()!; const chargeId = String(order.providerChargeId || '');
     if (!chargeId) return NextResponse.json({ error: 'Flutterwave has not returned a charge ID for this order.' }, { status: 409 });
+    if (order.status !== 'requires_auth') return NextResponse.json({ error: 'This order is not awaiting OTP/PIN authorization.' }, { status: 409, headers: { 'Cache-Control': 'no-store' } });
     if (order.status === 'credited') return NextResponse.json({ status: 'SUCCESSFUL', message: 'This order is already complete.' }, { headers: { 'Cache-Control': 'no-store' } });
     const token = await getFlutterwaveV4AccessToken(); const base = flutterwaveV4BaseUrl();
     const response = await fetch(`${base}/charges/${encodeURIComponent(chargeId)}`, { method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ authorization }), cache: 'no-store', signal: AbortSignal.timeout(20000) });

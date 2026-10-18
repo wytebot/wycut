@@ -17,7 +17,8 @@ export async function POST(req: NextRequest) {
     const freeAccess = hasLifetimeFreeAccess(identity.email);
     const wallet = await getAdminDb().collection('wycut_users').doc(identity.userId).get();
     const recapsAvailable = Math.max(0, Number(wallet.data()?.recapsAvailable || 0));
-    return NextResponse.json({ freeAccess, email: identity.email, plan: freeAccess ? 'lifetime_free' : 'standard', recapsAvailable }, { headers: { 'Cache-Control': 'no-store' } });
+    const freeTrialAvailable = !freeAccess && wallet.data()?.freeTrialUsed !== true && !identity.email.endsWith('@phone.wycut.invalid');
+    return NextResponse.json({ freeAccess, freeTrialAvailable, email: identity.email, plan: freeAccess ? 'lifetime_free' : 'standard', recapsAvailable }, { headers: { 'Cache-Control': 'no-store' } });
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : 'Authentication failed.' }, { status: 401, headers: { 'Cache-Control': 'no-store' } });
   }
