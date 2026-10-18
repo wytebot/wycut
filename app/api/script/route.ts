@@ -27,7 +27,15 @@ export async function POST(req: NextRequest) {
     if (e instanceof Error && e.message === 'FREE_TRIAL_DEVICE_REQUIRED') return NextResponse.json({ error: 'Device verification is not configured for free trials.', code: e.message }, { status: 503 });
     if (e instanceof Error && e.message === 'NO_RECAP_CREDITS') return NextResponse.json({ error: 'You have no recap credits. Purchase a single recap or a 10-recap pack to continue.', code: 'NO_RECAP_CREDITS', billingUrl: '/billing' }, { status: 402 });
     if (e instanceof Error && e.message === 'SCRIPT_RATE_LIMIT') return NextResponse.json({ error: 'This Google account has reached the five-script-per-10-minute limit. Wait a few minutes before generating again.', code: 'SCRIPT_RATE_LIMIT' }, { status: 429, headers: { 'Retry-After': '600', 'Cache-Control': 'no-store' } });
-    return NextResponse.json({ error: 'Could not reserve a recap credit. Please try again.' }, { status: 503 });
+    console.error('[api/script] credit reservation failed', { name: e instanceof Error ? e.name : 'UnknownError', message: e instanceof Error ? e.message : 'unknown reservation error' });
+    const detail = e instanceof Error ? e.message : '';
+    const configFailure = /FIREBASE_SERVICE_ACCOUNT|not configured|invalid base64|missing project_id|permission-denied|PERMISSION_DENIED|index/i.test(detail);
+    return NextResponse.json({
+      error: configFailure
+        ? 'WyCut could not access its billing database. Check FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 and Firestore permissions/indexes in the Vercel function logs.'
+        : 'WyCut could not reserve a recap generation. Check your credits and retry; the exact database error is recorded in Vercel function logs.',
+      code: configFailure ? 'CREDIT_DATABASE_CONFIGURATION' : 'CREDIT_RESERVATION_FAILED',
+    }, { status: 503, headers: { 'Cache-Control': 'no-store' } });
   }
   try {
     const result = await generateRecapScript({ title: body.title, transcript: body.transcript, targetRuntimeSeconds: body.targetRuntimeSeconds ?? 600, beatCount: body.beatCount ?? 38 });
@@ -37,7 +45,20 @@ export async function POST(req: NextRequest) {
     const hasSourceTimecodes = srtRanges.some(m => Number(m[5]) * 3600 + Number(m[6]) * 60 + Number(m[7]) + Number(m[8]) / 1000 > Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) + Number(m[4]) / 1000) || vttRanges.some(m => Number(m[4]) * 60 + Number(m[5]) + Number(m[6]) / 1000 > Number(m[1]) * 60 + Number(m[2]) + Number(m[3]) / 1000);
     return NextResponse.json({ ...result, recapId: usageId, hasSourceTimecodes }, { headers: { 'Cache-Control': 'no-store' } });
   } catch (e) {
-    await refundRecapCredit(usageId).catch(() => undefined);
-    return NextResponse.json({ error: e instanceof Error ? e.message : 'Script generation failed. Your recap credit was refunded.' }, { status: 502 });
+    await refundRecapCredit(usageId).catch(refundError => {
+      console.error('[api/script] credit refund failed', { usageId, error: refundError instanceof Error ? refundError.message : 'unknown refund error' });
+    });
+    const detail = e instanceof Error ? e.message : 'Unknown provider error';
+    console.error('[api/script] generation failed', { usageId, name: e instanceof Error ? e.name : 'UnknownError', message: detail });
+    const lower = detail.toLowerCase();
+    const code = lower.includes('api key') || lower.includes('configure gemini') || lower.includes('configure openai') ? 'AI_PROVIDER_NOT_CONFIGURED'
+      : lower.includes('timed out') || lower.includes('timeout') || lower.includes('abort') ? 'AI_PROVIDER_TIMEOUT'
+      : lower.includes('json') || lower.includes('script returned') || lower.includes('beat') || lower.includes('narration draft') || lower.includes('timestamp') ? 'AI_RESPONSE_INVALID'
+      : 'AI_GENERATION_FAILED';
+    const publicMessage = code === 'AI_PROVIDER_NOT_CONFIGURED' ? 'AI script generation is not configured on the server. Add a valid GEMINI_API_KEY or OPENAI_API_KEY in Vercel Environment Variables.'
+      : code === 'AI_PROVIDER_TIMEOUT' ? 'The AI provider took too long to respond. Your recap credit was refunded; retry once, or check provider status and Vercel logs.'
+      : code === 'AI_RESPONSE_INVALID' ? 'The AI provider responded, but its script failed WyCut validation. Your recap credit was refunded. Retry generation; check Vercel logs for the exact validation reason.'
+      : 'WyCut could not complete AI script generation. Your recap credit was refunded if the request had reserved one. Check the Vercel function log for [api/script] generation failed and its error details.';
+    return NextResponse.json({ error: publicMessage, code }, { status: 502, headers: { 'Cache-Control': 'no-store' } });
   }
 }

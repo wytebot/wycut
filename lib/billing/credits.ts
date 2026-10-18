@@ -65,8 +65,13 @@ export async function reserveRecapCredit(userId: string, email: string, title: s
 /** Refund stale reservations on the next credit request; deployments should also schedule this function. */
 async function refundExpiredReservations(db: ReturnType<typeof getAdminDb>) {
   const cutoff = Date.now() - 5 * 60 * 1000;
-  const stale = await db.collection('wycut_usage').where('status', '==', 'reserved').where('createdAtMs', '<=', cutoff).limit(50).get();
-  for (const doc of stale.docs) await refundRecapCredit(doc.id);
+  // Avoid requiring a composite Firestore index for status + createdAtMs.
+  // Scan a bounded set of reservations and filter expiry in application code.
+  const candidates = await db.collection('wycut_usage').where('status', '==', 'reserved').limit(100).get();
+  for (const doc of candidates.docs) {
+    const createdAtMs = Number(doc.data()?.createdAtMs || 0);
+    if (createdAtMs > 0 && createdAtMs <= cutoff) await refundRecapCredit(doc.id);
+  }
 }
 
 export async function markRecapCreditConsumed(usageId: string, script?: unknown) {

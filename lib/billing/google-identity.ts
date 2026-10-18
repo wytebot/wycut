@@ -31,7 +31,7 @@ export async function verifyGoogleIdentity(idToken: string): Promise<VerifiedIde
     }
     const legacyGoogleId = Array.isArray(googleIdentityIds) && typeof googleIdentityIds[0] === 'string' ? googleIdentityIds[0] : null;
     const email = typeof decoded.email === 'string' && decoded.email.trim()
-      ? decoded.normalizeEmail(decoded.email)
+      ? normalizeEmail(decoded.email)
       : `${uid}@phone.wycut.invalid`;
     return {
       userId: legacyGoogleId || uid,

@@ -12,7 +12,8 @@
     "build:capacitor-web": "node scripts/build-capacitor-web.mjs",
     "android:debug": "node scripts/build-android.mjs",
     "audit:pwa": "node scripts/audit-pwa.mjs",
-    "audit:trial": "node scripts/audit-free-trial-policy.mjs"
+    "audit:trial": "node scripts/audit-free-trial-policy.mjs",
+    "audit:generation": "node scripts/audit-generation-fixes.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^5.7.8",
