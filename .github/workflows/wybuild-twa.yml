@@ -145,8 +145,13 @@ jobs:
           if (cfg.shell === 'twa' && selected.size) {
             console.error('::error::The Trusted Web Activity shell cannot expose WyBuildNative plugin APIs. Clear native app feature selections or switch to the standalone shell.'); process.exit(1);
           }
-          if (engine !== 'capacitor' && (selected.has('googleauth') || selected.has('push'))) {
-            console.error('::error::Native Firebase sign-in and remote push require a buildable Capacitor source project. This repository was detected as URL-only/TWA. Remove those options or provide a package.json build that outputs index.html.'); process.exit(1);
+          if (engine !== 'capacitor' && selected.has('googleauth')) {
+            // URL/TWA builds load the deployed web app, so Google sign-in uses the website's
+            // existing web OAuth flow; native Firebase GoogleAuth needs a Capacitor source build.
+            console.log('::notice::URL-based build selected: Google sign-in will use the website OAuth flow. Native Firebase GoogleAuth is available only for a buildable Capacitor source project.');
+          }
+          if (engine !== 'capacitor' && selected.has('push')) {
+            console.error('::error::Remote push requires a buildable Capacitor source project. This repository was detected as URL-only/TWA. Disable remote push or provide a package.json build that outputs index.html.'); process.exit(1);
           }
           if (engine === 'capacitor' && selected.has('sharetarget')) {
             console.error('::error::Receiving Android shares is currently supported only by the URL-based WyBuild native shell. Disable Share target for a Capacitor source build; outgoing sharing remains available through WyBuildNative.share().'); process.exit(1);
