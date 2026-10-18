@@ -68,7 +68,7 @@ export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgr
       const data = await ffmpeg.readFile(output);
       if (typeof data === 'string' || data.length === 0) throw new Error(`FFmpeg produced an empty clip for ${filename}.`);
       const bytes = new Uint8Array(data as Uint8Array);
-      results.push({ filename, blob: new Blob([bytes], { type: 'video/mp4' }), size: bytes.byteLength });
+      results.push({ filename, blob: new Blob([bytes.buffer as ArrayBuffer], { type: 'video/mp4' }), size: bytes.byteLength });
       await ffmpeg.deleteFile(output);
       onProgress?.((i + 1) / sorted.length, i + 1, sorted.length);
     }
