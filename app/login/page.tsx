@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
-  browserSessionPersistence,
+  browserLocalPersistence,
   getRedirectResult,
   GoogleAuthProvider,
   setPersistence,
@@ -52,8 +52,8 @@ export default function LoginPage() {
 
   async function finishLogin(user: User) {
     const token = await user.getIdToken(true);
-    sessionStorage.setItem(TOKEN_KEY, token);
-    sessionStorage.setItem('wycut_auth_email', user.email || '');
+    localStorage.setItem(TOKEN_KEY, token);
+    localStorage.setItem('wycut_auth_email', user.email || '');
     continueToApp();
   }
 
@@ -63,7 +63,7 @@ export default function LoginPage() {
     let active = true;
     void (async () => {
       try {
-        if (!Capacitor.isNativePlatform()) await setPersistence(firebaseAuth, browserSessionPersistence);
+        if (!Capacitor.isNativePlatform()) await setPersistence(firebaseAuth, browserLocalPersistence);
         const result = await getRedirectResult(firebaseAuth);
         if (active && result?.user) await finishLogin(result.user);
       } catch (e) {
@@ -82,12 +82,12 @@ export default function LoginPage() {
     try {
       if (Capacitor.isNativePlatform()) {
         const nativeUser = await signInWithGoogleNative();
-        sessionStorage.setItem(TOKEN_KEY, nativeUser.authentication.idToken);
-        sessionStorage.setItem('wycut_auth_email', nativeUser.email || '');
+        localStorage.setItem(TOKEN_KEY, nativeUser.authentication.idToken);
+        localStorage.setItem('wycut_auth_email', nativeUser.email || '');
         continueToApp();
         return;
       }
-      await setPersistence(firebaseAuth, browserSessionPersistence);
+      await setPersistence(firebaseAuth, browserLocalPersistence);
       const provider = new GoogleAuthProvider();
       provider.setCustomParameters({ prompt: 'select_account' });
       try {

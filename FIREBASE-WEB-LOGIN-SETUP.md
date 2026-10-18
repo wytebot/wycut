@@ -26,3 +26,8 @@ The `.env.example` file now contains the Firebase Web SDK values for project `wy
 ## Dashboard account and Google Drive connection (v19)
 
 The dashboard now reflects the signed-in email from the active WyCut session instead of always showing a generic sign-in label. Google Drive connection uses the dedicated Google Identity Services OAuth client when `NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID` is configured. If it is absent or the GIS script is unavailable, the dashboard falls back to Firebase Google popup sign-in requesting only the `drive.file` scope. The Firebase Google provider must be enabled, Google Drive API must be enabled in Google Cloud, and the OAuth consent settings must allow the app/domain. A Drive access token is held in memory only; reconnect after reload or expiry.
+
+## Persistent login and Drive connection (v21)
+- Web Firebase authentication uses `browserLocalPersistence`, so sign-in survives closing/reopening the browser until the user signs out, site data/cache is cleared, or the app/browser storage is removed.
+- The browser remembers the Google Drive connection and its token expiry in local storage. It attempts a silent Google token renewal when the saved token expires, and provides a manual Disconnect control.
+- Google access tokens are short-lived by design. Silent renewal depends on the Google OAuth session, browser privacy settings, and consent state; if Google requires user interaction, WyCut asks the user to reconnect. For guaranteed long-term Drive access without user interaction, implement a backend OAuth authorization-code flow with offline access and securely stored refresh tokens. Do not store refresh tokens in browser local storage.
