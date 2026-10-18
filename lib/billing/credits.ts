@@ -1,17 +1,19 @@
 import { randomUUID } from 'node:crypto';
 import { getAdminDb } from '@/lib/firebase-admin';
+import { hasLifetimeFreeAccess } from '@/lib/billing/entitlements';
 
 export async function reserveRecapCredit(userId: string, email: string, title: string) {
   const db = getAdminDb();
   const userRef = db.collection('wycut_users').doc(userId);
   const usageId = randomUUID();
   const usageRef = db.collection('wycut_usage').doc(usageId);
+  const lifetimeFree = hasLifetimeFreeAccess(email);
   await db.runTransaction(async transaction => {
     const user = await transaction.get(userRef);
     const balance = Number(user.data()?.recapsAvailable || 0);
-    if (!user.exists || balance < 1) throw new Error('NO_RECAP_CREDITS');
-    transaction.set(userRef, { email, recapsAvailable: balance - 1, updatedAt: new Date().toISOString() }, { merge: true });
-    transaction.create(usageRef, { usageId, userId, email, title: title.slice(0, 160), status: 'reserved', narrationCalls: 0, createdAt: new Date().toISOString() });
+    if (!lifetimeFree && (!user.exists || balance < 1)) throw new Error('NO_RECAP_CREDITS');
+    transaction.set(userRef, { email, ...(lifetimeFree ? { lifetimeFreeAccess: true } : { recapsAvailable: balance - 1 }), updatedAt: new Date().toISOString() }, { merge: true });
+    transaction.create(usageRef, { usageId, userId, email, title: title.slice(0, 160), status: 'reserved', narrationCalls: 0, lifetimeFreeAccess: lifetimeFree, createdAt: new Date().toISOString() });
   });
   return usageId;
 }
@@ -28,6 +30,7 @@ export async function refundRecapCredit(usageId: string) {
     if (!usage.exists || usage.data()?.status !== 'reserved') return;
     const userId = String(usage.data()?.userId || '');
     if (!userId) return;
+    if (usage.data()?.lifetimeFreeAccess === true) { transaction.set(usageRef, { status: 'refunded', refundedAt: new Date().toISOString() }, { merge: true }); return; }
     const userRef = db.collection('wycut_users').doc(userId);
     const user = await transaction.get(userRef);
     transaction.set(userRef, { recapsAvailable: Number(user.data()?.recapsAvailable || 0) + 1, updatedAt: new Date().toISOString() }, { merge: true });

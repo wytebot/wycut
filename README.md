@@ -126,3 +126,11 @@ WyCut includes a web app manifest, generated app icons (including maskable Andro
 - Registration and browser install prompt: `components/pwa-register.tsx`
 
 The service worker caches only public static resources and does **not** cache API, auth, billing, webhook, or private Google Drive responses. The app still needs a connection for AI generation, billing, OAuth and Drive sync; the offline page explains this rather than pretending those server actions work offline. PWA installation requires HTTPS and a supported browser. Test installability and service-worker behavior on the final deployed domain after deployment.
+
+### Flutterwave webhook (WyCut)
+
+Register this endpoint in the Flutterwave merchant dashboard for the WyCut deployment: `https://YOUR-WYCUT-DOMAIN/api/billing/webhook`. Do not use the WyBuild domain. The endpoint validates the configured webhook secret/signature, fetches the transaction from the configured Flutterwave verification URL, checks the verified transaction against the saved WyCut order (reference, provider ID, amount and NGN currency), and credits recap purchases idempotently. Configure `FLW_WEBHOOK_SECRET_HASH`, `FLW_SECRET_KEY`, and `FLW_V4_VERIFY_URL_TEMPLATE` in WyCut's Vercel environment; the verify URL must match the Flutterwave v4 endpoint enabled for your merchant account.
+
+### Lifetime-free account
+
+The account `ilemobayotolulope11092003@gmail.com` has a server-side lifetime-free entitlement in `lib/billing/entitlements.ts`. The exemption is checked only after verifying the signed-in Google/Firebase ID token. It bypasses checkout and recap-credit deductions; it does not weaken verification for other accounts.

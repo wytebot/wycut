@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { settleVerifiedTransaction, type VerifiedFlutterwaveTransaction } from '@/lib/billing/settlement';
+import { getFlutterwaveV4AccessToken, flutterwaveV4BaseUrl } from '@/lib/billing/flutterwave-v4';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 type EventPayload = { event?: string; type?: string; data?: { id?: string | number; tx_ref?: string; status?: string; amount?: number | string; currency?: string; customer?: { email?: string }; meta?: Record<string, unknown> } };
@@ -18,18 +19,15 @@ export async function POST(req: NextRequest) {
   try { event = JSON.parse(rawBody) as EventPayload; } catch { return NextResponse.json({ error: 'Invalid event JSON.' }, { status: 400 }); }
   const data = event.data;
   if (!data?.id || !data.tx_ref) return NextResponse.json({ error: 'Webhook is missing transaction ID or reference.' }, { status: 400 });
-  const template = process.env.FLW_V4_VERIFY_URL_TEMPLATE;
-  const secretKey = process.env.FLW_SECRET_KEY;
-  if (!template || !secretKey) return NextResponse.json({ error: 'Server-side transaction verification is not configured.' }, { status: 503 });
-  const verifyUrl = template.replaceAll('{id}', encodeURIComponent(String(data.id))).replaceAll('{tx_ref}', encodeURIComponent(data.tx_ref));
-  if (!verifyUrl.startsWith('https://')) return NextResponse.json({ error: 'Verification URL must use HTTPS.' }, { status: 500 });
   try {
-    const response = await fetch(verifyUrl, { headers: { Authorization: `Bearer ${secretKey}`, Accept: 'application/json' }, cache: 'no-store', signal: AbortSignal.timeout(20000) });
+    const token = await getFlutterwaveV4AccessToken();
+    const verifyUrl = `${flutterwaveV4BaseUrl()}${(process.env.FLW_V4_CHARGES_PATH || '/charges').replace(/\/$/, '')}/${encodeURIComponent(String(data.id))}`;
+    const response = await fetch(verifyUrl, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }, cache: 'no-store', signal: AbortSignal.timeout(20000) });
     const result = await response.json().catch(() => ({})) as { status?: string; message?: string; data?: VerifiedFlutterwaveTransaction };
     if (!response.ok || !result.data) return NextResponse.json({ error: 'Could not verify transaction with Flutterwave.' }, { status: 502 });
     const tx = result.data;
-    if (String(tx.id) !== String(data.id) || tx.tx_ref !== data.tx_ref) return NextResponse.json({ error: 'Verified transaction does not match webhook event.' }, { status: 400 });
-    const settlement = await settleVerifiedTransaction(tx);
+    if (String(tx.id) !== String(data.id) || String(tx.tx_ref || (tx as VerifiedFlutterwaveTransaction & { reference?: string }).reference) !== data.tx_ref) return NextResponse.json({ error: 'Verified transaction does not match webhook event.' }, { status: 400 });
+    const settlement = await settleVerifiedTransaction({ ...tx, tx_ref: data.tx_ref, status: 'successful' });
     return NextResponse.json({ received: true, duplicate: settlement.duplicate, creditsGranted: settlement.creditsGranted });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : 'Webhook processing failed.' }, { status: 400 });

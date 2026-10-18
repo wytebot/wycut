@@ -5,6 +5,8 @@ import { isAllowedApiOrigin } from '@/lib/server/origin';
 import { getAdminDb } from '@/lib/firebase-admin';
 import { verifyGoogleIdentity } from '@/lib/billing/google-identity';
 import { priceProduct } from '@/lib/billing/pricing';
+import { hasLifetimeFreeAccess } from '@/lib/billing/entitlements';
+import { getFlutterwaveV4AccessToken, flutterwaveV4BaseUrl } from '@/lib/billing/flutterwave-v4';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 type Input = { productId?: string; idToken?: string; encryptedCard?: string; customer?: { name?: string; phonenumber?: string } };
@@ -15,19 +17,20 @@ export async function POST(request: NextRequest) {
   const limit = enforceRateLimit(request, 'billing-charge', 5, 10 * 60 * 1000);
   if (!limit.allowed) return NextResponse.json({ error: 'Too many payment attempts. Wait before retrying.' }, { status: 429, headers: { ...noStore, 'Retry-After': String(limit.retryAfterSeconds) } });
   if (!isAllowedApiOrigin(request)) return error('Cross-origin request rejected. Configure CAPACITOR_ALLOWED_ORIGINS for the installed app.', 403);
-  const secret = process.env.FLW_SECRET_KEY;
-  const baseUrl = process.env.FLW_V4_API_BASE;
-  if (!secret || !baseUrl) return error('Flutterwave v4 billing is not configured.', 503);
   let input: Input;
   try { input = await request.json() as Input; } catch { return error('Invalid JSON body.'); }
-  const price = priceProduct(input.productId || '');
-  if (!price) return error('Unknown product.');
-  if (!input.encryptedCard || input.encryptedCard.length > 20000) return error('Missing encrypted card payload. Card data must be encrypted in the browser before submission.');
   let identity;
   try {
     identity = await verifyGoogleIdentity(input.idToken || '');
     if (identity.email.endsWith('@phone.wycut.invalid')) return error('This phone-only account needs an email address for checkout. Sign in with an email or Google account to purchase credits.', 400);
   } catch (e) { return error(e instanceof Error ? e.message : 'Authentication failed.', 401); }
+  if (hasLifetimeFreeAccess(identity.email)) return NextResponse.json({ freeAccess: true, plan: 'lifetime_free', message: 'Lifetime free access is active for this account. No payment is required.' }, { headers: noStore });
+  const price = priceProduct(input.productId || '');
+  if (!price) return error('Unknown product.');
+  let accessToken: string; let baseUrl: string;
+  try { accessToken = await getFlutterwaveV4AccessToken(); baseUrl = flutterwaveV4BaseUrl(); }
+  catch { return error('Flutterwave v4 OAuth credentials are not configured or authentication failed.', 503); }
+  if (!input.encryptedCard || input.encryptedCard.length > 20000) return error('Missing encrypted card payload. Card data must be encrypted in the browser before submission.');
   let db;
   try { db = getAdminDb(); } catch { return error('Secure payment storage is not configured. Contact the app owner.', 503); }
   const chargesPath = process.env.FLW_V4_CHARGES_PATH || '/charges';
@@ -46,7 +49,7 @@ export async function POST(request: NextRequest) {
     meta: { app: 'WyCut', order_id: txRef, product_id: price.id, base_amount: price.baseNgn, gateway_fee: price.feeNgn, fee_rate: 0.02, fx_rate_usd_ngn: 1400, recap_credits: price.recaps },
   };
   try {
-    const response = await fetch(`${baseUrl.replace(/\/$/, '')}${chargesPath}`, { method: 'POST', headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(payload), cache: 'no-store', signal: AbortSignal.timeout(25000) });
+    const response = await fetch(`${baseUrl.replace(/\/$/, '')}${chargesPath}`, { method: 'POST', headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(payload), cache: 'no-store', signal: AbortSignal.timeout(25000) });
     const result = await response.json().catch(() => ({})) as ProviderResponse;
     if (!response.ok) {
       await orderRef.set({ status: 'provider_rejected', providerHttpStatus: response.status, providerMessage: result.message || 'Provider rejected the charge.', updatedAt: new Date().toISOString() }, { merge: true });

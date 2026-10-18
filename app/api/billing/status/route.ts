@@ -4,6 +4,7 @@ import { verifyGoogleIdentity } from '@/lib/billing/google-identity';
 import { settleVerifiedTransaction, type VerifiedFlutterwaveTransaction } from '@/lib/billing/settlement';
 import { isAllowedApiOrigin } from '@/lib/server/origin';
 import { enforceRateLimit } from '@/lib/server/rate-limit';
+import { getFlutterwaveV4AccessToken, flutterwaveV4BaseUrl } from '@/lib/billing/flutterwave-v4';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export async function POST(req: NextRequest) {
@@ -20,17 +21,18 @@ export async function POST(req: NextRequest) {
     if (!snap.exists || snap.data()?.userId !== identity.userId) return NextResponse.json({ error: 'Order not found for this account.' }, { status: 404 });
     let order = snap.data()!;
     if (order.status !== 'credited') {
-      const template = process.env.FLW_V4_VERIFY_URL_TEMPLATE; const secret = process.env.FLW_SECRET_KEY;
-      const canVerify = Boolean(template && secret && (order.providerChargeId || template.includes('{tx_ref}')));
-      if (template && secret && canVerify) {
-        const url = template.replaceAll('{id}', encodeURIComponent(String(order.providerTransactionId || order.providerChargeId || ''))).replaceAll('{tx_ref}', encodeURIComponent(body.txRef));
-        if (!url.startsWith('https://')) return NextResponse.json({ error: 'Invalid verification URL.' }, { status: 500 });
-        const response = await fetch(url, { headers: { Authorization: `Bearer ${secret}`, Accept: 'application/json' }, cache: 'no-store', signal: AbortSignal.timeout(18000) });
-        const verified = await response.json().catch(() => ({})) as { data?: VerifiedFlutterwaveTransaction };
-        if (response.ok && verified.data && String(verified.data.tx_ref) === body.txRef && String(verified.data.status).toLowerCase() === 'successful') {
-          await settleVerifiedTransaction(verified.data);
-          const refreshed = await ref.get(); order = refreshed.data()!;
-        }
+      const chargeId = String(order.providerChargeId || order.providerTransactionId || '');
+      if (chargeId) {
+        try {
+          const token = await getFlutterwaveV4AccessToken();
+          const url = `${flutterwaveV4BaseUrl()}${(process.env.FLW_V4_CHARGES_PATH || '/charges').replace(/\/$/, '')}/${encodeURIComponent(chargeId)}`;
+          const response = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }, cache: 'no-store', signal: AbortSignal.timeout(18000) });
+          const verified = await response.json().catch(() => ({})) as { data?: VerifiedFlutterwaveTransaction };
+          if (response.ok && verified.data && String(verified.data.tx_ref || verified.data.reference) === body.txRef && ['successful', 'succeeded'].includes(String(verified.data.status).toLowerCase())) {
+            await settleVerifiedTransaction({ ...verified.data, tx_ref: body.txRef, status: 'successful' });
+            const refreshed = await ref.get(); order = refreshed.data()!;
+          }
+        } catch { /* Keep order pending; the authenticated WyBuild webhook can still settle it. */ }
       }
     }
     const wallet = await db.collection('wycut_users').doc(identity.userId).get();
