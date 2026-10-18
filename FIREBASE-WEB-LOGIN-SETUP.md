@@ -21,3 +21,8 @@ The `.env.example` file now contains the Firebase Web SDK values for project `wy
 - Login state currently uses browser session storage to fit the existing API contract. This is not an HttpOnly server session cookie.
 - The Google popup requests account selection with `prompt: select_account`; popup-blocked or unsupported cases fall back to redirect.
 - Test on the deployed HTTPS domain. A successful local build does not prove that Google OAuth, authorized domains, service-account permissions, or the native OAuth configuration are correct.
+
+
+## Dashboard account and Google Drive connection (v19)
+
+The dashboard now reflects the signed-in email from the active WyCut session instead of always showing a generic sign-in label. Google Drive connection uses the dedicated Google Identity Services OAuth client when `NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID` is configured. If it is absent or the GIS script is unavailable, the dashboard falls back to Firebase Google popup sign-in requesting only the `drive.file` scope. The Firebase Google provider must be enabled, Google Drive API must be enabled in Google Cloud, and the OAuth consent settings must allow the app/domain. A Drive access token is held in memory only; reconnect after reload or expiry.
