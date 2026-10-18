@@ -51,14 +51,18 @@ export async function POST(req: NextRequest) {
     const detail = e instanceof Error ? e.message : 'Unknown provider error';
     console.error('[api/script] generation failed', { usageId, name: e instanceof Error ? e.name : 'UnknownError', message: detail });
     const lower = detail.toLowerCase();
-    const code = lower.includes('api key') || lower.includes('configure gemini') || lower.includes('configure openai') ? 'AI_PROVIDER_NOT_CONFIGURED'
-      : lower.includes('timed out') || lower.includes('timeout') || lower.includes('abort') ? 'AI_PROVIDER_TIMEOUT'
-      : lower.includes('json') || lower.includes('script returned') || lower.includes('beat') || lower.includes('narration draft') || lower.includes('timestamp') ? 'AI_RESPONSE_INVALID'
-      : 'AI_GENERATION_FAILED';
-    const publicMessage = code === 'AI_PROVIDER_NOT_CONFIGURED' ? 'AI script generation is not configured on the server. Add a valid GEMINI_API_KEY or OPENAI_API_KEY in Vercel Environment Variables.'
-      : code === 'AI_PROVIDER_TIMEOUT' ? 'The AI provider took too long to respond. Your recap credit was refunded; retry once, or check provider status and Vercel logs.'
-      : code === 'AI_RESPONSE_INVALID' ? 'The AI provider responded, but its script failed WyCut validation. Your recap credit was refunded. Retry generation; check Vercel logs for the exact validation reason.'
-      : 'WyCut could not complete AI script generation. Your recap credit was refunded if the request had reserved one. Check the Vercel function log for [api/script] generation failed and its error details.';
+    const notConfigured = lower.includes('configure gemini') || lower.includes('configure openai') || lower.includes('api key') || lower.includes('api_key_invalid') || lower.includes('permission_denied') || lower.includes('[401') || lower.includes('[403') || lower.includes('incorrect api key');
+    const quota = lower.includes('429') || lower.includes('quota') || lower.includes('rate limit') || lower.includes('resource_exhausted');
+    const invalid = detail.includes('[invalid]');
+    const timeout = lower.includes('timed out') || lower.includes('timeout') || lower.includes('aborted') || lower.includes('fetch failed');
+    // Order matters: a validation failure must not be reported as a timeout or a config problem.
+    const code = invalid ? 'AI_RESPONSE_INVALID' : notConfigured ? 'AI_PROVIDER_NOT_CONFIGURED' : quota ? 'AI_PROVIDER_QUOTA' : timeout ? 'AI_PROVIDER_TIMEOUT' : 'AI_GENERATION_FAILED';
+    const validationReason = (detail.match(/\[invalid\]\s*([^|]+)/)?.[1] || '').trim().slice(0, 240);
+    const publicMessage = code === 'AI_PROVIDER_NOT_CONFIGURED' ? 'AI script generation is not configured correctly on the server. Add a valid GEMINI_API_KEY or OPENAI_API_KEY in Vercel Environment Variables and redeploy. Your recap credit was refunded.'
+      : code === 'AI_PROVIDER_QUOTA' ? 'The AI provider is rate-limited or out of quota right now. Your recap credit was refunded; wait a minute and retry, or check the provider billing/quota.'
+      : code === 'AI_PROVIDER_TIMEOUT' ? 'The AI provider took too long to respond. Your recap credit was refunded; retry once, or try a shorter transcript.'
+      : code === 'AI_RESPONSE_INVALID' ? `The AI wrote a script that failed WyCut's checks${validationReason ? ` (${validationReason})` : ''}. Your recap credit was refunded. Tap Generate again.`
+      : 'WyCut could not complete AI script generation. Your recap credit was refunded. Check the Vercel function log for "[api/script] generation failed".';
     return NextResponse.json({ error: publicMessage, code }, { status: 502, headers: { 'Cache-Control': 'no-store' } });
   }
 }

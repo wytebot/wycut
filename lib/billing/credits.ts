@@ -81,6 +81,22 @@ export async function markRecapCreditConsumed(usageId: string, script?: unknown)
 
 export async function refundRecapCredit(usageId: string) {
   const db = getAdminDb(); const usageRef = db.collection('wycut_usage').doc(usageId);
+  const before = await usageRef.get();
+  const wasReserved = before.exists && before.data()?.status === 'reserved';
+  const ownerId = String(before.data()?.userId || '');
+  await refundRecapCreditTransaction(db, usageRef, usageId);
+  // A failed generation must not use up one of the user's five script attempts per 10 minutes.
+  if (wasReserved && ownerId) {
+    const userRef = db.collection('wycut_users').doc(ownerId);
+    await db.runTransaction(async transaction => {
+      const user = await transaction.get(userRef);
+      const count = Number(user.data()?.scriptWindowCount || 0);
+      if (count > 0) transaction.set(userRef, { scriptWindowCount: count - 1 }, { merge: true });
+    }).catch(error => console.error('[credits] could not restore script attempt', { usageId, error: error instanceof Error ? error.message : 'unknown' }));
+  }
+}
+
+async function refundRecapCreditTransaction(db: ReturnType<typeof getAdminDb>, usageRef: DocumentReference, usageId: string) {
   await db.runTransaction(async transaction => {
     const usage = await transaction.get(usageRef);
     if (!usage.exists || usage.data()?.status !== 'reserved') return;

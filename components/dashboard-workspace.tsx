@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useState, type ChangeEvent, type DragEvent } from 'react';
+import { useEffect, useRef, useState, type ChangeEvent, type DragEvent } from 'react';
 import { Cloud, FileText, Link2, UploadCloud, CheckCircle2, AlertCircle, Clapperboard, Mic2, Scissors, FolderUp, LoaderCircle, Download } from 'lucide-react';
 import { sliceVideoLocally, concatenateClipsLocally, type SlicedClip } from '@/lib/ffmpeg/client-slicer';
 import { exportProductionKit, type DriveExportFile } from '@/lib/drive/export';
@@ -139,6 +139,9 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
   const [mode, setMode] = useState<SourceMode>(initialFlow); const [url, setUrl] = useState(''); const [subtitleUrl, setSubtitleUrl] = useState(''); const [file, setFile] = useState<File | null>(null); const [video, setVideo] = useState<File | null>(null); const [title, setTitle] = useState('My Movie');
   const [notice, setNotice] = useState(''); const [busy, setBusy] = useState(false); const [authEmail, setAuthEmail] = useState(''); const [freeTrialRemaining, setFreeTrialRemaining] = useState<number | null>(null); const [stage, setStage] = useState(''); const [progress, setProgress] = useState(0);
   useEffect(() => { setMode(initialFlow); }, [initialFlow]);
+  const noticeRef = useRef<HTMLParagraphElement | null>(null);
+  // Bring new status/errors into view so a tap never looks like it did nothing.
+  useEffect(() => { if (notice && !busy) noticeRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, [notice, busy]);
   const [script, setScript] = useState<RecapScript | null>(null); const [recapId, setRecapId] = useState(''); const [idToken, setIdToken] = useState(''); const [narration, setNarration] = useState<Narration | null>(null); const [clips, setClips] = useState<SlicedClip[]>([]); const [roughCut, setRoughCut] = useState<Blob | null>(null); const [driveToken, setDriveToken] = useState(''); const [driveFolder, setDriveFolder] = useState(''); const [googleReady, setGoogleReady] = useState(false); const [googleLoadError, setGoogleLoadError] = useState(''); const [hasSourceTimecodes, setHasSourceTimecodes] = useState(false); const [showClipDownloads, setShowClipDownloads] = useState(false);
   useEffect(() => {
     const syncAccount = () => { try { const token = localStorage.getItem('wycut_google_id_token') || sessionStorage.getItem('wycut_google_id_token') || ''; const email = localStorage.getItem('wycut_auth_email') || sessionStorage.getItem('wycut_auth_email') || ''; setIdToken(token); setAuthEmail(email); const drive = localStorage.getItem(DRIVE_TOKEN_KEY) || ''; const expires = Number(localStorage.getItem(DRIVE_TOKEN_EXPIRY_KEY) || 0); if (drive && expires > Date.now()) setDriveToken(drive); else if (drive) setDriveToken(''); } catch { setIdToken(''); setAuthEmail(''); } void firebaseAuth.currentUser?.getIdToken().then(freshToken => { setIdToken(freshToken); try { localStorage.setItem('wycut_google_id_token', freshToken); localStorage.setItem('wycut_auth_email', firebaseAuth.currentUser?.email || ''); } catch { /* ignore */ } }).catch(() => undefined); };
@@ -290,14 +293,16 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
   }
   async function generateScript() {
     if (busy) return;
-    if (!idToken) { setNotice('Sign in with Google first. If you are already signed in, refresh the page and try again.'); return; }
     setBusy(true); setStage('Checking source and preparing transcript…'); setProgress(5); setNotice('');
     setScript(null); setRecapId(''); setNarration(null); setClips([]); setRoughCut(null); setHasSourceTimecodes(false);
     try {
       const source = await getTranscript();
       if (!source.text.trim() || source.text.trim().length < 40) throw new Error('The selected transcript is empty or too short. Upload a readable SRT, VTT or TXT transcript, or enter a public subtitle URL.');
       setStage('Refreshing sign-in and checking generation access…'); setProgress(15);
-      const freshIdToken = await getAuthToken(idToken); setIdToken(freshIdToken);
+      let freshIdToken: string;
+      try { freshIdToken = await getAuthToken(idToken); }
+      catch (authError) { throw new Error(`${authError instanceof Error ? authError.message : 'Sign in required.'} Open Sign in / account at the top of this page, sign in with Google, then come back and tap Generate again.`); }
+      setIdToken(freshIdToken);
       let deviceId = '';
       try {
         deviceId = localStorage.getItem('wycut_device_id') || '';
@@ -356,7 +361,7 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ beats, voice: 'onyx', idToken: await getAuthToken(idToken), recapId }), cache: 'no-store',
           });
-          const data = await response.json().catch(() => ({})) as { error?: string; provider?: string; segments?: Array<{ index: number; id: string; filename: string; text: string; audioBase64: string }> };
+          const data = await response.json().catch(() => ({ error: `Narration API returned a non-JSON response (HTTP ${response.status}). Check Vercel function logs.` })) as { error?: string; provider?: string; segments?: Array<{ index: number; id: string; filename: string; text: string; audioBase64: string }> };
           if (!response.ok) throw new Error(data.error || `Narration batch failed (HTTP ${response.status}).`);
           if (!Array.isArray(data.segments) || !data.segments.length) throw new Error('Narration provider returned no audio segments.');
           if (data.provider) providers.add(data.provider);
@@ -408,6 +413,7 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
     </div>}
     {mode === 'subtitles' && <p className="mt-3 text-xs leading-5 text-slate-400">This flow generates the original recap script, narration and captions from your subtitle file. Video cuts are unavailable until you select a matching authorized video on the Choose video file page.</p>}
     <button type="button" disabled={busy} aria-live="polite" onClick={generateScript} className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-violet-500 px-5 py-3.5 font-bold hover:bg-violet-400 disabled:cursor-wait disabled:opacity-70">{busy ? <><LoaderCircle size={18} className="animate-spin" aria-hidden="true"/> {stage || 'Generating…'}</> : mode === 'subtitles' ? 'Generate recap from subtitles' : 'Generate recap script'}</button>
+    {!busy && notice && <p ref={noticeRef} role="alert" className={`mt-3 rounded-xl border px-4 py-3 text-sm leading-6 ${/fail|could not|error|expired|sign in|no recap credits|too many|not configured|limit|invalid|\[[A-Z_]+\]/i.test(notice) ? 'border-red-400/30 bg-red-500/10 text-red-200' : 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200'}`}>{notice}</p>}
     {busy && <div className="mt-3" aria-live="polite" role="status"><div className="mb-1 flex justify-between text-xs text-slate-300"><span>{stage || 'Processing…'}</span><span>{progress}%</span></div><div className="h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-violet-400 transition-all" style={{width:`${Math.max(5,progress)}%`}}/></div></div>}
   </div>
   {script&&<div className="rounded-2xl border border-white/10 bg-[#111521] p-5 sm:p-7"><div className="flex flex-wrap items-center justify-between gap-3"><h2 className="flex items-center gap-2 text-lg font-bold"><FileText size={20} className="text-violet-300"/> 2. Narrative script</h2><span className="text-xs text-slate-400">{script.beats.length} scenes · ~10 min · {hasSourceTimecodes ? 'timestamped source' : 'estimated timing only'}</span></div><div className="mt-4 max-h-96 space-y-3 overflow-auto">{script.beats.map(b=><article key={`${b.index}-${b.id}`} className="rounded-xl border border-white/10 bg-black/20 p-4"><div className="flex flex-wrap justify-between gap-2 text-xs text-violet-300"><span>{String(b.index).padStart(3,'0')} · Act {b.act} · {b.title}</span><span>{b.startSeconds.toFixed(1)}s–{b.endSeconds.toFixed(1)}s</span></div><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-300">{b.narration}</p>{b.dialogueCues.map((c,i)=><p key={i} className="mt-2 text-xs text-amber-200">[LET MOVIE AUDIO PLAY: {c.startSeconds}s–{c.endSeconds}s{c.quote?` · “${c.quote}”`:''}]</p>)}</article>)}</div><button disabled={busy} onClick={()=>void downloadFile(new Blob([JSON.stringify(script,null,2)],{type:'application/json'}),'WyCut_Timeline_Script.json')} className="mt-4 inline-flex items-center gap-2 rounded-lg border border-white/10 px-4 py-2 text-sm"><Download size={15}/> Download script JSON</button><button disabled={busy||!script} onClick={generateVoice} className="ml-2 mt-4 inline-flex items-center gap-2 rounded-lg bg-violet-500 px-4 py-2 text-sm font-bold disabled:opacity-50"><Mic2 size={15}/> Generate narration</button></div>}
