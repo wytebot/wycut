@@ -2,6 +2,10 @@
 
 The `/login` page uses **Google sign-in only**. On the web, it attempts a Google account-selection popup first and falls back to redirect sign-in if the popup is blocked or unsupported. Capacitor native builds continue to use the existing native Google sign-in integration.
 
+## Firebase environment variables
+
+The `.env.example` file now contains the Firebase Web SDK values for project `wycut5`. For local development, copy it to `.env.local` and keep the existing Firebase values. In Vercel, add these `NEXT_PUBLIC_FIREBASE_*` variables under **Project → Settings → Environment Variables** using the values shown in `.env.example`, then redeploy. These web SDK values are public client configuration; do not put service-account credentials in any `NEXT_PUBLIC_` variable.
+
 ## Firebase Console checklist
 
 1. Open Firebase Console for project `wycut5`.
