@@ -1,2 +1,2 @@
-import { redirect } from 'next/navigation';
-export default function LegacyDashboardFlow() { redirect('/dashboard'); }
+import { DashboardWorkspace } from '@/components/dashboard-workspace';
+export default function DashboardSubtitlesPage() { return <DashboardWorkspace initialFlow="subtitles" />; }
