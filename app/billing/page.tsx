@@ -17,12 +17,16 @@ function getIdentityLabel(token: string) {
 const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 function nonce12() { const values = new Uint32Array(12); window.crypto.getRandomValues(values); return Array.from(values, value => alphabet[value % alphabet.length]).join(''); }
 function toBase64(bytes: Uint8Array) { let binary = ''; for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + 0x8000, bytes.length))); return btoa(binary); }
+// Copy typed-array views into a standalone ArrayBuffer to satisfy modern TypeScript DOM BufferSource types.
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer { const copy = new Uint8Array(bytes.byteLength); copy.set(bytes); return copy.buffer; }
 async function encryptField(value: string, keyBase64: string, nonce: string) {
   if (!window.crypto?.subtle) throw new Error('Secure card encryption is unavailable. Open WyCut over HTTPS or use the updated APK.');
   let raw: Uint8Array; try { raw = Uint8Array.from(atob(keyBase64), c => c.charCodeAt(0)); } catch { throw new Error('Flutterwave v4 encryption key is invalid.'); }
   if (raw.length !== 32) throw new Error('Flutterwave v4 encryption key must decode to 32 bytes.');
-  const key = await window.crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt']);
-  const encrypted = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv: new TextEncoder().encode(nonce) }, key, new TextEncoder().encode(value));
+  const key = await window.crypto.subtle.importKey('raw', toArrayBuffer(raw), { name: 'AES-GCM' }, false, ['encrypt']);
+  const iv = toArrayBuffer(new TextEncoder().encode(nonce));
+  const plaintext = toArrayBuffer(new TextEncoder().encode(value));
+  const encrypted = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext);
   return toBase64(new Uint8Array(encrypted));
 }
 function passesLuhn(value: string) {
