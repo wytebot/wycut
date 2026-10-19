@@ -16,3 +16,8 @@
 
 ## Not verified here
 No dependencies were installed in the build environment: `npm install`, `npm run typecheck`, lint, build and Flutterwave sandbox tests must be run before going live. Static TypeScript checking was done with dependency errors filtered out.
+
+## v30.3 — big videos on phones
+- Videos picked from the device are now read in place (FFmpeg WORKERFS) instead of being copied into memory twice, so the 80/100/300 MB limits are gone; the cap is 2 GB. Downloads from a URL still have to be held in RAM and keep the smaller limit.
+- The last (shorter) audio part is no longer billed as a full 5-minute part.
+- Rough-cut joining is skipped (clips are still saved) when the clips total more than 150 MB on phones / 500 MB on desktop.

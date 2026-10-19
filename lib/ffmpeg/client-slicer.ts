@@ -1,6 +1,5 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
-import { Capacitor } from '@capacitor/core';
 
 export type ClipRange = { index: number; id: string; startSeconds: number; endSeconds: number };
 export type SlicedClip = { filename: string; blob: Blob; size: number };
@@ -37,6 +36,30 @@ async function getFFmpeg(): Promise<FFmpeg> {
   }
   return ffmpeg;
 }
+/** Largest video WyCut will open. The file is read in place (not copied into memory), so this is a technical limit, not a RAM limit. */
+export const MAX_SOURCE_BYTES = 2 * 1024 * 1024 * 1024 - 1;
+export const MAX_SOURCE_LABEL = '2 GB';
+const MEMORY_FALLBACK_BYTES = 100 * 1024 * 1024;
+
+/**
+ * Mounts the picked file into FFmpeg's filesystem with WORKERFS, which reads it from disk on demand.
+ * The old approach copied the whole video into JavaScript memory and then again into WebAssembly memory (2-3x the file size),
+ * which is why phones crashed on anything big. Falls back to the in-memory copy for small files if mounting is unavailable.
+ */
+async function openSource(ffmpeg: FFmpeg, file: File, name: string): Promise<{ path: string; close: () => Promise<void> }> {
+  const mountPoint = `/src_${Date.now()}`;
+  try {
+    await ffmpeg.createDir(mountPoint);
+    const mounted = await ffmpeg.mount('WORKERFS' as unknown as Parameters<FFmpeg['mount']>[0], { files: [new File([file], name, { type: file.type })] }, mountPoint);
+    if (mounted === false) throw new Error('mount refused');
+    return { path: `${mountPoint}/${name}`, close: async () => { try { await ffmpeg.unmount(mountPoint); } catch { /* already unmounted */ } try { await ffmpeg.deleteDir(mountPoint); } catch { /* cleanup is best effort */ } } };
+  } catch {
+    try { await ffmpeg.deleteDir(mountPoint); } catch { /* not created */ }
+    if (file.size > MEMORY_FALLBACK_BYTES) throw new Error(`This browser could not open the video directly from your device, and it is too large to load into memory (over ${Math.round(MEMORY_FALLBACK_BYTES / 1024 / 1024)} MB). Try Chrome, or upload subtitles instead.`);
+    await ffmpeg.writeFile(name, await fetchFile(file));
+    return { path: name, close: async () => { try { await ffmpeg.deleteFile(name); } catch { /* already removed */ } } };
+  }
+}
 function safeName(value: string): string { return value.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 45) || 'scene'; }
 
 /** Re-encodes each clip to make trim boundaries frame-accurate. This is slower than stream copy and uses more CPU/memory. */
@@ -45,26 +68,25 @@ export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgr
   if (!file || file.size === 0) throw new Error('Choose a non-empty local video file.');
   const extension = (file.name.split('.').pop() || '').toLowerCase();
   if (!['mp4', 'm4v', 'mov'].includes(extension)) throw new Error('Frame-accurate re-encoding currently supports MP4, M4V, and MOV sources. Convert other containers locally first or choose a supported file.');
-  const mobileBrowser = typeof navigator !== 'undefined' && (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || Number((navigator as Navigator & { deviceMemory?: number }).deviceMemory || 8) <= 4);
-  const maxBytes = Capacitor.isNativePlatform() ? 80 * 1024 * 1024 : mobileBrowser ? 100 * 1024 * 1024 : 300 * 1024 * 1024;
-  if (file.size > maxBytes) throw new Error(`This file exceeds the ${Capacitor.isNativePlatform() ? '80 MB Android' : mobileBrowser ? '100 MB mobile browser' : '300 MB desktop browser'} processing safety limit. FFmpeg uses several times the source size in memory; split the source first.`);
+  if (file.size > MAX_SOURCE_BYTES) throw new Error(`This video is larger than ${MAX_SOURCE_LABEL}. Split it first, or use a lower-resolution copy.`);
   if (!ranges.length || ranges.length > 60) throw new Error('Provide between 1 and 60 clip ranges.');
   const sorted = ranges.map((r, i) => ({ ...r, index: Number.isFinite(r.index) ? Math.max(1, Math.floor(r.index)) : i + 1 })).sort((a, b) => a.index - b.index);
   for (const r of sorted) if (!Number.isFinite(r.startSeconds) || !Number.isFinite(r.endSeconds) || r.startSeconds < 0 || r.endSeconds <= r.startSeconds) throw new Error(`Invalid range for ${r.id}.`);
   const ffmpeg = await getFFmpeg();
   const sourceName = `source_${Date.now()}.${extension}`;
+  let source: Awaited<ReturnType<typeof openSource>> | null = null;
   const progressHandler = ({ progress }: { progress: number }) => onProgress?.(Math.min(1, Math.max(0, progress)), 0, sorted.length);
   ffmpeg.on('progress', progressHandler);
   const results: SlicedClip[] = [];
   try {
-    await ffmpeg.writeFile(sourceName, await fetchFile(file));
+    source = await openSource(ffmpeg, file, sourceName);
     for (let i = 0; i < sorted.length; i++) {
       const range = sorted[i]; const id = safeName(range.id); const filename = `${String(range.index).padStart(3, '0')}_${id}.mp4`;
       if (range.endSeconds - range.startSeconds > 3600) throw new Error(`Clip ${filename} is over one hour long; split the range before processing.`);
       // Re-encode after accurate seeking. All clips use the same H.264/AAC settings so the rough-cut concat is more reliable.
       const output = `out_${i}.mp4`;
       const duration = range.endSeconds - range.startSeconds;
-      const code = await ffmpeg.exec(['-ss', range.startSeconds.toFixed(3), '-i', sourceName, '-t', duration.toFixed(3), '-map', '0:v:0', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', '-y', output]);
+      const code = await ffmpeg.exec(['-ss', range.startSeconds.toFixed(3), '-i', source.path, '-t', duration.toFixed(3), '-map', '0:v:0', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', '-y', output]);
       if (code !== 0) throw new Error(`FFmpeg failed while frame-accurately re-encoding ${filename}. The source may use an unsupported codec or this device may be out of memory.`);
       const data = await ffmpeg.readFile(output);
       if (typeof data === 'string' || data.length === 0) throw new Error(`FFmpeg produced an empty clip for ${filename}.`);
@@ -76,7 +98,7 @@ export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgr
     return results;
   } finally {
     ffmpeg.off('progress', progressHandler);
-    try { await ffmpeg.deleteFile(sourceName); } catch { /* already removed */ }
+    await source?.close();
     for (let i = 0; i < sorted.length; i++) { try { await ffmpeg.deleteFile(`out_${i}.mp4`); } catch { /* cleanup is best effort */ } }
   }
   });
@@ -130,22 +152,21 @@ export async function extractAudioChunksLocally(file: File, chunkSeconds: number
     if (!file || file.size === 0) throw new Error('Choose a non-empty local video file.');
     const extension = (file.name.split('.').pop() || '').toLowerCase();
     if (!['mp4', 'm4v', 'mov'].includes(extension)) throw new Error('Audio extraction supports MP4, M4V and MOV sources.');
-    const mobileBrowser = typeof navigator !== 'undefined' && (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || Number((navigator as Navigator & { deviceMemory?: number }).deviceMemory || 8) <= 4);
-    const maxBytes = Capacitor.isNativePlatform() ? 80 * 1024 * 1024 : mobileBrowser ? 100 * 1024 * 1024 : 300 * 1024 * 1024;
-    if (file.size > maxBytes) throw new Error('This video is larger than this device can safely process in memory. Use a smaller file or upload subtitles instead.');
+    if (file.size > MAX_SOURCE_BYTES) throw new Error(`This video is larger than ${MAX_SOURCE_LABEL}. Use a smaller copy or upload subtitles instead.`);
     const ffmpeg = await getFFmpeg();
     const sourceName = `audio_src_${Date.now()}.${extension}`;
     const handler = ({ progress }: { progress: number }) => onProgress?.(Math.min(1, Math.max(0, progress)));
     ffmpeg.on('progress', handler);
     const created: string[] = [];
+    let source: Awaited<ReturnType<typeof openSource>> | null = null;
     try {
-      await ffmpeg.writeFile(sourceName, await fetchFile(file));
+      source = await openSource(ffmpeg, file, sourceName);
       const attempts: Array<{ ext: string; mime: string; codec: string[] }> = [
         { ext: 'mp3', mime: 'audio/mp3', codec: ['-c:a', 'libmp3lame', '-b:a', '24k'] },
         { ext: 'aac', mime: 'audio/aac', codec: ['-c:a', 'aac', '-b:a', '32k'] },
       ];
       for (const attempt of attempts) {
-        const code = await ffmpeg.exec(['-i', sourceName, '-vn', '-map', '0:a:0', '-ac', '1', '-ar', '16000', ...attempt.codec, '-f', 'segment', '-segment_time', String(chunkSeconds), '-reset_timestamps', '1', '-y', `achunk_%03d.${attempt.ext}`]);
+        const code = await ffmpeg.exec(['-i', source.path, '-vn', '-map', '0:a:0', '-ac', '1', '-ar', '16000', ...attempt.codec, '-f', 'segment', '-segment_time', String(chunkSeconds), '-reset_timestamps', '1', '-y', `achunk_%03d.${attempt.ext}`]);
         const listing = await ffmpeg.listDir('.');
         const names = listing.filter(item => !item.isDir && item.name.startsWith('achunk_') && item.name.endsWith(`.${attempt.ext}`)).map(item => item.name).sort();
         created.push(...names);
@@ -155,14 +176,18 @@ export async function extractAudioChunksLocally(file: File, chunkSeconds: number
           const data = await ffmpeg.readFile(names[i]);
           if (typeof data === 'string' || !data.length) continue;
           const bytes = new Uint8Array(data as Uint8Array);
-          chunks.push({ index: i, blob: new Blob([bytes.buffer as ArrayBuffer], { type: attempt.mime }), mimeType: attempt.mime, offsetSeconds: i * chunkSeconds, durationSeconds: chunkSeconds });
+          // Only the final part is shorter than a full chunk; estimate it from its size so it is not billed as a full part.
+          const bytesPerSecond = attempt.ext === 'mp3' ? 3000 : 4000;
+          const durationSeconds = i === names.length - 1 ? Math.min(chunkSeconds, Math.max(2, Math.round(bytes.byteLength / bytesPerSecond))) : chunkSeconds;
+          chunks.push({ index: i, blob: new Blob([bytes.buffer as ArrayBuffer], { type: attempt.mime }), mimeType: attempt.mime, offsetSeconds: i * chunkSeconds, durationSeconds });
         }
         if (chunks.length) return chunks;
       }
       throw new Error('This video has no readable audio track, or FFmpeg could not decode it on this device.');
     } finally {
       ffmpeg.off('progress', handler);
-      for (const n of [sourceName, ...created]) { try { await ffmpeg.deleteFile(n); } catch { /* cleanup is best effort */ } }
+      await source?.close();
+      for (const n of created) { try { await ffmpeg.deleteFile(n); } catch { /* cleanup is best effort */ } }
     }
   });
 }
