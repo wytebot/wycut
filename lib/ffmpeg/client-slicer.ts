@@ -71,7 +71,7 @@ async function openSource(ffmpeg: FFmpeg, file: File, name: string): Promise<{ p
 function safeName(value: string): string { return value.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 45) || 'scene'; }
 
 /** Re-encodes each clip to make trim boundaries frame-accurate. This is slower than stream copy and uses more CPU/memory. */
-export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgress?: (progress: number, current: number, total: number) => void): Promise<SlicedClip[]> {
+export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgress?: (progress: number, current: number, total: number) => void, options: { fast?: boolean } = {}): Promise<SlicedClip[]> {
   return serialized(async () => {
   if (!file || file.size === 0) throw new Error('Choose a non-empty local video file.');
   const extension = (file.name.split('.').pop() || '').toLowerCase();
@@ -94,7 +94,10 @@ export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgr
       // Re-encode after accurate seeking. All clips use the same H.264/AAC settings so the rough-cut concat is more reliable.
       const output = `out_${i}.mp4`;
       const duration = range.endSeconds - range.startSeconds;
-      const code = await ffmpeg.exec(['-ss', range.startSeconds.toFixed(3), '-i', source.path, '-t', duration.toFixed(3), '-map', '0:v:0', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', '-y', output]);
+      const start = range.startSeconds.toFixed(3); const length = duration.toFixed(3);
+      // Fast cut copies the streams (no re-encode): seconds instead of minutes, but it starts at the nearest earlier keyframe.
+      let code = options.fast ? await ffmpeg.exec(['-ss', start, '-i', source.path, '-t', length, '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', '-y', output]) : -1;
+      if (code !== 0) code = await ffmpeg.exec(['-ss', start, '-i', source.path, '-t', length, '-map', '0:v:0', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', '-y', output]);
       if (code !== 0) throw new Error(`FFmpeg failed while frame-accurately re-encoding ${filename}. The source may use an unsupported codec or this device may be out of memory.`);
       const data = await ffmpeg.readFile(output);
       if (typeof data === 'string' || data.length === 0) throw new Error(`FFmpeg produced an empty clip for ${filename}.`);

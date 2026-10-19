@@ -94,7 +94,7 @@ export async function transcribeVideoToSrt(video: File, getToken: () => Promise<
       onStatus(`Transcribing audio… ${done} of ${chunks.length} parts`, 10 + Math.round(done / chunks.length * 12));
     }
   };
-  await Promise.all([worker(), worker()]);
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(4, chunks.length)) }, () => worker()));
   const cues: Cue[] = [];
   chunks.forEach((chunk, i) => {
     const segments = [...(results[i] || [])].sort((a, b) => a.start - b.start).filter(s => s.start <= chunk.durationSeconds + 2);
