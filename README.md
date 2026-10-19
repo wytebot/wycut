@@ -25,7 +25,7 @@ Never prefix private AI keys, Flutterwave secrets, or Firebase service-account c
 
 1. Deploy the regular Next.js app to an HTTPS host, for example `https://your-wycut-domain.example`.
 2. Set `CAPACITOR_ALLOWED_ORIGINS=https://localhost,capacitor://localhost` on the backend deployment so the bundled Capacitor app can call its API using CORS.
-3. Ensure `NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID` is configured for the backend build and Google OAuth is set up for package `app.wycutrecap.vercel`.
+3. Ensure `NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID` is configured for the backend build and Google OAuth is set up for package `app.wycut.vercel`.
 
 ### GitHub Actions build
 
@@ -33,7 +33,7 @@ Add these repository **Actions secrets**:
 
 - `NEXT_PUBLIC_API_BASE_URL`: the backend origin only, e.g. `https://your-wycut-domain.example` (do not append `/api`).
 - `NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID`: the Google Web OAuth client ID used by the native Google sign-in plugin.
-- `GOOGLE_SERVICES_JSON_BASE64`: base64-encoded `google-services.json` from Firebase project `wycut5`, configured for Android package `app.wycutrecap.vercel`.
+- `GOOGLE_SERVICES_JSON_BASE64`: base64-encoded `google-services.json` from Firebase project `wycut5`, configured for Android package `app.wycut.vercel`.
 
 Push to `main`, or open **Actions → Build WyCut Android APK → Run workflow**. The workflow installs dependencies, builds a static UI, generates/syncs the Android project, uses Java 17, builds a debug APK, and uploads the `wycut-debug-apk` artifact. The Android folder is generated during the build and is intentionally ignored in Git.
 

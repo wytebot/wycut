@@ -9,7 +9,7 @@ const required = [
   'lib/ai/script-generator.ts', 'lib/ai/tts-generator.ts',
   'lib/ffmpeg/client-slicer.ts', 'lib/drive/export.ts', 'lib/server/rate-limit.ts',
   'lib/api-client.ts', 'lib/auth/google-native.ts', 'lib/server/origin.ts', 'middleware.ts', 'next.config.mjs', 'capacitor.config.ts',
-  'scripts/build-capacitor-web.mjs', 'scripts/build-android.mjs', '.github/workflows/android-debug-apk.yml',
+  'scripts/build-capacitor-web.mjs', 'ANDROID-APK-CHECKLIST.md', 'config/android/google-services.json', 'scripts/build-android.mjs', '.github/workflows/android-debug-apk.yml',
 ];
 let failed = false;
 for (const item of required) {

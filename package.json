@@ -1,6 +1,6 @@
 {
   "name": "wycut-recap-studio",
-  "version": "0.1.0",
+  "version": "0.30.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
