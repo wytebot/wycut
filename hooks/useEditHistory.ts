@@ -1,0 +1,3 @@
+'use client';
+import { useCallback, useRef, useState } from 'react';
+export function useEditHistory<T>(initial:T){const [value,setValue]=useState(initial);const past=useRef<T[]>([]);const future=useRef<T[]>([]);const update=useCallback((next:T)=>{past.current.push(value);future.current=[];setValue(next);},[value]);const undo=useCallback(()=>{const prev=past.current.pop();if(prev!==undefined){future.current.push(value);setValue(prev);}},[value]);const redo=useCallback(()=>{const next=future.current.pop();if(next!==undefined){past.current.push(value);setValue(next);}},[value]);return {value,update,undo,redo,canUndo:past.current.length>0,canRedo:future.current.length>0};}

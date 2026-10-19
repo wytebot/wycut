@@ -63,7 +63,7 @@
   },
   "editorAssets": {
     "policyVersion": 1,
-    "billing": "export_only",
+    "billing": "unlock_on_apply",
     "free": {
       "filters": [
         "Original",
@@ -183,22 +183,42 @@
         "Horror",
         "Sci-fi",
         "Cinematic",
-        "Magic",
-        "Nature",
-        "Animal-inspired",
-        "Vehicle",
-        "Crowd",
-        "Sports",
-        "Comedy"
+        "Magic & Fantasy",
+        "Vehicles & Machines",
+        "Crowd & Sports"
       ],
       "fonts": [
         "Display",
         "Handwritten",
         "Arabic-friendly",
         "Serif display"
+      ],
+      "transitions": [
+        "Dissolve",
+        "Zoom in",
+        "Flash",
+        "Glitch cut",
+        "Light leak",
+        "Whip pan",
+        "Film burn"
+      ],
+      "stickers": [
+        "💎 Premium sticker pack",
+        "Neon labels",
+        "Cinematic badges",
+        "Animated emoji pack"
       ]
     },
     "premiumExportCostCredits": 5,
-    "note": "This is a policy manifest only. Premium asset export deduction is not enabled until the server-side reservation/refund flow is deployed and integration-tested. Do not charge users from the client."
+    "note": "Premium editor assets are unlocked once per account and asset through the server-side /api/editor/assets/unlock endpoint. Never deduct credits in client-only code. Premium items remain locked if the unlock request fails.",
+    "premiumUnlockCosts": {
+      "font": 3,
+      "animation": 4,
+      "sound": 3,
+      "filter": 5,
+      "effect": 5,
+      "transition": 5,
+      "sticker": 2
+    }
   }
 }

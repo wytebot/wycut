@@ -29,3 +29,14 @@ button, input { font: inherit; }
 @keyframes wy-neon{0%,100%{text-shadow:0 0 4px #fff,0 0 8px #a78bfa}50%{text-shadow:0 0 9px #fff,0 0 20px #c084fc,0 0 28px #818cf8}}
 
 @keyframes wy-wave{0%,100%{transform:translateX(0) rotate(0)}25%{transform:translateX(-5px) rotate(-3deg)}75%{transform:translateX(5px) rotate(3deg)}}
+
+/* v42 mobile editor gesture/safe-area rules */
+.wycut-editor-workspace { overscroll-behavior: contain; }
+.wycut-editor-workspace button, .wycut-editor-workspace [role="button"] { touch-action: manipulation; }
+.wycut-preview-stage { overscroll-behavior: contain; }
+@media (max-width: 639px) {
+  html:has(.wycut-preview-stage), body:has(.wycut-preview-stage) { overscroll-behavior-y: none; }
+  .wycut-preview-stage { min-height: min(38vh, 300px); max-height: 45vh; }
+  #timeline-editor { overscroll-behavior: contain; }
+  #timeline-editor > div { max-width: 100%; }
+}
