@@ -17,6 +17,10 @@ export class InsufficientCreditsError extends Error {
   constructor(public needed: number, public balance: number) { super('INSUFFICIENT_CREDITS'); this.name = 'InsufficientCreditsError'; }
 }
 export type CreditKind = 'script' | 'narration' | 'transcribe';
+export class JobCancelledError extends Error { constructor() { super('JOB_CANCELLED'); this.name = 'JobCancelledError'; } }
+const JOB_ID = /^[A-Za-z0-9-]{8,80}$/;
+export const cleanJobId = (value: unknown): string => (typeof value === 'string' && JOB_ID.test(value) ? value : '');
+const markerRef = (db: Firestore, userId: string, jobId: string) => db.collection('wycut_cancelled_jobs').doc(`${userId}_${jobId}`);
 type UserData = DocumentData | undefined;
 
 function hashValue(value: string) { return createHmac('sha256', process.env.TRIAL_PEPPER || '').update(value).digest('hex'); }
@@ -79,7 +83,7 @@ export async function ensureWelcomeCredits(userId: string, email: string, device
 }
 
 /** Deduct credits immediately and record a ledger row. Returns '' for lifetime-free accounts (nothing charged). */
-export async function chargeCredits(input: { userId: string; email: string; amount: number; kind: CreditKind; ref?: string; deviceId?: string }): Promise<string> {
+export async function chargeCredits(input: { userId: string; email: string; amount: number; kind: CreditKind; ref?: string; deviceId?: string; jobId?: string }): Promise<string> {
   if (hasLifetimeFreeAccess(input.email) || input.amount <= 0) return '';
   const attempt = () => chargeOnce(input);
   try { return await attempt(); }
@@ -90,15 +94,16 @@ export async function chargeCredits(input: { userId: string; email: string; amou
     return attempt();
   }
 }
-async function chargeOnce(input: { userId: string; email: string; amount: number; kind: CreditKind; ref?: string }): Promise<string> {
+async function chargeOnce(input: { userId: string; email: string; amount: number; kind: CreditKind; ref?: string; jobId?: string }): Promise<string> {
   const db = getAdminDb();
   const userRef = db.collection('wycut_users').doc(input.userId);
   const ledgerId = randomUUID();
   await db.runTransaction(async transaction => {
     const user = await transaction.get(userRef);
+    if (input.jobId && (await transaction.get(markerRef(db, input.userId, input.jobId))).exists) throw new JobCancelledError();
     const balance = walletCredits(user.data()).credits;
     if (balance < input.amount) throw new InsufficientCreditsError(input.amount, balance);
-    transaction.create(db.collection(LEDGER).doc(ledgerId), { userId: input.userId, kind: input.kind, delta: -input.amount, status: 'consumed', ref: input.ref || null, createdAt: now(), createdAtMs: Date.now(), balanceAfter: balance - input.amount });
+    transaction.create(db.collection(LEDGER).doc(ledgerId), { userId: input.userId, kind: input.kind, delta: -input.amount, status: 'consumed', ref: input.ref || null, jobId: input.jobId || null, createdAt: now(), createdAtMs: Date.now(), balanceAfter: balance - input.amount });
     writeBalance(db, transaction, userRef, input.userId, user.data(), balance - input.amount, { email: input.email });
   });
   return ledgerId;
@@ -122,7 +127,7 @@ export async function refundCharge(ledgerId: string) {
 }
 
 /** Reserve the credits for one recap script and create the usage record that later holds the script. */
-export async function reserveRecapCredit(userId: string, email: string, title: string, deviceId: string | undefined, amount: number) {
+export async function reserveRecapCredit(userId: string, email: string, title: string, deviceId: string | undefined, amount: number, jobId = '') {
   const db = getAdminDb();
   await refundExpiredReservations(db);
   const usageId = randomUUID();
@@ -130,6 +135,7 @@ export async function reserveRecapCredit(userId: string, email: string, title: s
   const reserve = () => db.runTransaction(async transaction => {
     const userRef = db.collection('wycut_users').doc(userId);
     const user = await transaction.get(userRef);
+    if (jobId && (await transaction.get(markerRef(db, userId, jobId))).exists) throw new JobCancelledError();
     const current = user.data() || {};
     const t = Date.now();
     const previousWindowStart = Number(current.scriptWindowStartMs || 0);
@@ -140,8 +146,8 @@ export async function reserveRecapCredit(userId: string, email: string, title: s
     if (!lifetimeFree && balance < amount) throw new InsufficientCreditsError(amount, balance);
     const charged = lifetimeFree ? 0 : amount;
     const ledgerId = charged > 0 ? randomUUID() : '';
-    if (ledgerId) transaction.create(db.collection(LEDGER).doc(ledgerId), { userId, kind: 'script', delta: -charged, status: 'reserved', ref: usageId, createdAt: now(), createdAtMs: t, balanceAfter: balance - charged });
-    transaction.create(db.collection('wycut_usage').doc(usageId), { usageId, userId, email, title: title.slice(0, 160), status: 'reserved', narrationCalls: 0, narratedChars: 0, narrationCreditsBilled: 0, lifetimeFreeAccess: lifetimeFree, creditsCharged: charged, ledgerId, createdAt: now(), createdAtMs: t });
+    if (ledgerId) transaction.create(db.collection(LEDGER).doc(ledgerId), { userId, kind: 'script', delta: -charged, status: 'reserved', ref: usageId, jobId: jobId || null, createdAt: now(), createdAtMs: t, balanceAfter: balance - charged });
+    transaction.create(db.collection('wycut_usage').doc(usageId), { usageId, userId, email, title: title.slice(0, 160), status: 'reserved', jobId: jobId || null, narrationCalls: 0, narratedChars: 0, narrationCreditsBilled: 0, lifetimeFreeAccess: lifetimeFree, creditsCharged: charged, ledgerId, createdAt: now(), createdAtMs: t });
     writeBalance(db, transaction, userRef, userId, current, balance - charged, { email, scriptWindowStartMs: windowStart, scriptWindowCount: windowCount + 1 });
   });
   try { await reserve(); }
@@ -170,6 +176,8 @@ export async function markRecapCreditConsumed(usageId: string, script?: unknown)
   const db = getAdminDb();
   const usageRef = db.collection('wycut_usage').doc(usageId);
   const usage = await usageRef.get();
+  // A cancelled (refunded) job must never flip back to consumed, or the refunded script could be narrated for free.
+  if (usage.data()?.status !== 'reserved') return;
   await usageRef.set({ status: 'consumed', ...(script ? { script } : {}), consumedAt: now() }, { merge: true });
   const ledgerId = String(usage.data()?.ledgerId || '');
   if (ledgerId) await db.collection(LEDGER).doc(ledgerId).set({ status: 'consumed' }, { merge: true });
@@ -205,13 +213,14 @@ export async function assertOwnedRecapUsage(usageId: string, userId: string) {
 export type NarrationCharge = { chars: number; credits: number; ledgerId: string };
 
 /** Validates a narration batch against the stored script and charges only for the characters it adds (rounded up cumulatively per recap). */
-export async function reserveNarrationBatch(usageId: string, userId: string, email: string, requested: Array<{ index: number; id: string }>) {
+export async function reserveNarrationBatch(usageId: string, userId: string, email: string, requested: Array<{ index: number; id: string }>, jobId = '') {
   const db = getAdminDb(); const ref = db.collection('wycut_usage').doc(usageId);
   const userRef = db.collection('wycut_users').doc(userId);
   const lifetimeFree = hasLifetimeFreeAccess(email);
   const ledgerId = randomUUID();
   return db.runTransaction(async transaction => {
-    const [usage, user] = await Promise.all([transaction.get(ref), transaction.get(userRef)]);
+    const [usage, user, marker] = await Promise.all([transaction.get(ref), transaction.get(userRef), jobId ? transaction.get(markerRef(db, userId, jobId)) : Promise.resolve(null)]);
+    if (marker?.exists) throw new JobCancelledError();
     if (!usage.exists || usage.data()?.userId !== userId || !['consumed', 'complete'].includes(String(usage.data()?.status))) throw new Error('RECAP_NOT_OWNED');
     const stored = usage.data()?.script as { beats?: Array<{ index: number; id: string; title: string; startSeconds: number; endSeconds: number; narration: string; dialogueCues: Array<{ startSeconds: number; endSeconds: number; quote?: string; instruction: string }>; act: 1|2|3|4|5 }> } | undefined;
     if (!Array.isArray(stored?.beats)) throw new Error('SCRIPT_NOT_STORED');
@@ -228,7 +237,7 @@ export async function reserveNarrationBatch(usageId: string, userId: string, ema
     const balance = walletCredits(user.data()).credits;
     if (credits > balance) throw new InsufficientCreditsError(credits, balance);
     if (credits > 0) {
-      transaction.create(db.collection(LEDGER).doc(ledgerId), { userId, kind: 'narration', delta: -credits, status: 'consumed', ref: usageId, chars, createdAt: now(), createdAtMs: Date.now(), balanceAfter: balance - credits });
+      transaction.create(db.collection(LEDGER).doc(ledgerId), { userId, kind: 'narration', delta: -credits, status: 'consumed', ref: usageId, jobId: jobId || null, chars, createdAt: now(), createdAtMs: Date.now(), balanceAfter: balance - credits });
       writeBalance(db, transaction, userRef, userId, user.data(), balance - credits);
     }
     transaction.set(ref, { narrationCalls: count + 1, narratedChars: totalChars, narrationCreditsBilled: billed + credits, lastNarrationRequestedAt: now() }, { merge: true });
@@ -252,4 +261,51 @@ export async function releaseNarrationBatch(usageId: string, userId: string, cha
       writeBalance(db, transaction, userRef, userId, user.data(), walletCredits(user.data()).credits + charge.credits);
     }
   });
+}
+
+const transcribeDailyRef = (db: Firestore, userId: string) => db.collection('wycut_transcribe_limits').doc(`${userId}_${new Date().toISOString().slice(0, 10)}`);
+
+/**
+ * User cancelled a generation run: give back every credit charged under that run's jobId and make the run unusable.
+ * Idempotent, and a charge that lands after this call is rejected by the cancel marker, so nothing is lost or double-refunded.
+ * Narration/script bookkeeping is rolled back too, so refunded work cannot be re-used for free.
+ */
+export async function cancelJob(userId: string, jobId: string): Promise<{ refunded: number; rows: number }> {
+  const id = cleanJobId(jobId); if (!id) throw new Error('INVALID_JOB');
+  const db = getAdminDb();
+  await markerRef(db, userId, id).set({ userId, jobId: id, createdAt: now(), createdAtMs: Date.now() }, { merge: true });
+  const rows = await db.collection(LEDGER).where('userId', '==', userId).where('jobId', '==', id).limit(300).get();
+  let refunded = 0; let transcribeRows = 0; let count = 0;
+  for (const row of rows.docs) {
+    const first = row.data();
+    if (Number(first.delta) >= 0) continue;
+    const done = await db.runTransaction(async transaction => {
+      const ledgerRef = row.ref; const entry = await transaction.get(ledgerRef); const data = entry.data();
+      if (!entry.exists || !data || data.status === 'refunded' || Number(data.delta) >= 0) return 0;
+      const userRef = db.collection('wycut_users').doc(userId);
+      const usageRef = data.ref && (data.kind === 'script' || data.kind === 'narration') ? db.collection('wycut_usage').doc(String(data.ref)) : null;
+      const [user, usage] = await Promise.all([transaction.get(userRef), usageRef ? transaction.get(usageRef) : Promise.resolve(null)]);
+      const credits = Math.abs(Number(data.delta));
+      transaction.set(ledgerRef, { status: 'refunded', refundedAt: now(), refundReason: 'user_cancelled' }, { merge: true });
+      let extra: Record<string, unknown> = {};
+      if (usageRef && usage?.exists && usage.data()?.userId === userId) {
+        const u = usage.data() || {};
+        if (data.kind === 'script') {
+          transaction.set(usageRef, { status: 'refunded', refundedAt: now(), script: null }, { merge: true });
+          const windowCount = Number(user.data()?.scriptWindowCount || 0);
+          if (windowCount > 0) extra = { scriptWindowCount: windowCount - 1 };
+        } else {
+          transaction.set(usageRef, { narrationCalls: Math.max(0, Number(u.narrationCalls || 0) - 1), narratedChars: Math.max(0, Number(u.narratedChars || 0) - Number(data.chars || 0)), narrationCreditsBilled: Math.max(0, Number(u.narrationCreditsBilled || 0) - credits) }, { merge: true });
+        }
+      }
+      writeBalance(db, transaction, userRef, userId, user.data(), walletCredits(user.data()).credits + credits, extra);
+      return credits;
+    });
+    if (done > 0) { refunded += done; count++; if (first.kind === 'transcribe') transcribeRows++; }
+  }
+  for (let i = 0; i < transcribeRows; i++) {
+    const ref = transcribeDailyRef(db, userId);
+    await db.runTransaction(async transaction => { const snap = await transaction.get(ref); const n = Number(snap.data()?.count || 0); if (n > 0) transaction.set(ref, { count: n - 1, updatedAt: now() }, { merge: true }); }).catch(() => undefined);
+  }
+  return { refunded, rows: count };
 }

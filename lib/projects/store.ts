@@ -107,3 +107,18 @@ export async function deleteNarrationParts(projectId: string): Promise<void> {
 // ---- paid transcription chunks (keyed by video name/size/date + chunk index) ----
 export async function getChunk<T>(key: string): Promise<T | null> { try { const row = await tx<{ key: string; value: T }>('chunks', 'readonly', s => s.get(key)); return row ? row.value : null; } catch { return null; } }
 export async function putChunk<T>(key: string, value: T): Promise<void> { try { await tx('chunks', 'readwrite', s => s.put({ key, value, savedAt: Date.now() })); } catch { /* best effort */ } }
+
+export async function deleteChunksByPrefix(prefix: string): Promise<void> {
+  try {
+    const db = await openDb();
+    await new Promise<void>((resolve) => {
+      const transaction = db.transaction('chunks', 'readwrite'); const store = transaction.objectStore('chunks'); const request = store.openCursor();
+      request.onsuccess = () => { const cursor = request.result; if (!cursor) return; if (String((cursor.value as { key: string }).key).startsWith(prefix)) cursor.delete(); cursor.continue(); };
+      transaction.oncomplete = () => resolve(); transaction.onerror = () => resolve(); transaction.onabort = () => resolve();
+    });
+  } catch { /* ignore */ }
+}
+export async function deleteNarrationKeys(projectId: string, keys: string[]): Promise<void> {
+  for (const key of keys) { try { await tx('narration', 'readwrite', s => s.delete(`${projectId}|${key}`)); } catch { /* ignore */ } }
+}
+export async function deleteChunkKeys(keys: string[]): Promise<void> { for (const key of keys) { try { await tx('chunks', 'readwrite', s => s.delete(key)); } catch { /* ignore */ } } }

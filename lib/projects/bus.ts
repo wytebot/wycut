@@ -3,6 +3,8 @@ const OPEN_KEY = 'wycut_open_project';
 export const OPEN_PROJECT_EVENT = 'wycut:open-project';
 export const CONNECT_DRIVE_EVENT = 'wycut:connect-drive';
 export const DRIVE_TOKEN_EVENT = 'wycut:drive-token';
+export const CANCEL_GENERATION_EVENT = 'wycut:cancel-generation';
+export function requestCancelGeneration() { try { window.dispatchEvent(new Event(CANCEL_GENERATION_EVENT)); } catch { /* ignore */ } }
 export function requestOpenProject(id: string) { try { sessionStorage.setItem(OPEN_KEY, id); window.dispatchEvent(new Event(OPEN_PROJECT_EVENT)); } catch { /* ignore */ } }
 export function takePendingProject(): string { try { const id = sessionStorage.getItem(OPEN_KEY) || ''; if (id) sessionStorage.removeItem(OPEN_KEY); return id; } catch { return ''; } }
 export function requestDriveConnect() { try { window.dispatchEvent(new Event(CONNECT_DRIVE_EVENT)); } catch { /* ignore */ } }

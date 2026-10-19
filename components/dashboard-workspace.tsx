@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { useEffect, useRef, useState, type ChangeEvent, type DragEvent } from 'react';
 import { Cloud, FileText, Link2, UploadCloud, CheckCircle2, AlertCircle, Clapperboard, Mic2, Scissors, FolderUp, LoaderCircle, Download } from 'lucide-react';
-import { sliceVideoLocally, concatenateClipsLocally, MAX_SOURCE_BYTES, MAX_SOURCE_LABEL, type SlicedClip } from '@/lib/ffmpeg/client-slicer';
+import { sliceVideoLocally, concatenateClipsLocally, abortFFmpeg, MAX_SOURCE_BYTES, MAX_SOURCE_LABEL, type SlicedClip } from '@/lib/ffmpeg/client-slicer';
 import { exportProductionKit, type DriveExportFile } from '@/lib/drive/export';
 import { Capacitor } from '@capacitor/core';
 import { signInWithGoogleNative } from '@/lib/auth/google-native';
@@ -12,11 +12,12 @@ import { firebaseAuth } from '@/lib/firebase/client';
 import { getAuthToken } from '@/lib/auth/get-auth-token';
 import { apiUrl } from '@/lib/api-client';
 import type { RecapScript } from '@/lib/ai/script-generator';
-import { transcribeVideoToSrt } from '@/lib/transcribe/client';
+import { transcribeVideoToSrt, forgetTranscriptChunks } from '@/lib/transcribe/client';
+import { backgroundStart, backgroundUpdate, backgroundStop } from '@/lib/native/background';
 import { LOW_BALANCE_CREDITS, SCRIPT_CREDITS_MAX, SCRIPT_CREDITS_MIN, formatCredits, narrationCredits, scriptCredits, transcribeCreditsForVideo } from '@/lib/billing/pricing';
 import { TopUpError } from '@/lib/billing/client-errors';
-import { saveProject, getProject, getNarrationParts, putNarrationPart, deleteNarrationParts, newProjectId, liveProjects } from '@/lib/projects/store';
-import { OPEN_PROJECT_EVENT, CONNECT_DRIVE_EVENT, DRIVE_TOKEN_EVENT, takePendingProject } from '@/lib/projects/bus';
+import { saveProject, getProject, getNarrationParts, putNarrationPart, deleteNarrationParts, deleteNarrationKeys, newProjectId, liveProjects } from '@/lib/projects/store';
+import { OPEN_PROJECT_EVENT, CONNECT_DRIVE_EVENT, CANCEL_GENERATION_EVENT, DRIVE_TOKEN_EVENT, takePendingProject } from '@/lib/projects/bus';
 
 type GoogleTokenResponse = { access_token?: string; expires_in?: number; error?: string };
 type GoogleIdentity = { accounts: { oauth2: { initTokenClient: (config: { client_id: string; scope: string; callback: (response: GoogleTokenResponse) => void }) => { requestAccessToken: (options?: { prompt?: string }) => void } } } };
@@ -149,6 +150,16 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
   const projectIdRef = useRef(''); const keepOutputs = useRef(false); const exportedRef = useRef(false); const restoredTranscript = useRef<string | null>(null);
   const [autoRebuild, setAutoRebuild] = useState(false); const lastCheckpoint = useRef(0);
   const checkpoint = (patch: Parameters<typeof saveProject>[1]) => { if (projectIdRef.current) void saveProject(projectIdRef.current, patch); };
+  // ---- one "job" = one run of a paid/long step. Cancel aborts it, refunds its credits and discards what it produced. ----
+  type JobKind = 'script' | 'narration' | 'slice' | 'export';
+  type Job = { id: string; kind: JobKind; abort: AbortController; cancelled: boolean; paidChunkKeys: string[]; narrationKeys: string[] };
+  const jobRef = useRef<Job | null>(null);
+  const [activeKind, setActiveKind] = useState<'' | JobKind>(''); const [confirmCancel, setConfirmCancel] = useState(false); const [cancelling, setCancelling] = useState(false);
+  function startJob(kind: JobKind): Job {
+    const id = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `job-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const job: Job = { id, kind, abort: new AbortController(), cancelled: false, paidChunkKeys: [], narrationKeys: [] };
+    jobRef.current = job; setActiveKind(kind); return job;
+  }
   const noticeRef = useRef<HTMLParagraphElement | null>(null);
   // Remember the transcript made from the video so a retry never pays for transcription twice.
   const transcriptCache = useRef<{ key: string; text: string } | null>(null);
@@ -299,7 +310,7 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
       setNotice(/Failed to fetch|CORS|NetworkError/i.test(message) ? 'The source host blocks browser downloads (CORS). Use a direct-download host that permits browser access, or select an authorized video file from your device. WyCut does not proxy large videos through its server.' : message.includes('aborted') ? 'Source download timed out. Try a faster direct link or a smaller file.' : message);
     } finally { setBusy(false); setStage(''); }
   }
-  async function getTranscript(): Promise<{ text: string; label: string }> {
+  async function getTranscript(job: Job): Promise<{ text: string; label: string }> {
     if (restoredTranscript.current && !file && !(mode === 'url' && subtitleUrl.trim())) return { text: restoredTranscript.current, label: title || 'Restored project' };
     if (mode === 'url' && subtitleUrl.trim()) {
       let parsed: URL; try { parsed = new URL(subtitleUrl.trim()); } catch { throw new Error('Enter a valid HTTPS subtitle/transcript URL.'); }
@@ -319,7 +330,7 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
       const key = `${video.name}:${video.size}:${video.lastModified}`;
       if (transcriptCache.current?.key === key) return { text: transcriptCache.current.text, label: video.name };
       setStage('Preparing audio transcription…'); setProgress(3);
-      const text = await transcribeVideoToSrt(video, () => getAuthToken(idToken), (nextStage, nextProgress) => { setStage(nextStage); setProgress(nextProgress); }, { cacheKey: key, ensureCredits: needed => ensureCredits(needed + SCRIPT_CREDITS_MAX) });
+      const text = await transcribeVideoToSrt(video, () => getAuthToken(idToken), (nextStage, nextProgress) => { setStage(nextStage); setProgress(nextProgress); }, { cacheKey: key, jobId: job.id, signal: job.abort.signal, onPaid: paidKey => job.paidChunkKeys.push(paidKey), ensureCredits: needed => ensureCredits(needed + SCRIPT_CREDITS_MAX) });
       transcriptCache.current = { key, text };
       return { text, label: video.name };
     }
@@ -327,13 +338,15 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
   }
   async function generateScript() {
     if (busy) return;
+    const job = startJob('script');
     if (exportedRef.current) { projectIdRef.current = ''; exportedRef.current = false; }
     if (!projectIdRef.current) projectIdRef.current = newProjectId();
     checkpoint({ title: title.trim() || 'My Movie', mode, status: 'running', stage: 'Starting…', progress: 0, error: null, sourceName: video?.name ?? file?.name, sourceSize: video?.size ?? file?.size, subtitleUrl: subtitleUrl.trim() || null, videoUrl: url.trim() || null });
     setBusy(true); setNeedsTopUp(false); setStage('Checking source and preparing transcript…'); setProgress(5); setNotice('');
     setScript(null); setRecapId(''); setNarration(null); setClips([]); setRoughCut(null); setHasSourceTimecodes(false);
     try {
-      const source = await getTranscript();
+      const source = await getTranscript(job);
+      if (job.cancelled) return;
       checkpoint({ transcript: source.text.slice(0, 400_000) });
       if (!source.text.trim() || source.text.trim().length < 40) throw new Error('The selected transcript is empty or too short. Upload a readable SRT, VTT or TXT transcript, or enter a public subtitle URL.');
       setStage('Refreshing sign-in and checking generation access…'); setProgress(15);
@@ -350,11 +363,12 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
       setStage('Generating your recap script with AI…'); setProgress(25);
       let response: Response;
       try {
-        response = await fetch(apiUrl('/api/script'), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Device-Id': deviceId }, body: JSON.stringify({ title: title.trim() || source.label.replace(/\.(srt|vtt|txt)$/i, ''), transcript: source.text, targetRuntimeSeconds: 600, beatCount: 38, idToken: freshIdToken, deviceId }), cache: 'no-store' });
+        response = await fetch(apiUrl('/api/script'), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Device-Id': deviceId }, body: JSON.stringify({ title: title.trim() || source.label.replace(/\.(srt|vtt|txt)$/i, ''), transcript: source.text, targetRuntimeSeconds: 600, beatCount: 38, idToken: freshIdToken, deviceId, jobId: job.id }), cache: 'no-store', signal: job.abort.signal });
       } catch (networkError) {
         const detail = networkError instanceof Error ? networkError.message : 'Network request failed';
         throw new Error(`Could not reach WyCut's script API (${detail}). Check your connection, deployed API route and Vercel function logs, then retry. Your generation was not confirmed.`);
       }
+      if (job.cancelled) return;
       setStage('Checking AI response…'); setProgress(85);
       const data = await response.json().catch(() => null) as ({ error?: string; code?: string; script?: RecapScript; recapId?: string; provider?: string; hasSourceTimecodes?: boolean } | null);
       if (!data) throw new Error(`WyCut's script API returned a non-JSON response (HTTP ${response.status}). Check Vercel function logs for a crash or deployment error.`);
@@ -367,12 +381,13 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
       setScript(data.script); setRecapId(data.recapId || ''); setHasSourceTimecodes(data.hasSourceTimecodes === true); setNarration(null); setClips([]); setRoughCut(null); setProgress(100); keepOutputs.current = true; checkpoint({ script: data.script, recapId: data.recapId || '', hasSourceTimecodes: data.hasSourceTimecodes === true, narrationReady: null, narrationParts: null, clipCount: null, roughCut: null });
       void loadBalance(freshIdToken); setNotice(`Script generated with ${data.provider || 'AI'}. ${data.script.beats.length} beats ready. ${data.hasSourceTimecodes ? 'Timestamped subtitle timeline detected; review cut points.' : 'No source timestamps found; upload matching SRT/VTT before slicing.'}`);
     } catch (e) {
+      if (job.cancelled) return;
       if (e instanceof TopUpError) setNeedsTopUp(true);
       let message = e instanceof Error ? e.message : 'Unknown error while generating the script.';
       if (/Failed to fetch|NetworkError|Load failed/i.test(message)) message = `A source URL could not be read by this browser. The host may block cross-origin (CORS) access, require sign-in, or be unavailable. Use a public HTTPS SRT/VTT/TXT transcript URL that permits browser access, or upload the transcript file. Details: ${message}`;
       if (/aborted|AbortError/i.test(message)) message = `The source request timed out. Try a smaller file or a faster public URL. Details: ${message}`;
       setNotice(`Generation failed: ${message}`);
-    } finally { setBusy(false); setStage(''); setProgress(0); }
+    } finally { if (!job.cancelled) { setBusy(false); setStage(''); setProgress(0); setActiveKind(''); } }
   }
 
   // Progress checkpoints (throttled), live/interrupted tracking and a screen wake lock while a job runs.
@@ -397,6 +412,39 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
     void acquire(); document.addEventListener('visibilitychange', onVisible);
     return () => { cancelled = true; document.removeEventListener('visibilitychange', onVisible); void lock?.release().catch(() => undefined); };
   }, [busy]); // eslint-disable-line react-hooks/exhaustive-deps
+  async function cancelGeneration() {
+    const job = jobRef.current;
+    setConfirmCancel(false);
+    if (!busy || !job || job.cancelled || job.kind === 'export' || cancelling) return;
+    setCancelling(true); job.cancelled = true; job.abort.abort(); abortFFmpeg();
+    setBusy(false); setStage(''); setProgress(0); setActiveKind('');
+    let refunded = 0; let refundProblem = '';
+    if (job.kind === 'script' || job.kind === 'narration') {
+      try {
+        const response = await fetch(apiUrl('/api/billing/cancel'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idToken: await getAuthToken(idToken), jobId: job.id }), cache: 'no-store' });
+        const data = await response.json().catch(() => null) as { ok?: boolean; refunded?: number; error?: string } | null;
+        if (response.ok && data?.ok) refunded = Math.max(0, Number(data.refunded || 0)); else refundProblem = data?.error || `HTTP ${response.status}`;
+      } catch (error) { refundProblem = error instanceof Error ? error.message : 'network error'; }
+    }
+    // Throw away what the cancelled run produced, so refunded work can't be reused for free.
+    if (job.kind === 'script') {
+      await forgetTranscriptChunks(job.paidChunkKeys); transcriptCache.current = null; restoredTranscript.current = null;
+      setScript(null); setRecapId(''); setHasSourceTimecodes(false); setNarration(null); setClips([]); setRoughCut(null);
+      checkpoint({ transcript: null, script: null, recapId: null, hasSourceTimecodes: null, narrationReady: null, narrationParts: null, clipCount: null, roughCut: null, status: 'idle', stage: null, progress: null, error: null });
+    } else if (job.kind === 'narration') {
+      job.narrationKeys.forEach(key => narrationCache.current.delete(key)); if (projectIdRef.current) await deleteNarrationKeys(projectIdRef.current, job.narrationKeys);
+      setNarration(null); checkpoint({ narrationReady: null, narrationParts: null, status: 'idle', stage: null, progress: null, error: null });
+    } else { setClips([]); setRoughCut(null); checkpoint({ clipCount: null, roughCut: null, status: 'idle', stage: null, progress: null, error: null }); }
+    if (projectIdRef.current) liveProjects.delete(projectIdRef.current);
+    setNeedsTopUp(false); setCancelling(false);
+    setNotice(job.kind === 'slice' ? 'Cutting stopped. No credits are used by this step.' : refundProblem ? `Generation stopped, but your credits could not be returned automatically (${refundProblem}). Tap Cancel on a new run or contact support; nothing more will be charged.` : refunded > 0 ? `Generation cancelled. ${formatCredits(refunded)} credits were returned to your balance.` : 'Generation cancelled. No credits were charged for it.');
+    void loadBalance(await getAuthToken(idToken).catch(() => idToken));
+  }
+  const cancelRef = useRef(cancelGeneration); cancelRef.current = cancelGeneration;
+  useEffect(() => { const ask = () => { if (jobRef.current && !jobRef.current.cancelled && jobRef.current.kind !== 'export') setConfirmCancel(true); }; window.addEventListener(CANCEL_GENERATION_EVENT, ask); return () => window.removeEventListener(CANCEL_GENERATION_EVENT, ask); }, []);
+  // Android: keep the process alive with a foreground service while a job runs (no-op on the web).
+  useEffect(() => { if (!busy) return; void backgroundStart('WyCut is working', stage || 'Working…'); return () => { void backgroundStop(); }; }, [busy]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (busy) void backgroundUpdate(`${stage || 'Working…'}${progress > 0 ? ` · ${progress}%` : ''}`); }, [stage, Math.floor(progress / 5)]); // eslint-disable-line react-hooks/exhaustive-deps
   async function openProject(id: string) {
     if (!id || projectIdRef.current === id) return;
     if (busy) { setNotice('Wait for the current generation to finish before opening another project.'); return; }
@@ -429,6 +477,7 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
   const pendingNarrationChars = script ? script.beats.filter(beat => !narrationCache.current.has(beatKey(beat))).reduce((sum, beat) => sum + beat.narration.length, 0) : 0;
   async function generateVoice() {
     if (!script || busy) return;
+    const job = startJob('narration');
     setBusy(true); setNeedsTopUp(false); setStage('Preparing narration…'); setNotice(''); setNarration(null);
     try {
       // Beats already narrated for this script are reused, so a retry after a failure or top-up never pays twice.
@@ -450,15 +499,17 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
       const requestBatch = async (beats: RecapScript['beats']) => {
         let lastError = 'Narration batch failed.';
         for (let attempt = 0; attempt < 3; attempt++) {
+          if (job.cancelled) throw new Error('Cancelled');
           if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 1500 * attempt));
           let response: Response;
-          try { response = await fetch(apiUrl('/api/narration'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ beats, voice: 'onyx', idToken: await getAuthToken(idToken), recapId }), cache: 'no-store' }); }
-          catch (networkError) { lastError = `Network error (${networkError instanceof Error ? networkError.message : 'request failed'}).`; continue; }
+          try { response = await fetch(apiUrl('/api/narration'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ beats, voice: 'onyx', idToken: await getAuthToken(idToken), recapId, jobId: job.id }), cache: 'no-store', signal: job.abort.signal }); }
+          catch (networkError) { if (job.cancelled) throw new Error('Cancelled'); lastError = `Network error (${networkError instanceof Error ? networkError.message : 'request failed'}).`; continue; }
           const data = await response.json().catch(() => ({ error: `Narration API returned a non-JSON response (HTTP ${response.status}). Check Vercel function logs.` })) as { error?: string; code?: string; provider?: string; segments?: Array<{ index: number; id: string; filename: string; text: string; audioBase64: string }> };
+          if (data.code === 'JOB_CANCELLED') throw new Error('Cancelled');
           if (response.status === 402 || data.code === 'INSUFFICIENT_CREDITS') throw new TopUpError(data.error || 'You need more credits to finish the narration.');
           if (response.ok && Array.isArray(data.segments) && data.segments.length) {
             if (data.provider) providers.add(data.provider);
-            data.segments.forEach(item => { const beat = beats.find(candidate => candidate.id === item.id); if (beat) { narrationCache.current.set(beatKey(beat), { id: item.id, text: item.text, audioBase64: item.audioBase64 }); if (projectIdRef.current) void putNarrationPart(projectIdRef.current, beatKey(beat), { id: item.id, text: item.text, audioBase64: item.audioBase64 }); } });
+            data.segments.forEach(item => { const beat = beats.find(candidate => candidate.id === item.id); if (beat) { narrationCache.current.set(beatKey(beat), { id: item.id, text: item.text, audioBase64: item.audioBase64 }); job.narrationKeys.push(beatKey(beat)); if (projectIdRef.current) void putNarrationPart(projectIdRef.current, beatKey(beat), { id: item.id, text: item.text, audioBase64: item.audioBase64 }); } });
             return;
           }
           lastError = data.error || `Narration batch failed (HTTP ${response.status}).`;
@@ -472,6 +523,7 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
         await Promise.all(pair.map(requestBatch));
         setStage(`Generating narration… ${Math.min(i + pair.length, batches.length)} of ${batches.length} batches complete`);
       }
+      if (job.cancelled) return;
       const segments: Narration['segments'] = [];
       for (const beat of script.beats) {
         const item = narrationCache.current.get(beatKey(beat));
@@ -486,15 +538,19 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
       void loadBalance(await getAuthToken(idToken).catch(() => idToken));
       setNotice(`Narration generated. ${segments.length} MP3 segments ready.`);
     } catch (e) {
+      if (job.cancelled) return;
       if (e instanceof TopUpError) setNeedsTopUp(true);
       setNotice(e instanceof Error ? e.message : 'Could not generate narration.');
       void loadBalance(idToken);
     }
-    finally { setBusy(false); setStage(''); }
+    finally { if (!job.cancelled) { setBusy(false); setStage(''); setActiveKind(''); } }
   }
-  async function sliceVideo() { if (!hasSourceTimecodes) { setNotice('Accurate cuts require a timestamped SRT/VTT transcript. Plain text has no source timecodes, so any AI timing would be a guess. Upload the matching SRT/VTT before slicing.'); return; } if (!script || !video) { setNotice('Generate a script and choose the source movie file you are authorized to edit.'); return; } setBusy(true); setStage('Loading local FFmpeg…'); setProgress(0); setNotice(''); setClips([]); setRoughCut(null); try { const duration = await getVideoDuration(video); const lastTimestamp = Math.max(...script.beats.map(beat => beat.endSeconds)); if (lastTimestamp > duration + 2) throw new Error(`The script references ${Math.round(lastTimestamp)} seconds, but this source video is only ${Math.round(duration)} seconds long. Upload matching subtitles/source video.`); const output = await sliceVideoLocally(video, script.beats.map(b => ({ index: b.index, id: b.id, startSeconds: b.startSeconds, endSeconds: b.endSeconds })), (p, current, total) => { setProgress(Math.round(p * 100)); setStage(current > 0 ? `Slicing clip ${current} of ${total} locally…` : 'Processing video locally…'); }); setClips(output); checkpoint({ clipCount: output.length }); const clipBytes = output.reduce((sum, clip) => sum + clip.size, 0); const roughCutLimit = (Capacitor.isNativePlatform() || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ? 150 : 500) * 1024 * 1024; if (clipBytes > roughCutLimit) { setNotice(`${output.length} clips created (${Math.round(clipBytes / 1024 / 1024)} MB). The combined rough cut was skipped because it needs more memory than this device can safely use — save the clips and join them in your editor, or use a desktop browser.`); } else { setStage('Creating rough cut locally…'); const rough = await concatenateClipsLocally(output, p => setProgress(Math.round(p * 100))); setRoughCut(rough); checkpoint({ clipCount: output.length, roughCut: true }); setNotice(`${output.length} clips and a rough cut created locally with re-encoded frame-accurate boundaries. Processing may take longer on mobile devices.`); } } catch (e) { setNotice(e instanceof Error ? e.message : 'Local video slicing failed.'); } finally { setBusy(false); setStage(''); } }
-  async function exportDrive() { if (!driveToken) { setNotice('Connect Google Drive first.'); return; } if (!clips.length && !script && !narration) { setNotice('Generate a script or narration before exporting.'); return; } if (!script) { setNotice('Generate a recap script before exporting the cuts.'); return; } setBusy(true); setStage('Uploading cut sections directly to your Google Drive…'); setNotice(''); setDriveFolder(''); try { const files: DriveExportFile[] = []; for (const c of clips) files.push({ name: c.filename, mimeType: 'video/mp4', body: c.blob, folder: 'video' }); if (narration) { for (const segment of narration.segments) files.push({ name: segment.filename, mimeType: 'audio/mpeg', body: segment.audio, folder: 'voiceover' }); files.push({ name: 'Full_Voiceover.mp3', mimeType: 'audio/mpeg', body: narration.fullVoiceover, folder: 'master' }); files.push({ name: 'Captions.srt', mimeType: 'text/plain', body: narration.captionsSrt, folder: 'master' }); } files.push({ name: 'Timeline_Script.txt', mimeType: 'text/plain', body: script.beats.map(b => `${String(b.index).padStart(3, '0')} ${b.title}\nSource: ${b.startSeconds.toFixed(2)}s–${b.endSeconds.toFixed(2)}s | Act ${b.act}\n${b.narration}\n${b.dialogueCues.map(c => `[LET MOVIE AUDIO PLAY: ${c.startSeconds}s - ${c.quote || c.instruction}]`).join('\n')}\n`).join('\n'), folder: 'master' }); if (roughCut) files.push({ name: 'Full_RoughCut.mp4', mimeType: 'video/mp4', body: roughCut, folder: 'master' }); const result = await exportProductionKit(driveToken, title || script.title, files); setDriveFolder(result.folderUrl); if (projectIdRef.current) { exportedRef.current = true; const pid = projectIdRef.current; void saveProject(pid, { status: 'exported', stage: null, progress: null, error: null, drive: { folderId: result.folderId, folderUrl: result.folderUrl, exportedAt: Date.now(), fileCount: result.uploaded.length }, transcript: null, script: null, narrationReady: null, narrationParts: null, sourceSize: null, videoUrl: null, subtitleUrl: null }); void deleteNarrationParts(pid); } setNotice(`Export complete: ${result.uploaded.length} files uploaded directly to Drive${clips.length ? `, including ${clips.length} cut video sections` : ''}${narration ? ' and narration files' : ''}.`); } catch (e) { if (e instanceof Error && 'folderUrl' in e && typeof (e as Error & { folderUrl?: unknown }).folderUrl === 'string') setDriveFolder((e as Error & { folderUrl: string }).folderUrl); setNotice(e instanceof Error ? e.message : 'Drive export failed.'); } finally { setBusy(false); setStage(''); } }
-  return <main className="min-h-screen bg-[#080a10] px-4 py-8 text-white sm:px-8"><div className="mx-auto max-w-6xl"><header className="mb-7 flex flex-wrap items-center justify-between gap-4"><div><div className="flex items-center gap-4"><Link href="/" className="text-sm text-violet-300">← WyCut</Link><Link href="/login?next=/dashboard" aria-label={authEmail ? `Signed in as ${authEmail}; manage account` : "Sign in to WyCut"} className="max-w-[48vw] truncate rounded-lg border border-violet-400/30 bg-violet-500/10 px-3 py-2 text-xs font-bold text-violet-200">{authEmail ? `Signed in · ${authEmail}` : "Sign in / account"}</Link><Link href="/billing" className="rounded-lg border border-white/10 px-3 py-2 text-xs font-bold text-slate-300">Billing</Link>{(credits !== null || freeAccess) && <Link href="/billing" aria-live="polite" className={`rounded-lg border px-3 py-2 text-xs font-bold ${freeAccess ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200' : credits !== null && credits < LOW_BALANCE_CREDITS ? 'border-amber-400/40 bg-amber-400/10 text-amber-200' : 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200'}`}>{freeAccess ? 'Unlimited access' : credits !== null && credits < LOW_BALANCE_CREDITS ? `${formatCredits(credits)} credits · Top up` : `${formatCredits(credits ?? 0)} credits`}</Link>}</div><h1 className="mt-2 text-2xl font-black sm:text-4xl">Recap Studio</h1><p className="mt-2 text-slate-400">Create a script, narration and edit-ready files.</p></div><div className="rounded-xl border border-white/10 bg-white/[.03] px-4 py-3"><div className="flex items-center gap-2"><Cloud size={18} className={driveToken ? 'text-emerald-400' : 'text-slate-400'}/><span className="text-sm font-semibold">Google Drive</span></div><p className="mt-1 text-xs text-slate-400">{driveToken ? 'Connected on this device' : 'Not connected'} · drive.file scope</p><div className="mt-2 flex flex-wrap gap-3"><button type="button" onClick={() => void connectDrive()} className="text-xs font-bold text-violet-300">{driveToken ? 'Reconnect Drive' : 'Connect Google Drive'}</button>{driveToken && <button type="button" onClick={disconnectDrive} className="text-xs font-semibold text-slate-400 underline">Disconnect</button>}</div>{!Capacitor.isNativePlatform() && <p className="mt-1 text-[11px] text-slate-500">{googleReady ? 'Google sign-in ready' : googleLoadError || 'Preparing Google sign-in…'}</p>}</div><nav className="flex flex-wrap gap-2 rounded-xl border border-white/10 bg-[#111521] p-2" aria-label="Choose input workflow"><Link href="/dashboard/url" className={`rounded-lg px-3 py-2 text-xs font-bold ${mode === 'url' ? 'bg-violet-500 text-white' : 'text-slate-300 hover:bg-white/5'}`}><Link2 className="mr-1 inline" size={14}/>Video URL</Link><Link href="/dashboard/file" className={`rounded-lg px-3 py-2 text-xs font-bold ${mode === 'file' ? 'bg-violet-500 text-white' : 'text-slate-300 hover:bg-white/5'}`}><UploadCloud className="mr-1 inline" size={14}/>Video file</Link><Link href="/dashboard/subtitles" className={`rounded-lg px-3 py-2 text-xs font-bold ${mode === 'subtitles' ? 'bg-violet-500 text-white' : 'text-slate-300 hover:bg-white/5'}`}><FileText className="mr-1 inline" size={14}/>Subtitles</Link></nav></header>
+  async function sliceVideo() { if (!hasSourceTimecodes) { setNotice('Accurate cuts require a timestamped SRT/VTT transcript. Plain text has no source timecodes, so any AI timing would be a guess. Upload the matching SRT/VTT before slicing.'); return; } if (!script || !video) { setNotice('Generate a script and choose the source movie file you are authorized to edit.'); return; } const job = startJob('slice'); setBusy(true); setStage('Loading local FFmpeg…'); setProgress(0); setNotice(''); setClips([]); setRoughCut(null); try { const duration = await getVideoDuration(video); const lastTimestamp = Math.max(...script.beats.map(beat => beat.endSeconds)); if (lastTimestamp > duration + 2) throw new Error(`The script references ${Math.round(lastTimestamp)} seconds, but this source video is only ${Math.round(duration)} seconds long. Upload matching subtitles/source video.`); const output = await sliceVideoLocally(video, script.beats.map(b => ({ index: b.index, id: b.id, startSeconds: b.startSeconds, endSeconds: b.endSeconds })), (p, current, total) => { setProgress(Math.round(p * 100)); setStage(current > 0 ? `Slicing clip ${current} of ${total} locally…` : 'Processing video locally…'); }); if (job.cancelled) return; setClips(output); checkpoint({ clipCount: output.length }); const clipBytes = output.reduce((sum, clip) => sum + clip.size, 0); const roughCutLimit = (Capacitor.isNativePlatform() || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ? 150 : 500) * 1024 * 1024; if (clipBytes > roughCutLimit) { setNotice(`${output.length} clips created (${Math.round(clipBytes / 1024 / 1024)} MB). The combined rough cut was skipped because it needs more memory than this device can safely use — save the clips and join them in your editor, or use a desktop browser.`); } else { setStage('Creating rough cut locally…'); const rough = await concatenateClipsLocally(output, p => setProgress(Math.round(p * 100))); if (job.cancelled) return; setRoughCut(rough); checkpoint({ clipCount: output.length, roughCut: true }); setNotice(`${output.length} clips and a rough cut created locally with re-encoded frame-accurate boundaries. Processing may take longer on mobile devices.`); } } catch (e) { if (job.cancelled) return; setNotice(e instanceof Error ? e.message : 'Local video slicing failed.'); } finally { if (!job.cancelled) { setBusy(false); setStage(''); setActiveKind(''); } } }
+  async function exportDrive() { if (!driveToken) { setNotice('Connect Google Drive first.'); return; } if (!clips.length && !script && !narration) { setNotice('Generate a script or narration before exporting.'); return; } if (!script) { setNotice('Generate a recap script before exporting the cuts.'); return; } startJob('export'); setBusy(true); setStage('Uploading cut sections directly to your Google Drive…'); setNotice(''); setDriveFolder(''); try { const files: DriveExportFile[] = []; for (const c of clips) files.push({ name: c.filename, mimeType: 'video/mp4', body: c.blob, folder: 'video' }); if (narration) { for (const segment of narration.segments) files.push({ name: segment.filename, mimeType: 'audio/mpeg', body: segment.audio, folder: 'voiceover' }); files.push({ name: 'Full_Voiceover.mp3', mimeType: 'audio/mpeg', body: narration.fullVoiceover, folder: 'master' }); files.push({ name: 'Captions.srt', mimeType: 'text/plain', body: narration.captionsSrt, folder: 'master' }); } files.push({ name: 'Timeline_Script.txt', mimeType: 'text/plain', body: script.beats.map(b => `${String(b.index).padStart(3, '0')} ${b.title}\nSource: ${b.startSeconds.toFixed(2)}s–${b.endSeconds.toFixed(2)}s | Act ${b.act}\n${b.narration}\n${b.dialogueCues.map(c => `[LET MOVIE AUDIO PLAY: ${c.startSeconds}s - ${c.quote || c.instruction}]`).join('\n')}\n`).join('\n'), folder: 'master' }); if (roughCut) files.push({ name: 'Full_RoughCut.mp4', mimeType: 'video/mp4', body: roughCut, folder: 'master' }); const result = await exportProductionKit(driveToken, title || script.title, files); setDriveFolder(result.folderUrl); if (projectIdRef.current) { exportedRef.current = true; const pid = projectIdRef.current; void saveProject(pid, { status: 'exported', stage: null, progress: null, error: null, drive: { folderId: result.folderId, folderUrl: result.folderUrl, exportedAt: Date.now(), fileCount: result.uploaded.length }, transcript: null, script: null, narrationReady: null, narrationParts: null, sourceSize: null, videoUrl: null, subtitleUrl: null }); void deleteNarrationParts(pid); } setNotice(`Export complete: ${result.uploaded.length} files uploaded directly to Drive${clips.length ? `, including ${clips.length} cut video sections` : ''}${narration ? ' and narration files' : ''}.`); } catch (e) { if (e instanceof Error && 'folderUrl' in e && typeof (e as Error & { folderUrl?: unknown }).folderUrl === 'string') setDriveFolder((e as Error & { folderUrl: string }).folderUrl); setNotice(e instanceof Error ? e.message : 'Drive export failed.'); } finally { setBusy(false); setStage(''); setActiveKind(''); } }
+  return <main className="min-h-screen bg-[#080a10] px-4 py-8 text-white sm:px-8">
+  {busy && activeKind && activeKind !== 'export' && !confirmCancel && <button type="button" onClick={() => setConfirmCancel(true)} disabled={cancelling} className="fixed left-4 z-40 flex items-center gap-2 rounded-full border border-red-400/40 bg-[#1a0f14] px-4 py-3 text-sm font-bold text-red-200 shadow-lg shadow-black/50 active:scale-95" style={{ bottom: 'calc(env(safe-area-inset-bottom, 0px) + 1.25rem)' }}><span aria-hidden="true">✕</span> Cancel</button>}
+  {confirmCancel && <div role="dialog" aria-modal="true" aria-labelledby="cancel-title" className="fixed inset-0 z-[60] grid place-items-center bg-black/70 p-5"><div className="w-full max-w-sm rounded-2xl border border-white/10 bg-[#111521] p-6 shadow-2xl"><h2 id="cancel-title" className="text-lg font-black">Stop generation?</h2><p className="mt-2 text-sm leading-6 text-slate-300">Do you want to stop generation?</p><p className="mt-2 text-xs leading-5 text-slate-400">{activeKind === 'slice' ? 'Cutting uses no credits. Yes stops it now; No keeps it going.' : 'Yes stops it now and returns the credits used by this run to your balance. No keeps it going.'}</p><div className="mt-5 grid grid-cols-2 gap-3"><button type="button" autoFocus onClick={() => setConfirmCancel(false)} className="rounded-xl border border-white/15 px-4 py-3 text-sm font-bold">No</button><button type="button" onClick={() => void cancelRef.current()} className="rounded-xl bg-red-500 px-4 py-3 text-sm font-bold text-white">Yes</button></div></div></div>}
+  <div className="mx-auto max-w-6xl"><header className="mb-7 flex flex-wrap items-center justify-between gap-4"><div><div className="flex items-center gap-4"><Link href="/" className="text-sm text-violet-300">← WyCut</Link><Link href="/login?next=/dashboard" aria-label={authEmail ? `Signed in as ${authEmail}; manage account` : "Sign in to WyCut"} className="max-w-[48vw] truncate rounded-lg border border-violet-400/30 bg-violet-500/10 px-3 py-2 text-xs font-bold text-violet-200">{authEmail ? `Signed in · ${authEmail}` : "Sign in / account"}</Link><Link href="/billing" className="rounded-lg border border-white/10 px-3 py-2 text-xs font-bold text-slate-300">Billing</Link>{(credits !== null || freeAccess) && <Link href="/billing" aria-live="polite" className={`rounded-lg border px-3 py-2 text-xs font-bold ${freeAccess ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200' : credits !== null && credits < LOW_BALANCE_CREDITS ? 'border-amber-400/40 bg-amber-400/10 text-amber-200' : 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200'}`}>{freeAccess ? 'Unlimited access' : credits !== null && credits < LOW_BALANCE_CREDITS ? `${formatCredits(credits)} credits · Top up` : `${formatCredits(credits ?? 0)} credits`}</Link>}</div><h1 className="mt-2 text-2xl font-black sm:text-4xl">Recap Studio</h1><p className="mt-2 text-slate-400">Create a script, narration and edit-ready files.</p></div><div className="rounded-xl border border-white/10 bg-white/[.03] px-4 py-3"><div className="flex items-center gap-2"><Cloud size={18} className={driveToken ? 'text-emerald-400' : 'text-slate-400'}/><span className="text-sm font-semibold">Google Drive</span></div><p className="mt-1 text-xs text-slate-400">{driveToken ? 'Connected on this device' : 'Not connected'} · drive.file scope</p><div className="mt-2 flex flex-wrap gap-3"><button type="button" onClick={() => void connectDrive()} className="text-xs font-bold text-violet-300">{driveToken ? 'Reconnect Drive' : 'Connect Google Drive'}</button>{driveToken && <button type="button" onClick={disconnectDrive} className="text-xs font-semibold text-slate-400 underline">Disconnect</button>}</div>{!Capacitor.isNativePlatform() && <p className="mt-1 text-[11px] text-slate-500">{googleReady ? 'Google sign-in ready' : googleLoadError || 'Preparing Google sign-in…'}</p>}</div><nav className="flex flex-wrap gap-2 rounded-xl border border-white/10 bg-[#111521] p-2" aria-label="Choose input workflow"><Link href="/dashboard/url" className={`rounded-lg px-3 py-2 text-xs font-bold ${mode === 'url' ? 'bg-violet-500 text-white' : 'text-slate-300 hover:bg-white/5'}`}><Link2 className="mr-1 inline" size={14}/>Video URL</Link><Link href="/dashboard/file" className={`rounded-lg px-3 py-2 text-xs font-bold ${mode === 'file' ? 'bg-violet-500 text-white' : 'text-slate-300 hover:bg-white/5'}`}><UploadCloud className="mr-1 inline" size={14}/>Video file</Link><Link href="/dashboard/subtitles" className={`rounded-lg px-3 py-2 text-xs font-bold ${mode === 'subtitles' ? 'bg-violet-500 text-white' : 'text-slate-300 hover:bg-white/5'}`}><FileText className="mr-1 inline" size={14}/>Subtitles</Link></nav></header>
   <div className="grid gap-6 lg:grid-cols-[1fr_310px]"><section className="space-y-5"><div className="rounded-2xl border border-white/10 bg-[#111521] p-5 sm:p-7">
     <h2 className="mb-4 flex items-center gap-2 text-lg font-bold"><Clapperboard size={20} className="text-violet-300"/> {mode === 'url' ? '1. Video URL workflow' : mode === 'file' ? '1. Choose a video file' : '1. Subtitle-to-recap workflow'}</h2>
     <label className="mb-2 block text-sm font-semibold">Movie / project title</label>

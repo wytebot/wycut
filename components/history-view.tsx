@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { LoaderCircle, Trash2, PlayCircle, CheckCircle2, Cloud, ChevronDown, FileText, Mic2, Film, ExternalLink, Download, RefreshCw } from 'lucide-react';
 import { listProjects, deleteProject, liveProjects, PROJECTS_CHANGED, type ProjectRecord } from '@/lib/projects/store';
-import { requestOpenProject, requestDriveConnect, readDriveToken } from '@/lib/projects/bus';
+import { requestOpenProject, requestDriveConnect, readDriveToken, requestCancelGeneration } from '@/lib/projects/bus';
 import { DRIVE_TOKEN_EVENT } from '@/lib/projects/bus';
 import { loadProductionKit, fetchDriveBlob, fetchDriveText, DriveReadError, type DriveKit, type DriveItem } from '@/lib/drive/read';
 
@@ -24,6 +24,7 @@ export function HistoryView() {
   const ongoing = (projects || []).filter(p => p.status !== 'exported');
   const completed = (projects || []).filter(p => p.status === 'exported' && p.drive);
   const open = (p: ProjectRecord) => { requestOpenProject(p.id); router.push(ROUTES[p.mode]); };
+  const stop = (p: ProjectRecord) => { router.push(ROUTES[p.mode]); window.setTimeout(() => requestCancelGeneration(), 150); };
   const remove = async (p: ProjectRecord) => { if (liveProjects.has(p.id)) return; if (!window.confirm(p.status === 'exported' ? `Remove “${p.title}” from this list? Your files in Google Drive are not touched.` : `Delete “${p.title}” from this device? Its saved transcript and narration will be removed.`)) return; await deleteProject(p.id); refresh(); };
   const list = tab === 'ongoing' ? ongoing : completed;
   return <main className="min-h-screen bg-[#080a10] px-4 pb-28 pt-8 text-white sm:px-8"><div className="mx-auto max-w-3xl">
@@ -31,13 +32,13 @@ export function HistoryView() {
     <div role="tablist" className="mb-5 grid grid-cols-2 gap-1 rounded-xl border border-white/10 bg-[#111521] p-1">{(['ongoing', 'completed'] as const).map(t => <button key={t} role="tab" aria-selected={tab === t} onClick={() => setTab(t)} className={`rounded-lg px-3 py-2.5 text-sm font-bold capitalize ${tab === t ? 'bg-violet-500 text-white' : 'text-slate-300'}`}>{t} · {t === 'ongoing' ? ongoing.length : completed.length}</button>)}</div>
     {projects === null && <p className="flex items-center gap-2 text-sm text-slate-400"><LoaderCircle size={16} className="animate-spin" /> Loading…</p>}
     {projects !== null && list.length === 0 && <div className="rounded-2xl border border-dashed border-white/15 p-8 text-center text-sm leading-6 text-slate-400">{tab === 'ongoing' ? 'Nothing in progress. Start a recap in the studio and it will appear here, even if you leave the app.' : 'No completed projects yet. After you export a kit to Google Drive it shows up here.'}<div className="mt-4"><Link href="/dashboard" className="rounded-xl bg-violet-500 px-4 py-2.5 text-sm font-bold">Open studio</Link></div></div>}
-    <div className="space-y-4">{tab === 'ongoing' ? ongoing.map(p => <OngoingCard key={p.id} p={p} onOpen={() => open(p)} onDelete={() => void remove(p)} />) : completed.map(p => <CompletedCard key={p.id} p={p} onDelete={() => void remove(p)} />)}</div>
+    <div className="space-y-4">{tab === 'ongoing' ? ongoing.map(p => <OngoingCard key={p.id} p={p} onOpen={() => open(p)} onStop={() => stop(p)} onDelete={() => void remove(p)} />) : completed.map(p => <CompletedCard key={p.id} p={p} onDelete={() => void remove(p)} />)}</div>
   </div></main>;
 }
 
 function Chip({ on, children }: { on: boolean; children: React.ReactNode }) { return <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${on ? 'bg-emerald-400/10 text-emerald-300' : 'bg-white/5 text-slate-500'}`}>{on ? '✓ ' : ''}{children}</span>; }
 
-function OngoingCard({ p, onOpen, onDelete }: { p: ProjectRecord; onOpen: () => void; onDelete: () => void }) {
+function OngoingCard({ p, onOpen, onStop, onDelete }: { p: ProjectRecord; onOpen: () => void; onStop: () => void; onDelete: () => void }) {
   const live = p.status === 'running' && liveProjects.has(p.id);
   const interrupted = p.status === 'running' && !live;
   const label = live ? 'Running now' : interrupted ? 'Interrupted' : p.status === 'failed' ? 'Needs attention' : 'Saved';
@@ -48,7 +49,7 @@ function OngoingCard({ p, onOpen, onDelete }: { p: ProjectRecord; onOpen: () => 
     {interrupted && <p className="mt-3 text-xs leading-5 text-amber-200/90">The app was closed while this was running. Open it to continue; saved work is reused and nothing already paid for is charged again.</p>}
     {p.status === 'failed' && p.error && <p className="mt-3 line-clamp-3 text-xs leading-5 text-red-200/90">{p.error}</p>}
     <div className="mt-3 flex flex-wrap gap-1.5"><Chip on={Boolean(p.transcript)}>Transcript</Chip><Chip on={Boolean(p.script)}>Script</Chip><Chip on={Boolean(p.narrationReady)}>Voiceover</Chip><Chip on={(p.clipCount || 0) > 0}>{p.clipCount ? `${p.clipCount} clips` : 'Clips'}</Chip></div>
-    <div className="mt-4 flex gap-2"><button onClick={onOpen} className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-violet-500 px-4 py-3 text-sm font-bold active:scale-[.99]"><PlayCircle size={17} /> {live ? 'View progress' : 'Resume project'}</button><button onClick={onDelete} disabled={live} aria-label={`Delete ${p.title}`} className="grid w-12 place-items-center rounded-xl border border-white/10 text-slate-400 disabled:opacity-30"><Trash2 size={17} /></button></div>
+    <div className="mt-4 flex gap-2"><button onClick={onOpen} className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-violet-500 px-4 py-3 text-sm font-bold active:scale-[.99]"><PlayCircle size={17} /> {live ? 'View progress' : 'Resume project'}</button>{live ? <button onClick={onStop} className="rounded-xl border border-red-400/40 px-4 py-3 text-sm font-bold text-red-200">Cancel</button> : <button onClick={onDelete} aria-label={`Delete ${p.title}`} className="grid w-12 place-items-center rounded-xl border border-white/10 text-slate-400"><Trash2 size={17} /></button>}</div>
     {(p.clipCount || 0) > 0 && <p className="mt-2 text-[11px] leading-4 text-slate-500">Cut clips are kept in memory only. Export to Drive to keep them, or re-slice after resuming.</p>}
   </article>;
 }

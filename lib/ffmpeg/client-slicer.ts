@@ -112,6 +112,12 @@ export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgr
   });
 }
 
+/** Stops whatever FFmpeg is doing right now (used by Cancel). The running job fails and the next job starts a fresh engine. */
+export function abortFFmpeg(): void {
+  try { ffmpegInstance?.terminate(); } catch { /* already stopped */ }
+  ffmpegInstance = null; loadPromise = null;
+}
+
 export async function releaseFFmpegMemory(): Promise<void> {
   await serialized(async () => {
     if (ffmpegInstance?.loaded) { ffmpegInstance.terminate(); ffmpegInstance = null; loadPromise = null; }

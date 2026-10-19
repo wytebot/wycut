@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import { installBackgroundService } from './native/install-background-service.mjs';
 
 const root = process.cwd();
 const androidDir = path.join(root, 'android');
@@ -42,6 +43,8 @@ if (!await exists(androidDir)) {
 await mkdir(path.dirname(googleServicesPath), { recursive: true });
 await writeFile(googleServicesPath, firebaseJsonText);
 await run(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['cap', 'sync', 'android']);
+// Foreground service so long jobs keep running when the app is in the background.
+await installBackgroundService({ root, androidDir, appId });
 // Stamp a version into the generated Android project so every APK can be told apart (and updates install over each other).
 {
   const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));

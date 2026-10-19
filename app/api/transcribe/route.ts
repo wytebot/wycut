@@ -6,7 +6,7 @@ import { isAllowedApiOrigin } from '@/lib/server/origin';
 import { verifyGoogleIdentity } from '@/lib/billing/google-identity';
 import { getAdminDb } from '@/lib/firebase-admin';
 import { hasLifetimeFreeAccess } from '@/lib/billing/entitlements';
-import { InsufficientCreditsError, chargeCredits, refundCharge } from '@/lib/billing/credits';
+import { InsufficientCreditsError, JobCancelledError, cleanJobId, chargeCredits, refundCharge } from '@/lib/billing/credits';
 import { transcribeCredits } from '@/lib/billing/pricing';
 
 export const runtime = 'nodejs';
@@ -85,7 +85,7 @@ export async function POST(req: NextRequest) {
   const limit = enforceRateLimit(req, 'transcribe', 90, 10 * 60 * 1000);
   if (!limit.allowed) return NextResponse.json({ error: 'Too many transcription requests. Wait a minute and retry.' }, { status: 429, headers: { 'Retry-After': String(limit.retryAfterSeconds), 'Cache-Control': 'no-store' } });
   if (!isAllowedApiOrigin(req)) return NextResponse.json({ error: 'Cross-origin request rejected.' }, { status: 403 });
-  let body: { idToken?: string; audioBase64?: string; mimeType?: string; durationSeconds?: number; deviceId?: string };
+  let body: { idToken?: string; audioBase64?: string; mimeType?: string; durationSeconds?: number; deviceId?: string; jobId?: string };
   try { body = await req.json() as typeof body; } catch { return NextResponse.json({ error: 'Invalid request body.' }, { status: 400 }); }
   if (typeof body.audioBase64 !== 'string' || !body.audioBase64 || body.audioBase64.length > MAX_BASE64_CHARS) return NextResponse.json({ error: 'Audio chunk is missing or too large.' }, { status: 413 });
   const mimeType = typeof body.mimeType === 'string' && ALLOWED_MIME.has(body.mimeType) ? body.mimeType : 'audio/mp3';
@@ -105,9 +105,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'WyCut could not check transcription limits (billing database). Check Firebase configuration in Vercel logs.', code: 'CREDIT_DATABASE_CONFIGURATION' }, { status: 503 });
   }
   let ledgerId = '';
-  try { ledgerId = await chargeCredits({ userId: identity.userId, email: identity.email, amount, kind: 'transcribe', deviceId }); }
+  try { ledgerId = await chargeCredits({ userId: identity.userId, email: identity.email, amount, kind: 'transcribe', deviceId, jobId: cleanJobId(body.jobId) }); }
   catch (e) {
     await releaseDailyChunk(identity.userId).catch(() => undefined);
+    if (e instanceof JobCancelledError) return NextResponse.json({ error: 'This generation was cancelled.', code: 'JOB_CANCELLED' }, { status: 409, headers: { 'Cache-Control': 'no-store' } });
     if (e instanceof InsufficientCreditsError) return NextResponse.json({ error: `Transcribing this part needs ${e.needed} credits and your balance is ${Math.floor(e.balance)}. Top up to continue.`, code: 'INSUFFICIENT_CREDITS', needed: e.needed, balance: Math.floor(e.balance), billingUrl: '/billing' }, { status: 402, headers: { 'Cache-Control': 'no-store' } });
     console.error('[api/transcribe] credit charge failed', { message: e instanceof Error ? e.message : 'unknown' });
     return NextResponse.json({ error: 'WyCut could not use your credits (billing database). Check Firebase configuration in Vercel logs.', code: 'CREDIT_DATABASE_CONFIGURATION' }, { status: 503 });

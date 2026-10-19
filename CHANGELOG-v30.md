@@ -34,3 +34,11 @@ No dependencies were installed in the build environment: `npm install`, `npm run
 - Completed projects (exported to Drive) keep only a Drive folder reference locally. Clips, rough cut, voice files, captions and script are read live from the user's Drive (watch/listen/save/read) and are not stored on the device.
 - The screen stays awake while a job runs. Android may still freeze or kill a backgrounded WebView; the checkpoints make that recoverable. Truly continuous background work would need a native foreground-service plugin.
 - Not run here: run npm install, typecheck, lint and test on a phone.
+
+## v30.6 — cancel + refund, background service
+- Cancel button (bottom-left while a transcription/script/narration/cutting job runs) with a Yes/No popup: "Do you want to stop generation?". No keeps going. Yes aborts the network calls and FFmpeg, then returns every credit charged by THAT run (new POST /api/billing/cancel) and discards what the run produced (its transcript parts, script or narration) so refunded work cannot be reused for free. Work from earlier, finished runs is kept. Cutting uses no credits, so cancelling it just stops it. Drive export cannot be cancelled.
+- Each run has a job id sent with transcribe/script/narration requests; the server stores it on the credit-ledger rows and, once cancelled, rejects any charge that arrives late (wycut_cancelled_jobs marker), so nothing is double-charged or lost. Refund is idempotent and also rolls back usage counters and the daily transcription count.
+- markRecapCreditConsumed no longer flips a refunded script back to consumed.
+- History: a running project shows a Cancel button that opens the same popup.
+- Android foreground service (scripts/native/*.tpl, installed by scripts/build-android.mjs after `cap sync`): shows a "WyCut is working" notification with live progress and keeps the process alive with a partial wake lock while a job runs. Adds FOREGROUND_SERVICE(+DATA_SYNC), POST_NOTIFICATIONS, WAKE_LOCK permissions. Android 15 limits dataSync services to ~6 h/day.
+- Not run here: npm install, typecheck, Android build, Firestore rules/indexes check (cancelJob queries the ledger on userId + jobId equality), and a real-phone test of cancel/refund and background behaviour.

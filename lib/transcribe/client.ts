@@ -2,7 +2,7 @@ import { extractAudioChunksLocally, type AudioChunk } from '@/lib/ffmpeg/client-
 import { apiUrl } from '@/lib/api-client';
 import { transcribeCredits } from '@/lib/billing/pricing';
 import { TopUpError } from '@/lib/billing/client-errors';
-import { getChunk, putChunk } from '@/lib/projects/store';
+import { getChunk, putChunk, deleteChunkKeys } from '@/lib/projects/store';
 
 const CHUNK_SECONDS = 300;
 const MAX_TRANSCRIPT_CHARS = 110_000; // script API limit is 120,000 characters
@@ -42,14 +42,23 @@ function buildSrt(cues: Cue[]): string {
   return '';
 }
 
-async function transcribeChunk(chunk: AudioChunk, getToken: () => Promise<string>): Promise<ApiSegment[]> {
+/** Forget the parts that were paid for in a run the user cancelled (they get those credits back). Parts paid in earlier runs are kept. */
+export async function forgetTranscriptChunks(keys: string[]): Promise<void> {
+  for (const key of keys) chunkCache.delete(key);
+  await deleteChunkKeys(keys);
+}
+const abortError = () => new DOMException('Cancelled', 'AbortError');
+
+async function transcribeChunk(chunk: AudioChunk, getToken: () => Promise<string>, jobId = '', signal?: AbortSignal): Promise<ApiSegment[]> {
   const audioBase64 = await toBase64(chunk.blob);
   let lastError = 'Transcription failed.';
   for (let attempt = 0; attempt < 2; attempt++) {
+    if (signal?.aborted) throw abortError();
     let response: Response;
     try {
-      response = await fetch(apiUrl('/api/transcribe'), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Device-Id': deviceId() }, body: JSON.stringify({ idToken: await getToken(), deviceId: deviceId(), audioBase64, mimeType: chunk.mimeType, durationSeconds: chunk.durationSeconds }), cache: 'no-store' });
-    } catch (error) { lastError = `Could not reach the transcription API (${error instanceof Error ? error.message : 'network error'}).`; continue; }
+      response = await fetch(apiUrl('/api/transcribe'), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Device-Id': deviceId() }, body: JSON.stringify({ idToken: await getToken(), deviceId: deviceId(), audioBase64, mimeType: chunk.mimeType, durationSeconds: chunk.durationSeconds, jobId }), cache: 'no-store', signal });
+    } catch (error) {
+      if (signal?.aborted) throw abortError(); lastError = `Could not reach the transcription API (${error instanceof Error ? error.message : 'network error'}).`; continue; }
     const data = await response.json().catch(() => null) as { error?: string; code?: string; needed?: number; balance?: number; segments?: ApiSegment[] } | null;
     if (response.ok && data && Array.isArray(data.segments)) return data.segments;
     if (response.status === 402 || data?.code === 'INSUFFICIENT_CREDITS') throw new TopUpError(data?.error || 'You need more credits to continue.', data?.needed, data?.balance);
@@ -61,8 +70,9 @@ async function transcribeChunk(chunk: AudioChunk, getToken: () => Promise<string
 }
 
 /** Video file -> audio-only chunks (local FFmpeg) -> timestamped SRT text. Nothing but small audio chunks leaves the device. */
-export async function transcribeVideoToSrt(video: File, getToken: () => Promise<string>, onStatus: (stage: string, progress: number) => void, options: { cacheKey?: string; ensureCredits?: (needed: number) => Promise<void> } = {}): Promise<string> {
+export async function transcribeVideoToSrt(video: File, getToken: () => Promise<string>, onStatus: (stage: string, progress: number) => void, options: { cacheKey?: string; ensureCredits?: (needed: number) => Promise<void>; jobId?: string; signal?: AbortSignal; onPaid?: (key: string) => void } = {}): Promise<string> {
   onStatus('Extracting audio from your video on this device…', 3);
+  if (options.signal?.aborted) throw abortError();
   const chunks = await extractAudioChunksLocally(video, CHUNK_SECONDS, p => onStatus('Extracting audio from your video on this device…', 3 + Math.round(p * 7)));
   const results: ApiSegment[][] = new Array(chunks.length);
   const keyFor = (i: number) => (options.cacheKey ? `${options.cacheKey}:${chunks.length}:${i}` : '');
@@ -77,8 +87,9 @@ export async function transcribeVideoToSrt(video: File, getToken: () => Promise<
       const i = cursor++;
       if (i >= chunks.length) return;
       if (results[i]) continue;
-      results[i] = await transcribeChunk(chunks[i], getToken);
-      if (keyFor(i)) { chunkCache.set(keyFor(i), results[i]); void putChunk(keyFor(i), results[i]); }
+      if (options.signal?.aborted) throw abortError();
+      results[i] = await transcribeChunk(chunks[i], getToken, options.jobId, options.signal);
+      if (keyFor(i)) { chunkCache.set(keyFor(i), results[i]); void putChunk(keyFor(i), results[i]); options.onPaid?.(keyFor(i)); }
       done++;
       onStatus(`Transcribing audio… ${done} of ${chunks.length} parts`, 10 + Math.round(done / chunks.length * 12));
     }
