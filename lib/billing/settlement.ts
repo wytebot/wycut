@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { getAdminDb } from '@/lib/firebase-admin';
 import { priceProduct } from '@/lib/billing/pricing';
+import { walletCredits } from '@/lib/billing/credits';
 
 export type VerifiedFlutterwaveTransaction = {
   id?: string | number;
@@ -30,7 +31,7 @@ export async function settleVerifiedTransaction(tx: VerifiedFlutterwaveTransacti
   const storedTotal = roundedAmount(order.totalAmount);
   const storedBase = roundedAmount(order.baseAmount);
   const storedFee = roundedAmount(order.gatewayFee);
-  const storedCredits = Number(order.recaps);
+  const storedCredits = Number(order.credits ?? price?.credits); // orders made before credit packs stored `recaps`; legacy products map to a fixed credit amount
   if (!price || order.currency !== 'NGN' || !Number.isFinite(storedTotal) || !Number.isFinite(storedBase) || !Number.isFinite(storedFee) || storedBase + storedFee !== storedTotal || !Number.isInteger(storedCredits) || storedCredits < 1) {
     throw new Error('Stored order pricing is invalid.');
   }
@@ -54,16 +55,20 @@ export async function settleVerifiedTransaction(tx: VerifiedFlutterwaveTransacti
       const payment = paymentSnap.data() || {};
       if (latestOrderSnap.exists && String(latestOrderSnap.data()?.status || '') !== 'credited') transaction.set(orderRef, { status: 'credited', paymentId, providerTransactionId: String(tx.id), creditsGranted: Number(payment.creditsGranted || storedCredits), creditedAt: payment.verifiedAt || new Date().toISOString(), verifiedAmount: storedTotal, verifiedCurrency: 'NGN' }, { merge: true });
       if (userSnap.data()?.activePaymentRef === tx.tx_ref) transaction.set(userRef, { activePaymentRef: null, updatedAt: new Date().toISOString() }, { merge: true });
-      return { duplicate: true, creditsGranted: 0, balance: Number(userSnap.data()?.recapsAvailable || 0) };
+      return { duplicate: true, creditsGranted: 0, balance: walletCredits(userSnap.data()).credits };
     }
     if (!latestOrderSnap.exists) throw new Error('Order disappeared during settlement.');
     const latestOrder = latestOrderSnap.data()!;
     if (latestOrder.userId !== order.userId || latestOrder.productId !== order.productId) throw new Error('Order ownership or product changed during settlement.');
     if (['credited', 'successful'].includes(String(latestOrder.status)) && latestOrder.paymentId) {
-      return { duplicate: true, creditsGranted: 0, balance: Number(userSnap.data()?.recapsAvailable || 0) };
+      return { duplicate: true, creditsGranted: 0, balance: walletCredits(userSnap.data()).credits };
     }
-    const currentBalance = Number(userSnap.data()?.recapsAvailable || 0);
-    const nextBalance = currentBalance + storedCredits;
+    const currentWallet = walletCredits(userSnap.data());
+    const nextBalance = currentWallet.credits + storedCredits;
+    if (currentWallet.legacyRecaps > 0) {
+      transaction.create(db.collection('wycut_credit_ledger').doc(`migration_${order.userId}_${paymentId.slice(0, 12)}`), { userId: order.userId, kind: 'migration', delta: currentWallet.credits - Math.max(0, Number(userSnap.data()?.creditsBalance || 0)), status: 'posted', note: 'Legacy recap credits converted during a purchase', createdAt: new Date().toISOString(), createdAtMs: Date.now() });
+    }
+    transaction.create(db.collection('wycut_credit_ledger').doc(`purchase_${paymentId}`), { userId: order.userId, kind: 'purchase', delta: storedCredits, status: 'posted', ref: String(tx.tx_ref), productId: order.productId, providerTransactionId: String(tx.id), createdAt: new Date().toISOString(), createdAtMs: Date.now(), balanceAfter: nextBalance });
     transaction.create(paymentRef, {
       provider: 'flutterwave_v4', providerTransactionId: String(tx.id), txRef: tx.tx_ref,
       userId: order.userId, productId: order.productId, baseAmount: storedBase,
@@ -73,7 +78,7 @@ export async function settleVerifiedTransaction(tx: VerifiedFlutterwaveTransacti
     });
     transaction.set(userRef, {
       userId: order.userId, email: order.customerEmail, displayName: order.customerName || null,
-      recapsAvailable: nextBalance, totalRecapsPurchased: Number(userSnap.data()?.totalRecapsPurchased || 0) + storedCredits,
+      creditsBalance: nextBalance, recapsAvailable: 0, totalCreditsPurchased: Number(userSnap.data()?.totalCreditsPurchased || 0) + storedCredits,
       activePaymentRef: userSnap.data()?.activePaymentRef === tx.tx_ref ? null : (userSnap.data()?.activePaymentRef || null),
       updatedAt: new Date().toISOString(), createdAt: userSnap.data()?.createdAt || new Date().toISOString(),
     }, { merge: true });

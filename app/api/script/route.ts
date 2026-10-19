@@ -3,7 +3,8 @@ import { enforceRateLimit } from '@/lib/server/rate-limit';
 import { generateRecapScript } from '@/lib/ai/script-generator';
 import { isAllowedApiOrigin } from '@/lib/server/origin';
 import { verifyGoogleIdentity } from '@/lib/billing/google-identity';
-import { markRecapCreditConsumed, refundRecapCredit, reserveRecapCredit } from '@/lib/billing/credits';
+import { InsufficientCreditsError, markRecapCreditConsumed, refundRecapCredit, reserveRecapCredit } from '@/lib/billing/credits';
+import { scriptCredits } from '@/lib/billing/pricing';
 export const runtime = 'nodejs';
 export const maxDuration = 120;
 export async function POST(req: NextRequest) {
@@ -15,17 +16,14 @@ export async function POST(req: NextRequest) {
   if (typeof body.title !== 'string' || typeof body.transcript !== 'string') return NextResponse.json({ error: 'Provide title and transcript text.' }, { status: 400 });
   if (body.transcript.length > 120_000) return NextResponse.json({ error: 'Transcript exceeds 120,000 characters.' }, { status: 413 });
   let identity;
-  try { identity = await verifyGoogleIdentity(body.idToken || ''); } catch (e) { return NextResponse.json({ error: e instanceof Error ? e.message : 'Sign in with Google to use a recap credit.' }, { status: 401 }); }
+  try { identity = await verifyGoogleIdentity(body.idToken || ''); } catch (e) { return NextResponse.json({ error: e instanceof Error ? e.message : 'Sign in with Google to use your credits.' }, { status: 401 }); }
   const deviceId = req.headers.get('x-device-id') || body.deviceId || '';
-  if (identity.email.endsWith('@phone.wycut.invalid')) return NextResponse.json({ error: 'A verified Google email is required for the free trial.', code: 'GOOGLE_EMAIL_REQUIRED' }, { status: 403 });
+  if (identity.email.endsWith('@phone.wycut.invalid')) return NextResponse.json({ error: 'A verified Google email is required to use WyCut credits.', code: 'GOOGLE_EMAIL_REQUIRED' }, { status: 403 });
   let usageId = '';
   try {
-    usageId = await reserveRecapCredit(identity.userId, identity.email, body.title, deviceId);
+    usageId = await reserveRecapCredit(identity.userId, identity.email, body.title, deviceId, scriptCredits(body.transcript.length));
   } catch (e) {
-    if (e instanceof Error && ['FREE_TRIAL_USED_ON_DEVICE', 'FREE_TRIAL_ALREADY_USED'].includes(e.message)) return NextResponse.json({ error: 'Your two free generations have been used on this account or device. Purchase a recap to continue.', code: e.message, billingUrl: '/billing' }, { status: 402 });
-    if (e instanceof Error && e.message === 'FREE_TRIAL_DAILY_CAP') return NextResponse.json({ error: 'WyCut has reached its daily free-generation safety limit. Please try again tomorrow or purchase a recap.', code: e.message }, { status: 429 });
-    if (e instanceof Error && e.message === 'FREE_TRIAL_DEVICE_REQUIRED') return NextResponse.json({ error: 'Device verification is not configured for free trials.', code: e.message }, { status: 503 });
-    if (e instanceof Error && e.message === 'NO_RECAP_CREDITS') return NextResponse.json({ error: 'You have no recap credits. Purchase a single recap or a 10-recap pack to continue.', code: 'NO_RECAP_CREDITS', billingUrl: '/billing' }, { status: 402 });
+    if (e instanceof InsufficientCreditsError) return NextResponse.json({ error: `This script needs ${e.needed} credits and your balance is ${Math.floor(e.balance)}. Top up to continue.`, code: 'INSUFFICIENT_CREDITS', needed: e.needed, balance: Math.floor(e.balance), billingUrl: '/billing' }, { status: 402, headers: { 'Cache-Control': 'no-store' } });
     if (e instanceof Error && e.message === 'SCRIPT_RATE_LIMIT') return NextResponse.json({ error: 'This Google account has reached the five-script-per-10-minute limit. Wait a few minutes before generating again.', code: 'SCRIPT_RATE_LIMIT' }, { status: 429, headers: { 'Retry-After': '600', 'Cache-Control': 'no-store' } });
     console.error('[api/script] credit reservation failed', { name: e instanceof Error ? e.name : 'UnknownError', message: e instanceof Error ? e.message : 'unknown reservation error' });
     const detail = e instanceof Error ? e.message : '';
@@ -33,7 +31,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       error: configFailure
         ? 'WyCut could not access its billing database. Check FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 and Firestore permissions/indexes in the Vercel function logs.'
-        : 'WyCut could not reserve a recap generation. Check your credits and retry; the exact database error is recorded in Vercel function logs.',
+        : 'WyCut could not reserve your credits for this script. Retry in a moment; the exact database error is recorded in Vercel function logs.',
       code: configFailure ? 'CREDIT_DATABASE_CONFIGURATION' : 'CREDIT_RESERVATION_FAILED',
     }, { status: 503, headers: { 'Cache-Control': 'no-store' } });
   }
@@ -58,11 +56,11 @@ export async function POST(req: NextRequest) {
     // Order matters: a validation failure must not be reported as a timeout or a config problem.
     const code = invalid ? 'AI_RESPONSE_INVALID' : notConfigured ? 'AI_PROVIDER_NOT_CONFIGURED' : quota ? 'AI_PROVIDER_QUOTA' : timeout ? 'AI_PROVIDER_TIMEOUT' : 'AI_GENERATION_FAILED';
     const validationReason = (detail.match(/\[invalid\]\s*([^|]+)/)?.[1] || '').trim().slice(0, 240);
-    const publicMessage = code === 'AI_PROVIDER_NOT_CONFIGURED' ? 'AI script generation is not configured correctly on the server. Add a valid GEMINI_API_KEY or OPENAI_API_KEY in Vercel Environment Variables and redeploy. Your recap credit was refunded.'
-      : code === 'AI_PROVIDER_QUOTA' ? 'The AI provider is rate-limited or out of quota right now. Your recap credit was refunded; wait a minute and retry, or check the provider billing/quota.'
-      : code === 'AI_PROVIDER_TIMEOUT' ? 'The AI provider took too long to respond. Your recap credit was refunded; retry once, or try a shorter transcript.'
-      : code === 'AI_RESPONSE_INVALID' ? `The AI wrote a script that failed WyCut's checks${validationReason ? ` (${validationReason})` : ''}. Your recap credit was refunded. Tap Generate again.`
-      : 'WyCut could not complete AI script generation. Your recap credit was refunded. Check the Vercel function log for "[api/script] generation failed".';
+    const publicMessage = code === 'AI_PROVIDER_NOT_CONFIGURED' ? 'AI script generation is not configured correctly on the server. Add a valid GEMINI_API_KEY or OPENAI_API_KEY in Vercel Environment Variables and redeploy. Your credits were refunded.'
+      : code === 'AI_PROVIDER_QUOTA' ? 'The AI provider is rate-limited or out of quota right now. Your credits were refunded; wait a minute and retry, or check the provider billing/quota.'
+      : code === 'AI_PROVIDER_TIMEOUT' ? 'The AI provider took too long to respond. Your credits were refunded; retry once, or try a shorter transcript.'
+      : code === 'AI_RESPONSE_INVALID' ? `The AI wrote a script that failed WyCut's checks${validationReason ? ` (${validationReason})` : ''}. Your credits were refunded. Tap Generate again.`
+      : 'WyCut could not complete AI script generation. Your credits were refunded. Check the Vercel function log for "[api/script] generation failed".';
     return NextResponse.json({ error: publicMessage, code }, { status: 502, headers: { 'Cache-Control': 'no-store' } });
   }
 }

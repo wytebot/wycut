@@ -1,0 +1,31 @@
+{
+  "usdNgnRate": 1400,
+  "gatewayFeeRate": 0,
+  "welcomeCredits": 30,
+  "legacyRecapToCredits": 150,
+  "rates": {
+    "transcribeSecondsPerCredit": 150,
+    "scriptCredits": 14,
+    "scriptLongCredits": 18,
+    "scriptLongThresholdChars": 60000,
+    "narrationCreditsPer1000Chars": 5
+  },
+  "packs": [
+    { "id": "starter", "label": "Starter", "usd": 1, "credits": 100 },
+    { "id": "plus", "label": "Plus", "usd": 3, "credits": 330, "badge": "+10% bonus" },
+    { "id": "creator", "label": "Creator", "usd": 7, "credits": 800, "badge": "+14% bonus" },
+    { "id": "pro", "label": "Pro", "usd": 15, "credits": 1800, "badge": "+20% bonus" }
+  ],
+  "legacyProducts": [
+    { "id": "single_recap", "label": "Single recap (legacy)", "usd": 1.99, "credits": 200 },
+    { "id": "recap_pack_10", "label": "10-recap pack (legacy)", "usd": 14.99, "credits": 1500 }
+  ],
+  "costModelUsd": {
+    "_note": "Provider cost estimates used only by scripts/audit-pricing.mjs. Re-check against provider price pages before changing prices.",
+    "transcribePer300sChunk": 0.0052,
+    "scriptPerGeneration": 0.046,
+    "ttsPer1000Chars": 0.015,
+    "overheadFactor": 1.15,
+    "minimumMarginAtCheapestPack": 0.5
+  }
+}

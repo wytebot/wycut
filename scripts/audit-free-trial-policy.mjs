@@ -1,19 +1,30 @@
 import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
-const credits = readFileSync(new URL('../lib/billing/credits.ts', import.meta.url), 'utf8');
-const entitlement = readFileSync(new URL('../app/api/billing/entitlement/route.ts', import.meta.url), 'utf8');
-const scriptRoute = readFileSync(new URL('../app/api/script/route.ts', import.meta.url), 'utf8');
-const env = readFileSync(new URL('../.env.example', import.meta.url), 'utf8');
-const dashboard = readFileSync(new URL('../components/dashboard-workspace.tsx', import.meta.url), 'utf8');
-assert.match(credits, /FREE_TRIAL_ALLOWANCE\s*=\s*2/);
-assert.match(credits, /counts\[0\]\s*>=\s*FREE_TRIAL_ALLOWANCE/);
-assert.match(credits, /counts\[1\]\s*>=\s*FREE_TRIAL_ALLOWANCE\s*\|\|\s*counts\[2\]\s*>=\s*FREE_TRIAL_ALLOWANCE/);
+const read = p => readFileSync(new URL(`../${p}`, import.meta.url), 'utf8');
+const credits = read('lib/billing/credits.ts');
+const entitlement = read('app/api/billing/entitlement/route.ts');
+const scriptRoute = read('app/api/script/route.ts');
+const transcribe = read('app/api/transcribe/route.ts');
+const narration = read('app/api/narration/route.ts');
+const settlement = read('lib/billing/settlement.ts');
+const dashboard = read('components/dashboard-workspace.tsx');
+const env = read('.env.example');
+// Welcome credits: one grant, locked to device + normalised email + account, daily-capped, atomic.
+assert.match(credits, /ensureWelcomeCredits/);
+assert.match(credits, /welcomeGranted/);
+assert.match(credits, /normalizeEmail\(email\)/);
+assert.match(credits, /claims\.some\(snap => snap\.exists\)/);
 assert.match(credits, /db\.runTransaction/);
-assert.match(credits, /usage\.data\(\)\?\.script\s*===\s*undefined/);
-assert.match(credits, /trialDailyLimitId/);
-assert.match(entitlement, /freeTrialRemaining/);
-assert.match(scriptRoute, /Your two free generations have been used/);
-assert.match(env, /FREE_TRIAL_DAILY_CAP=3/);
-assert.doesNotMatch(env, /FREE_TRIAL_DAILY_CAP=100/);
-assert.match(dashboard, /freeTrialRemaining/);
-console.log('Free-trial policy static audit passed: two lifetime claims, account/email/device enforcement, failed-script refund path, entitlement count, and conservative daily cap.');
+assert.match(env, /FREE_TRIAL_DAILY_CAP=60/);
+// Every paid action charges credits and can refund.
+assert.match(scriptRoute, /reserveRecapCredit\([^)]*scriptCredits/);
+assert.match(scriptRoute, /refundRecapCredit/);
+assert.match(transcribe, /chargeCredits/);
+assert.match(transcribe, /refundCharge/);
+assert.match(narration, /reserveNarrationBatch/);
+assert.match(narration, /releaseNarrationBatch\([^)]*charge/);
+// Purchases are idempotent ledger rows.
+assert.match(settlement, /purchase_\$\{paymentId\}/);
+assert.match(entitlement, /ensureWelcomeCredits/);
+assert.match(dashboard, /ensureCredits/);
+console.log('Credit policy static audit passed: welcome credits, charging on every paid step, refunds, and idempotent purchases.');

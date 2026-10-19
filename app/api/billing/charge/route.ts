@@ -5,7 +5,7 @@ import { enforceRateLimit } from '@/lib/server/rate-limit';
 import { isAllowedApiOrigin } from '@/lib/server/origin';
 import { getAdminDb } from '@/lib/firebase-admin';
 import { verifyGoogleIdentity } from '@/lib/billing/google-identity';
-import { priceProduct } from '@/lib/billing/pricing';
+import { GATEWAY_FEE_RATE, USD_NGN_RATE, priceProduct } from '@/lib/billing/pricing';
 import { hasLifetimeFreeAccess } from '@/lib/billing/entitlements';
 import { getFlutterwaveV4AccessToken, flutterwaveV4BaseUrl } from '@/lib/billing/flutterwave-v4';
 export const runtime = 'nodejs';
@@ -37,7 +37,7 @@ export async function POST(request: NextRequest) {
   if (!isAllowedApiOrigin(request)) return error('Cross-origin request rejected. Configure CAPACITOR_ALLOWED_ORIGINS for the installed app.', 403);
   let input: Input; try { input = await request.json() as Input; } catch { return error('Invalid JSON body.'); }
   let identity;
-  try { identity = await verifyGoogleIdentity(input.idToken || ''); if (identity.email.endsWith('@phone.wycut.invalid')) return error('Add a verified email address before purchasing recap credits.', 400); }
+  try { identity = await verifyGoogleIdentity(input.idToken || ''); if (identity.email.endsWith('@phone.wycut.invalid')) return error('Add a verified email address before buying credits.', 400); }
   catch (e) { return error(e instanceof Error ? e.message : 'Authentication failed.', 401); }
   if (hasLifetimeFreeAccess(identity.email)) return NextResponse.json({ freeAccess: true, plan: 'lifetime_free', message: 'Lifetime free access is active. No payment is required.' }, { headers: noStore });
   const price = priceProduct(input.productId || ''); if (!price) return error('Unknown product.');
@@ -48,7 +48,7 @@ export async function POST(request: NextRequest) {
   catch { return error('Flutterwave v4 credentials or secure payment storage are not configured.', 503); }
   const txRef = `wycut_${randomUUID()}`; const orderRef = db.collection('wycut_orders').doc(txRef);
   const customerName = (input.customer?.name || identity.name || '').slice(0, 120);
-  const order = { txRef, productId: price.id, userId: identity.userId, customerEmail: identity.email, customerName, baseAmount: price.baseNgn, gatewayFee: price.feeNgn, totalAmount: price.totalNgn, currency: 'NGN', recaps: price.recaps, status: 'creating', createdAt: new Date().toISOString(), provider: 'flutterwave_v4' };
+  const order = { txRef, productId: price.id, userId: identity.userId, customerEmail: identity.email, customerName, baseAmount: price.baseNgn, gatewayFee: price.feeNgn, totalAmount: price.totalNgn, currency: 'NGN', credits: price.credits, status: 'creating', createdAt: new Date().toISOString(), provider: 'flutterwave_v4' };
   try {
     const userRef = db.collection('wycut_users').doc(identity.userId);
     await db.runTransaction(async transaction => {
@@ -84,7 +84,7 @@ export async function POST(request: NextRequest) {
     await orderRef.set({ status: 'creating_charge', providerCustomerId: customerId, providerPaymentMethodId: paymentMethodId, updatedAt: new Date().toISOString() }, { merge: true });
     let chargeResult: { response: Response; result: ProviderResponse };
     try {
-      chargeResult = await providerRequest<ProviderResponse>(baseUrl, accessToken, '/charges', { reference: txRef, amount: price.totalNgn, currency: 'NGN', customer_id: customerId, payment_method_id: paymentMethodId, redirect_url: new URL(`/billing?payment_return=1&txRef=${encodeURIComponent(txRef)}`, request.url).toString(), meta: { app: 'WyCut', order_id: txRef, product_id: price.id, base_amount: price.baseNgn, gateway_fee: price.feeNgn, fee_rate: 0.02, fx_rate_usd_ngn: 1400, recap_credits: price.recaps } }, `wycut-charge-${txRef}`);
+      chargeResult = await providerRequest<ProviderResponse>(baseUrl, accessToken, '/charges', { reference: txRef, amount: price.totalNgn, currency: 'NGN', customer_id: customerId, payment_method_id: paymentMethodId, redirect_url: new URL(`/billing?payment_return=1&txRef=${encodeURIComponent(txRef)}`, request.url).toString(), meta: { app: 'WyCut', order_id: txRef, product_id: price.id, base_amount: price.baseNgn, gateway_fee: price.feeNgn, fee_rate: GATEWAY_FEE_RATE, fx_rate_usd_ngn: USD_NGN_RATE, credits: price.credits } }, `wycut-charge-${txRef}`);
     } catch {
       await updateOrderPreservingCredit(orderRef, { status: 'unknown_provider_result', providerMessage: 'Charge request timed out; do not retry until the order status/webhook is checked.', updatedAt: new Date().toISOString() });
       return NextResponse.json({ error: 'Flutterwave did not return a confirmed charge response. Do not retry this payment yet; check status while WyBuild verifies any successful charge.', txRef, status: 'unknown_provider_result' }, { status: 502, headers: noStore });
@@ -93,11 +93,11 @@ export async function POST(request: NextRequest) {
     if (!chargeResult.response.ok || !data.id) {
       const unknown = chargeResult.response.status >= 500 || chargeResult.response.ok;
       await updateOrderPreservingCredit(orderRef, { status: unknown ? 'unknown_provider_result' : 'provider_rejected', providerHttpStatus: chargeResult.response.status, providerMessage: chargeResult.result.message || (unknown ? 'Provider response is ambiguous; verify before retrying.' : 'Provider rejected the charge.'), updatedAt: new Date().toISOString() });
-      return NextResponse.json({ error: unknown ? 'Flutterwave returned an ambiguous result. Do not retry until payment status is checked.' : (chargeResult.result.message || 'Flutterwave rejected the charge. No recap credits were added.'), txRef, status: unknown ? 'unknown_provider_result' : 'provider_rejected' }, { status: 502, headers: noStore });
+      return NextResponse.json({ error: unknown ? 'Flutterwave returned an ambiguous result. Do not retry until payment status is checked.' : (chargeResult.result.message || 'Flutterwave rejected the charge. No credits were added.'), txRef, status: unknown ? 'unknown_provider_result' : 'provider_rejected' }, { status: 502, headers: noStore });
     }
     const status = String(data.status || chargeResult.result.status || 'pending').toLowerCase(); const nextAction = `${data.next_action?.type || ''} ${data.auth_model || ''} ${data.status || ''} ${data.next_action?.requires_pin ? 'requires_pin' : ''} ${data.next_action?.requires_otp ? 'requires_otp' : ''}`.toLowerCase(); const needsPin = /pin/.test(nextAction); const needsOtp = /otp/.test(nextAction); const rawRedirect = data.next_action?.redirect_url; const redirectUrl = typeof rawRedirect === 'string' ? rawRedirect : rawRedirect && typeof rawRedirect === 'object' ? rawRedirect.url : data.redirect_url;
     await updateOrderPreservingCredit(orderRef, { status: needsPin || needsOtp ? 'requires_auth' : status, providerChargeId: String(data.id), providerReference: data.reference || txRef, providerStatus: status, providerAuthModel: data.next_action?.type || null, updatedAt: new Date().toISOString() });
-    return NextResponse.json({ txRef, providerChargeId: String(data.id), baseAmount: price.baseNgn, gatewayFee: price.feeNgn, totalCharged: price.totalNgn, currency: 'NGN', recaps: price.recaps, feeMessage: `Includes the disclosed 2% gateway fee (${price.feeNgn} NGN).`, status: needsPin ? 'REQUIRES_PIN' : needsOtp ? 'REQUIRES_OTP' : status.toUpperCase(), providerMessage: chargeResult.result.message || null, redirectUrl: redirectUrl || null }, { headers: noStore });
+    return NextResponse.json({ txRef, providerChargeId: String(data.id), baseAmount: price.baseNgn, gatewayFee: price.feeNgn, totalCharged: price.totalNgn, currency: 'NGN', credits: price.credits, feeMessage: price.feeNgn > 0 ? `Includes a ${Math.round(GATEWAY_FEE_RATE * 100)}% gateway fee (${price.feeNgn} NGN).` : 'No extra fees: the price shown is the price paid.', status: needsPin ? 'REQUIRES_PIN' : needsOtp ? 'REQUIRES_OTP' : status.toUpperCase(), providerMessage: chargeResult.result.message || null, redirectUrl: redirectUrl || null }, { headers: noStore });
   } catch (e) {
     await updateOrderPreservingCredit(orderRef, { status: 'provider_error', providerMessage: e instanceof Error ? e.message.slice(0, 500) : 'Provider request failed.', updatedAt: new Date().toISOString() }).catch(() => undefined);
     return NextResponse.json({ error: e instanceof Error ? e.message : 'Could not start Flutterwave payment.', txRef, status: 'provider_error' }, { status: 502, headers: noStore });

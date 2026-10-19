@@ -5,7 +5,7 @@ const root = process.cwd();
 const required = [
   'app/page.tsx', 'app/dashboard/page.tsx', 'app/billing/page.tsx', 'app/api/script/route.ts',
   'app/api/narration/route.ts', 'app/privacy/page.tsx', 'app/terms/page.tsx', 'app/refunds/page.tsx', 'app/acceptable-use/page.tsx', 'components/legal-layout.tsx', 'config/ai-operations.json', 'lib/ai/operations-config.ts', 'staff-ai-ops-template/README.md', 'staff-ai-ops-template/ai-operations.json', 'app/api/auth/google/verify/route.ts', 'app/api/billing/charge/route.ts',
-  'app/api/billing/config/route.ts', 'app/api/billing/entitlement/route.ts', 'app/api/billing/validate-otp/route.ts', 'app/api/billing/status/route.ts', 'app/api/wybuild-payment-confirmation/route.ts', 'lib/billing/pricing.ts', 'lib/billing/settlement.ts', 'lib/billing/credits.ts', 'lib/billing/flutterwave-v4.ts', 'lib/billing/google-identity.ts', 'lib/firebase/client.ts',
+  'app/api/billing/config/route.ts', 'app/api/billing/entitlement/route.ts', 'app/api/billing/validate-otp/route.ts', 'app/api/billing/status/route.ts', 'app/api/wybuild-payment-confirmation/route.ts', 'lib/billing/pricing.ts', 'config/credit-pricing.json', 'lib/billing/client-errors.ts', 'lib/billing/settlement.ts', 'lib/billing/credits.ts', 'lib/billing/flutterwave-v4.ts', 'lib/billing/google-identity.ts', 'lib/firebase/client.ts',
   'lib/ai/script-generator.ts', 'lib/ai/tts-generator.ts',
   'lib/ffmpeg/client-slicer.ts', 'lib/drive/export.ts', 'lib/server/rate-limit.ts',
   'lib/api-client.ts', 'lib/auth/google-native.ts', 'lib/server/origin.ts', 'middleware.ts', 'next.config.mjs', 'capacitor.config.ts',

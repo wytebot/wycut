@@ -117,3 +117,52 @@ export async function concatenateClipsLocally(clips: SlicedClip[], onProgress?: 
   }
   });
 }
+
+export type AudioChunk = { index: number; blob: Blob; mimeType: string; offsetSeconds: number; durationSeconds: number };
+
+/**
+ * Extracts only the audio track (mono, 16 kHz, 24 kbps) and splits it into short chunks.
+ * Speech models bill by audio duration, not file size, so the small bitrate costs nothing in accuracy
+ * for speech but keeps every upload far below serverless body limits.
+ */
+export async function extractAudioChunksLocally(file: File, chunkSeconds: number, onProgress?: (progress: number) => void): Promise<AudioChunk[]> {
+  return serialized(async () => {
+    if (!file || file.size === 0) throw new Error('Choose a non-empty local video file.');
+    const extension = (file.name.split('.').pop() || '').toLowerCase();
+    if (!['mp4', 'm4v', 'mov'].includes(extension)) throw new Error('Audio extraction supports MP4, M4V and MOV sources.');
+    const mobileBrowser = typeof navigator !== 'undefined' && (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || Number((navigator as Navigator & { deviceMemory?: number }).deviceMemory || 8) <= 4);
+    const maxBytes = Capacitor.isNativePlatform() ? 80 * 1024 * 1024 : mobileBrowser ? 100 * 1024 * 1024 : 300 * 1024 * 1024;
+    if (file.size > maxBytes) throw new Error('This video is larger than this device can safely process in memory. Use a smaller file or upload subtitles instead.');
+    const ffmpeg = await getFFmpeg();
+    const sourceName = `audio_src_${Date.now()}.${extension}`;
+    const handler = ({ progress }: { progress: number }) => onProgress?.(Math.min(1, Math.max(0, progress)));
+    ffmpeg.on('progress', handler);
+    const created: string[] = [];
+    try {
+      await ffmpeg.writeFile(sourceName, await fetchFile(file));
+      const attempts: Array<{ ext: string; mime: string; codec: string[] }> = [
+        { ext: 'mp3', mime: 'audio/mp3', codec: ['-c:a', 'libmp3lame', '-b:a', '24k'] },
+        { ext: 'aac', mime: 'audio/aac', codec: ['-c:a', 'aac', '-b:a', '32k'] },
+      ];
+      for (const attempt of attempts) {
+        const code = await ffmpeg.exec(['-i', sourceName, '-vn', '-map', '0:a:0', '-ac', '1', '-ar', '16000', ...attempt.codec, '-f', 'segment', '-segment_time', String(chunkSeconds), '-reset_timestamps', '1', '-y', `achunk_%03d.${attempt.ext}`]);
+        const listing = await ffmpeg.listDir('.');
+        const names = listing.filter(item => !item.isDir && item.name.startsWith('achunk_') && item.name.endsWith(`.${attempt.ext}`)).map(item => item.name).sort();
+        created.push(...names);
+        if (code !== 0 || !names.length) { for (const n of names) { try { await ffmpeg.deleteFile(n); } catch { /* ignore */ } } continue; }
+        const chunks: AudioChunk[] = [];
+        for (let i = 0; i < names.length; i++) {
+          const data = await ffmpeg.readFile(names[i]);
+          if (typeof data === 'string' || !data.length) continue;
+          const bytes = new Uint8Array(data as Uint8Array);
+          chunks.push({ index: i, blob: new Blob([bytes.buffer as ArrayBuffer], { type: attempt.mime }), mimeType: attempt.mime, offsetSeconds: i * chunkSeconds, durationSeconds: chunkSeconds });
+        }
+        if (chunks.length) return chunks;
+      }
+      throw new Error('This video has no readable audio track, or FFmpeg could not decode it on this device.');
+    } finally {
+      ffmpeg.off('progress', handler);
+      for (const n of [sourceName, ...created]) { try { await ffmpeg.deleteFile(n); } catch { /* cleanup is best effort */ } }
+    }
+  });
+}

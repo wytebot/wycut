@@ -23,3 +23,11 @@ assert.match(authToken, /authStateReady\(\)/, 'Auth token helper must wait for F
 assert.doesNotMatch(generator, /failed or timed out/, 'Generic provider error must not contain "timed out" (misclassified as a timeout)');
 assert.match(workspace, /noticeRef/, 'Errors must be shown next to the Generate button, not only in the sidebar');
 console.log('v28 audit passed.');
+
+// v29 transcription guards
+assert.ok(fs.existsSync('app/api/transcribe/route.ts'), 'Transcription route must exist');
+const transcribeRoute = fs.readFileSync('app/api/transcribe/route.ts', 'utf8');
+assert.match(transcribeRoute, /gemini-2\.5-flash-lite/, 'Default transcription model should be the cheapest Gemini audio model');
+assert.match(transcribeRoute, /TRANSCRIBE_DAILY_CAP/, 'Transcription must be rate-capped per account');
+assert.match(workspace, /transcribeVideoToSrt/, 'Dashboard must fall back to video transcription when no subtitles are given');
+console.log('v29 audit passed.');

@@ -53,8 +53,8 @@ export async function POST(req: NextRequest) {
         const orderSnap = await transaction.get(orderRef);
         if (!orderSnap.exists) throw new Error('WyCut order was not found.');
         const order = orderSnap.data() || {}; const userId = String(order.userId || ''); const userRef = userId ? db.collection('wycut_users').doc(userId) : null; const userSnap = userRef ? await transaction.get(userRef) : null; const price = priceProduct(String(order.productId || ''));
-        if (!price || order.currency !== 'NGN' || Number(order.totalAmount) !== price.totalNgn || Number(order.baseAmount) !== price.baseNgn || Number(order.gatewayFee) !== price.feeNgn) throw new Error('Stored order pricing does not match the current price book.');
-        if (Math.round(amount * 100) / 100 !== price.totalNgn) throw new Error('Verified failed transaction amount does not match the order.');
+        if (!price || order.currency !== 'NGN' || !Number.isFinite(Number(order.totalAmount)) || Number(order.baseAmount) + Number(order.gatewayFee) !== Number(order.totalAmount)) throw new Error('Stored order pricing is invalid.'); // compare with the stored order, not today's price book, so orders created before a price change still reconcile
+        if (Math.round(amount * 100) / 100 !== Number(order.totalAmount)) throw new Error('Verified failed transaction amount does not match the order.');
         if (order.providerChargeId && String(order.providerChargeId) !== String(body.id)) throw new Error('Verified failed transaction ID does not match the order.');
         const email = String(body.customerEmail || '').trim().toLowerCase();
         if (email && order.customerEmail && email !== String(order.customerEmail).toLowerCase()) throw new Error('Verified failed transaction customer does not match the order.');
