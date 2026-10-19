@@ -95,7 +95,7 @@ async function uploadFile(file: DriveExportFile, parentId: string, token: string
   return { id: completed.id, name: completed.name || name, webViewLink: completed.webViewLink };
 }
 /** Browser-direct BYOS upload: file bytes go from the user's browser to Google Drive, not through WyCut's server. */
-export async function exportProductionKit(accessToken: string, movieName: string, files: DriveExportFile[]): Promise<DriveExportResult> {
+export async function exportProductionKit(accessToken: string, movieName: string, files: DriveExportFile[], onProgress?: (progress: { completedFiles: number; totalFiles: number; percent: number; currentFile: string }) => void): Promise<DriveExportResult> {
   if (!accessToken || accessToken.length < 20) throw new Error('A valid Google OAuth access token is required.');
   if (!files.length || files.length > MAX_FILE_COUNT) throw new Error(`Provide between 1 and ${MAX_FILE_COUNT} export files.`);
   const cleanTitle = movieName.normalize('NFKD').replace(/[^a-zA-Z0-9 _-]/g, '').trim().replace(/\s+/g, '_').slice(0, 70) || 'Movie';
@@ -109,10 +109,14 @@ export async function exportProductionKit(accessToken: string, movieName: string
       master: (await createFolder('03_Master_Tracks', accessToken, root.id)).id,
     };
     // Sequential upload avoids several simultaneous video blobs exhausting mobile memory.
+    onProgress?.({ completedFiles: 0, totalFiles: files.length, percent: 0, currentFile: files[0]?.name || 'Preparing export' });
     for (let i = 0; i < files.length; i++) {
+      onProgress?.({ completedFiles: i, totalFiles: files.length, percent: Math.round((i / files.length) * 95), currentFile: files[i].name });
       const item = await uploadFile(files[i], folderIds[files[i].folder], accessToken);
       uploaded.push({ name: item.name, id: item.id, webViewLink: item.webViewLink });
+      onProgress?.({ completedFiles: i + 1, totalFiles: files.length, percent: Math.round(((i + 1) / files.length) * 95), currentFile: files[i].name });
     }
+    onProgress?.({ completedFiles: files.length, totalFiles: files.length, percent: 100, currentFile: 'Saved successfully' });
     return { folderId: root.id, folderUrl, uploaded };
   } catch (error) {
     const detail = error instanceof Error ? error.message : 'Drive export failed.';

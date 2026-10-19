@@ -2,9 +2,14 @@
 
 import Link from 'next/link';
 import { useEffect, useRef, useState, type ChangeEvent, type DragEvent } from 'react';
-import { Cloud, FileText, Link2, UploadCloud, CheckCircle2, AlertCircle, Clapperboard, Scissors, FolderUp, LoaderCircle, Download } from 'lucide-react';
-import { sliceVideoLocally, concatenateClipsLocally, abortFFmpeg, MAX_SOURCE_BYTES, MAX_SOURCE_LABEL, type SlicedClip } from '@/lib/ffmpeg/client-slicer';
+import { Cloud, UploadCloud, Scissors, LoaderCircle, Download, Music2, Plus, CheckCircle2, ArrowLeft, Image as ImageIcon, Film } from 'lucide-react';
+import { sliceVideoLocally, concatenateClipsLocally, mixAudioTracksLocally, abortFFmpeg, MAX_SOURCE_BYTES, MAX_SOURCE_LABEL, type SlicedClip } from '@/lib/ffmpeg/client-slicer';
+import { renderEditPlan, cancelEditExport } from '@/lib/ffmpeg/edit-export';
+import { normalizeEditPlan } from '@/lib/editor/edit-plan';
+import { SoundLibrary, type WyCutAudioTrack } from '@/components/sound-library';
+import AdvancedEditorTools from '@/components/advanced-editor-tools';
 import { exportProductionKit, type DriveExportFile } from '@/lib/drive/export';
+import { fetchDriveBlob, fetchDriveText, loadProductionKit } from '@/lib/drive/read';
 import { Capacitor } from '@capacitor/core';
 import { signInWithGoogleNative } from '@/lib/auth/google-native';
 import { GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
@@ -17,7 +22,7 @@ import { backgroundStart, backgroundUpdate, backgroundStop } from '@/lib/native/
 import { LOW_BALANCE_CREDITS, SCRIPT_CREDITS_MAX, SCRIPT_CREDITS_MIN, formatCredits, scriptCredits, transcribeCreditsForVideo } from '@/lib/billing/pricing';
 import { TopUpError } from '@/lib/billing/client-errors';
 import { saveProject, getProject, deleteNarrationParts, deleteNarrationKeys, newProjectId, liveProjects } from '@/lib/projects/store';
-import { OPEN_PROJECT_EVENT, CONNECT_DRIVE_EVENT, CANCEL_GENERATION_EVENT, DRIVE_TOKEN_EVENT, takePendingProject } from '@/lib/projects/bus';
+import { OPEN_PROJECT_EVENT, OPEN_DRIVE_PROJECT_EVENT, CONNECT_DRIVE_EVENT, CANCEL_GENERATION_EVENT, DRIVE_TOKEN_EVENT, takePendingProject, takePendingDriveProject } from '@/lib/projects/bus';
 
 type GoogleTokenResponse = { access_token?: string; expires_in?: number; error?: string };
 type GoogleIdentity = { accounts: { oauth2: { initTokenClient: (config: { client_id: string; scope: string; callback: (response: GoogleTokenResponse) => void }) => { requestAccessToken: (options?: { prompt?: string }) => void } } } };
@@ -59,12 +64,24 @@ async function blobToBase64(blob: Blob): Promise<string> {
 }
 async function download(blob: Blob, name: string) {
   if (Capacitor.isNativePlatform()) {
-    // Large base64 conversions can exhaust Android WebView memory. Use Drive for video kits.
-    if (blob.size > 25 * 1024 * 1024) throw new Error('This file is too large for safe in-app saving on Android. Connect Google Drive and export the production kit instead.');
+    // Write in chunks so large local video exports don't require one giant base64 string in Android WebView memory.
     const [{ Filesystem, Directory }, { Share }] = await Promise.all([
       import('@capacitor/filesystem'), import('@capacitor/share'),
     ]);
-    const result = await Filesystem.writeFile({ path: name, data: await blobToBase64(blob), directory: Directory.Cache, recursive: true });
+    const chunkBytes = 4 * 1024 * 1024;
+    let result: { uri: string } | null = null;
+    for (let offset = 0; offset < blob.size || (blob.size === 0 && offset === 0); offset += chunkBytes) {
+      const part = blob.slice(offset, Math.min(blob.size, offset + chunkBytes));
+      const buffer = await part.arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      const encoded = btoa(binary);
+      if (offset === 0) result = await Filesystem.writeFile({ path: name, data: encoded, directory: Directory.Cache, recursive: true });
+      else await Filesystem.appendFile({ path: name, data: encoded, directory: Directory.Cache });
+      if (blob.size === 0) break;
+    }
+    if (!result) throw new Error('Could not prepare the export file.');
     await Share.share({ title: name, text: `WyCut export: ${name}`, url: result.uri, dialogTitle: 'Save or share WyCut file' });
     return;
   }
@@ -106,14 +123,15 @@ function videoSourceLimitLabel() {
   return mobile ? '100 MB mobile browser' : '300 MB desktop browser';
 }
 
-export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: SourceMode }) {
-  const [mode, setMode] = useState<SourceMode>(initialFlow); const [url, setUrl] = useState(''); const [subtitleUrl, setSubtitleUrl] = useState(''); const [file, setFile] = useState<File | null>(null); const [video, setVideo] = useState<File | null>(null); const [title, setTitle] = useState('My Movie');
+export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: SourceMode }) {
+  const [mode, setMode] = useState<SourceMode>('file'); const [url, setUrl] = useState(''); const [subtitleUrl, setSubtitleUrl] = useState(''); const [file, setFile] = useState<File | null>(null); const [video, setVideo] = useState<File | null>(null); const [timelineAssets, setTimelineAssets] = useState<File[]>([]); const [exportPage, setExportPage] = useState(false); const [exportDone, setExportDone] = useState(false); const [exportProgress, setExportProgress] = useState(0); const [exportStage, setExportStage] = useState(''); const [title, setTitle] = useState('My Movie');
   const [notice, setNotice] = useState(''); const [busy, setBusy] = useState(false); const [authEmail, setAuthEmail] = useState(''); const [credits, setCredits] = useState<number | null>(null); const [freeAccess, setFreeAccess] = useState(false); const [needsTopUp, setNeedsTopUp] = useState(false); const [videoSeconds, setVideoSeconds] = useState(0);
   const narrationCache = useRef(new Map<string, { id: string; text: string; audioBase64: string }>()); const [stage, setStage] = useState(''); const [progress, setProgress] = useState(0);
-  useEffect(() => { setMode(initialFlow); }, [initialFlow]);
+  useEffect(() => { setMode('file'); }, [initialFlow]);
   // ---- local project history: every stage is checkpointed so work can be resumed from the History page ----
   const projectIdRef = useRef(''); const keepOutputs = useRef(false); const exportedRef = useRef(false); const restoredTranscript = useRef<string | null>(null);
   const [fastCut, setFastCut] = useState(true); const lastCheckpoint = useRef(0);
+  const [aspectRatio, setAspectRatio] = useState<'9:16'|'16:9'|'1:1'|'4:5'>('9:16'); const [applyAspectRatio, setApplyAspectRatio] = useState(false); const [playbackRate, setPlaybackRate] = useState('1'); const [previewUrl, setPreviewUrl] = useState('');
   const checkpoint = (patch: Parameters<typeof saveProject>[1]) => { if (projectIdRef.current) void saveProject(projectIdRef.current, patch); };
   // ---- one "job" = one run of a paid/long step. Cancel aborts it, refunds its credits and discards what it produced. ----
   type JobKind = 'script' | 'narration' | 'slice' | 'export';
@@ -130,7 +148,7 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
   const transcriptCache = useRef<{ key: string; text: string } | null>(null);
   // Bring new status/errors into view so a tap never looks like it did nothing.
   useEffect(() => { if (notice && !busy) noticeRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, [notice, busy]);
-  const [script, setScript] = useState<RecapScript | null>(null); const [recapId, setRecapId] = useState(''); const [idToken, setIdToken] = useState(''); const [clips, setClips] = useState<SlicedClip[]>([]); const [roughCut, setRoughCut] = useState<Blob | null>(null); const [driveToken, setDriveToken] = useState(''); const [driveFolder, setDriveFolder] = useState(''); const [googleReady, setGoogleReady] = useState(false); const [googleLoadError, setGoogleLoadError] = useState(''); const [hasSourceTimecodes, setHasSourceTimecodes] = useState(false); const [showClipDownloads, setShowClipDownloads] = useState(false);
+  const [script, setScript] = useState<RecapScript | null>(null); const [soundTracks, setSoundTracks] = useState<WyCutAudioTrack[]>([]); const [selectedClipIndex, setSelectedClipIndex] = useState(0); const [timelineZoom, setTimelineZoom] = useState(1); const [mirrorPreview, setMirrorPreview] = useState(false); const [cropMode, setCropMode] = useState('contain'); const [textOverlay, setTextOverlay] = useState(''); const [emojiOverlay, setEmojiOverlay] = useState(''); const [overlayFont, setOverlayFont] = useState('Inter'); const [showWatermark, setShowWatermark] = useState(true); const [effectPreset, setEffectPreset] = useState('Original'); const [visualEffect, setVisualEffect] = useState('None'); const [textAnimation, setTextAnimation] = useState('None'); const [transition, setTransition] = useState('Cut'); const [sticker, setSticker] = useState(''); const [recapId, setRecapId] = useState(''); const [idToken, setIdToken] = useState(''); const [clips, setClips] = useState<SlicedClip[]>([]); const [roughCut, setRoughCut] = useState<Blob | null>(null); const [driveToken, setDriveToken] = useState(''); const [driveFolder, setDriveFolder] = useState(''); const [googleReady, setGoogleReady] = useState(false); const [googleLoadError, setGoogleLoadError] = useState(''); const [hasSourceTimecodes, setHasSourceTimecodes] = useState(false); const [showClipDownloads, setShowClipDownloads] = useState(false);
   useEffect(() => {
     const syncAccount = () => { try { const token = localStorage.getItem('wycut_google_id_token') || sessionStorage.getItem('wycut_google_id_token') || ''; const email = localStorage.getItem('wycut_auth_email') || sessionStorage.getItem('wycut_auth_email') || ''; setIdToken(token); setAuthEmail(email); const drive = localStorage.getItem(DRIVE_TOKEN_KEY) || ''; const expires = Number(localStorage.getItem(DRIVE_TOKEN_EXPIRY_KEY) || 0); if (drive && expires > Date.now()) setDriveToken(drive); else if (drive) setDriveToken(''); } catch { setIdToken(''); setAuthEmail(''); } void firebaseAuth.currentUser?.getIdToken().then(freshToken => { setIdToken(freshToken); try { localStorage.setItem('wycut_google_id_token', freshToken); localStorage.setItem('wycut_auth_email', firebaseAuth.currentUser?.email || ''); } catch { /* ignore */ } }).catch(() => undefined); };
     syncAccount(); window.addEventListener('focus', syncAccount); window.addEventListener('storage', syncAccount);
@@ -151,6 +169,11 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
   }
   useEffect(() => { if (!idToken) { setCredits(null); setFreeAccess(false); return; } void loadBalance(idToken); }, [idToken]);
   useEffect(() => {
+    if (!video) { setPreviewUrl(''); return; }
+    const url = URL.createObjectURL(video); setPreviewUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [video]);
+  useEffect(() => {
     if (!video) { setVideoSeconds(0); return; }
     let active = true; void getVideoDuration(video).then(seconds => { if (active) setVideoSeconds(seconds); }).catch(() => { if (active) setVideoSeconds(0); });
     return () => { active = false; };
@@ -163,7 +186,7 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
   }
   useEffect(() => { if (Capacitor.isNativePlatform()) return; let active = true; void loadGoogleIdentityServices().then(() => { if (active) { setGoogleReady(true); setGoogleLoadError(''); } }).catch(error => { if (active) setGoogleLoadError(error instanceof Error ? error.message : 'Google Drive sign-in could not load.'); }); return () => { active = false; }; }, []);
   useEffect(() => { if (!googleReady || Capacitor.isNativePlatform()) return; let connected = false; let expires = 0; try { connected = Boolean(localStorage.getItem(DRIVE_TOKEN_KEY)); expires = Number(localStorage.getItem(DRIVE_TOKEN_EXPIRY_KEY) || 0); } catch { return; } if (!connected || expires > Date.now() || !window.google?.accounts?.oauth2) return; const clientId = process.env.NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID; if (!clientId || !clientId.endsWith('.apps.googleusercontent.com')) return; const client = window.google.accounts.oauth2.initTokenClient({ client_id: clientId, scope: 'https://www.googleapis.com/auth/drive.file', callback: (response) => { if (response.access_token && !response.error) { persistDriveToken(response.access_token, response.expires_in || 3600); setDriveToken(response.access_token); setNotice('Google Drive connection refreshed automatically.'); } else { setNotice('Your Google Drive connection is saved, but Google requires you to reconnect to renew permission. Tap Reconnect Drive.'); } } }); try { client.requestAccessToken({ prompt: '' }); } catch { /* silent refresh can be blocked; keep saved connection and offer manual reconnect */ } }, [googleReady]);
-  const clearGeneratedOutputs = () => { projectIdRef.current = ''; keepOutputs.current = false; exportedRef.current = false; restoredTranscript.current = null; setScript(null); setRecapId(''); setHasSourceTimecodes(false); setClips([]); setRoughCut(null); };
+  const clearGeneratedOutputs = () => { projectIdRef.current = ''; keepOutputs.current = false; exportedRef.current = false; restoredTranscript.current = null; setScript(null); setRecapId(''); setHasSourceTimecodes(false); setClips([]); setRoughCut(null); setSoundTracks([]); };
   const selectFile = (candidate?: File) => {
     if (!candidate) return;
     if (!/\.(srt|vtt|txt)$/i.test(candidate.name) && !['text/plain','text/vtt','application/x-subrip'].includes(candidate.type)) {
@@ -185,7 +208,7 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
       setNotice('Choose an MP4, M4V or MOV video. Other containers are not supported by the local FFmpeg pipeline. Previous video outputs were cleared.');
       return;
     }
-    // Picked files are read from disk in place, so only a technical size cap applies (not the phone's RAM).
+    // Source files are disk-backed where the browser supports it; video encoding and exported clips still need working memory, so very large edits use safer fallbacks.
     if (candidate.size > MAX_SOURCE_BYTES) {
       setVideo(null); clearGeneratedOutputs();
       setNotice(`This video is larger than ${MAX_SOURCE_LABEL}. Use a lower-resolution copy or split it first. Previous video outputs were cleared.`);
@@ -328,7 +351,7 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
       setStage('Generating your recap script with AI…'); setProgress(25);
       let response: Response;
       try {
-        response = await fetch(apiUrl('/api/script'), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Device-Id': deviceId }, body: JSON.stringify({ title: title.trim() || source.label.replace(/\.(srt|vtt|txt)$/i, ''), transcript: source.text, targetRuntimeSeconds: 600, beatCount: 38, idToken: freshIdToken, deviceId, jobId: job.id }), cache: 'no-store', signal: job.abort.signal });
+        response = await fetch(apiUrl('/api/script'), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Device-Id': deviceId }, body: JSON.stringify({ title: title.trim() || source.label.replace(/\.(srt|vtt|txt)$/i, ''), transcript: source.text, targetRuntimeSeconds: 600, beatCount: 12, idToken: freshIdToken, deviceId, jobId: job.id }), cache: 'no-store', signal: job.abort.signal });
       } catch (networkError) {
         const detail = networkError instanceof Error ? networkError.message : 'Network request failed';
         throw new Error(`Could not reach WyCut's script API (${detail}). Check your connection, deployed API route and Vercel function logs, then retry. Your generation was not confirmed.`);
@@ -410,12 +433,61 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
   // Android: keep the process alive with a foreground service while a job runs (no-op on the web).
   useEffect(() => { if (!busy) return; void backgroundStart('WyCut is working', stage || 'Working…'); return () => { void backgroundStop(); }; }, [busy]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { if (busy) void backgroundUpdate(`${stage || 'Working…'}${progress > 0 ? ` · ${progress}%` : ''}`); }, [stage, Math.floor(progress / 5)]); // eslint-disable-line react-hooks/exhaustive-deps
+  async function openDriveProject(folderId: string) {
+    if (!folderId || busy) { if (busy) setNotice('Wait for the current task to finish before opening another project.'); return; }
+    if (!driveToken) { setNotice('Reconnect Google Drive to restore this project.'); return; }
+    setNotice('Loading project settings and script from Google Drive…');
+    try {
+      const kit = await loadProductionKit(driveToken, folderId);
+      const manifestFile = kit.master.find(item => /^Project\.json$/i.test(item.name));
+      if (!manifestFile) throw new Error('This Drive project has no editable Project.json manifest. Older exports can still be viewed and downloaded, but cannot restore their timeline automatically.');
+      const manifest = JSON.parse(await fetchDriveText(driveToken, manifestFile.id)) as { title?: string; recapId?: string; script?: RecapScript; editPlan?: unknown; settings?: Record<string, unknown>; sourceFileName?: string; mediaAssets?: Array<{ fileName: string; name: string; kind: 'video'|'image' }>; sounds?: Array<{ name?: string; fileName?: string; category?: string; startSeconds?: number; durationSeconds?: number; volume?: number; source?: string }> };
+      if (!manifest.script || !Array.isArray(manifest.script.beats) || manifest.script.beats.length < 1 || manifest.script.beats.length > 100) throw new Error('The saved project manifest is invalid or incomplete.');
+      clearGeneratedOutputs(); setVideo(null); setFile(null); setTimelineAssets([]); setNeedsTopUp(false);
+      const localId = newProjectId(); projectIdRef.current = localId; keepOutputs.current = true; exportedRef.current = false;
+      setTitle(String(manifest.title || manifest.script.title || 'Restored project')); setMode('file'); setScript(manifest.script); setRecapId(String(manifest.recapId || '')); setHasSourceTimecodes(true);
+      const legacySettings = manifest.settings || {};
+      const migratedPlan = manifest.editPlan ? normalizeEditPlan(manifest.editPlan) : null;
+      const settings: Record<string, unknown> = { ...legacySettings, ...(migratedPlan ? { aspectRatio: migratedPlan.aspectRatio, effectPreset: migratedPlan.filter, visualEffect: migratedPlan.effect, transition: migratedPlan.transition, playbackRate: String(migratedPlan.speed), mirrorPreview: migratedPlan.mirror, cropMode: migratedPlan.crop, textOverlay: migratedPlan.text?.value || '', emojiOverlay: migratedPlan.emoji || '', overlayFont: migratedPlan.text?.font || 'Inter', textAnimation: migratedPlan.text?.animation || 'None', sticker: migratedPlan.sticker || '', showWatermark: migratedPlan.watermark } : {}) };
+      if (typeof settings.aspectRatio === 'string' && ['9:16','16:9','1:1','4:5'].includes(settings.aspectRatio)) setAspectRatio(settings.aspectRatio as '9:16'|'16:9'|'1:1'|'4:5');
+      if (typeof settings.applyAspectRatio === 'boolean') setApplyAspectRatio(settings.applyAspectRatio);
+      if (typeof settings.playbackRate === 'string') setPlaybackRate(settings.playbackRate);
+      if (typeof settings.fastCut === 'boolean') setFastCut(settings.fastCut);
+      if (typeof settings.mirrorPreview === 'boolean') setMirrorPreview(settings.mirrorPreview);
+      if (typeof settings.cropMode === 'string') setCropMode(settings.cropMode);
+      if (typeof settings.textOverlay === 'string') setTextOverlay(settings.textOverlay);
+      if (typeof settings.emojiOverlay === 'string') setEmojiOverlay(settings.emojiOverlay);
+      if (typeof settings.overlayFont === 'string') setOverlayFont(settings.overlayFont);
+      if (typeof settings.showWatermark === 'boolean') setShowWatermark(settings.showWatermark);
+      if (typeof settings.effectPreset === 'string') setEffectPreset(settings.effectPreset === 'none' ? 'Original' : settings.effectPreset);
+      if (typeof settings.visualEffect === 'string') setVisualEffect(settings.visualEffect);
+      if (typeof settings.textAnimation === 'string') setTextAnimation(settings.textAnimation);
+      if (typeof settings.transition === 'string') setTransition(settings.transition);
+      if (typeof settings.sticker === 'string') setSticker(settings.sticker);
+      const restoredSounds: WyCutAudioTrack[] = [];
+      for (const sound of manifest.sounds || []) {
+        if (!sound.fileName) continue; const item = kit.voices.find(v => v.name === sound.fileName); if (!item) continue;
+        const blob = await fetchDriveBlob(driveToken, item.id);
+        restoredSounds.push({ id: `drive-${item.id}`, name: sound.name || item.name, category: sound.category || 'Imported', blob, startSeconds: Math.max(0, Number(sound.startSeconds) || 0), durationSeconds: Math.max(0.1, Number(sound.durationSeconds) || 1), volume: Math.max(0, Math.min(1, Number(sound.volume) || 0)), source: sound.source === 'library' ? 'library' : 'device' });
+      }
+      setSoundTracks(restoredSounds);
+      const sourceItem = manifest.sourceFileName ? kit.videos.find(v => v.name === manifest.sourceFileName) : kit.videos.find(v => /^SOURCE_ORIGINAL_/i.test(v.name));
+      if (sourceItem) { const sourceBlob = await fetchDriveBlob(driveToken, sourceItem.id); const sourceFile = new File([sourceBlob], sourceItem.name.replace(/^SOURCE_ORIGINAL_/, ''), { type: sourceBlob.type || 'video/mp4', lastModified: Date.now() }); setVideo(sourceFile); setNotice('Project and original source restored from Google Drive.'); }
+      const restoredAssets: File[] = [];
+      for (const asset of manifest.mediaAssets || []) { const item = kit.videos.find(v => v.name === asset.fileName); if (item) { const blob = await fetchDriveBlob(driveToken, item.id); restoredAssets.push(new File([blob], asset.name || item.name, { type: blob.type || (asset.kind === 'image' ? 'image/jpeg' : 'video/mp4'), lastModified: Date.now() })); } }
+      setTimelineAssets(restoredAssets);
+      void saveProject(localId, { title: String(manifest.title || manifest.script.title || 'Restored project'), mode: 'file', status: 'idle', script: manifest.script, recapId: String(manifest.recapId || ''), hasSourceTimecodes: true, drive: { folderId, folderUrl: `https://drive.google.com/drive/folders/${folderId}`, exportedAt: Date.now(), fileCount: kit.master.length + kit.videos.length + kit.voices.length } });
+      setNotice(sourceItem ? 'Project, original source video, media assets, sound tracks and settings restored from Google Drive.' : 'Project settings restored. This older export does not contain its original source; select it once and export again to save it to Drive.');
+    } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not restore this project from Google Drive.'); }
+  }
+  const openDriveProjectRef = useRef(openDriveProject); openDriveProjectRef.current = openDriveProject;
+
   async function openProject(id: string) {
     if (!id || projectIdRef.current === id) return;
     if (busy) { setNotice('Wait for the current generation to finish before opening another project.'); return; }
     const record = await getProject(id);
     if (!record) { setNotice('That project is no longer stored on this device.'); return; }
-    clearGeneratedOutputs(); setVideo(null); setFile(null); setNeedsTopUp(false);
+    clearGeneratedOutputs(); setVideo(null); setFile(null); setTimelineAssets([]); setNeedsTopUp(false);
     projectIdRef.current = record.id; keepOutputs.current = true; exportedRef.current = record.status === 'exported';
     setTitle(record.title); setMode(record.mode); setSubtitleUrl(record.subtitleUrl || ''); setUrl(record.videoUrl || '');
     restoredTranscript.current = record.transcript || null;
@@ -430,14 +502,34 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
   const connectDriveRef = useRef(connectDrive); connectDriveRef.current = connectDrive;
   useEffect(() => {
     const check = () => { const id = takePendingProject(); if (id) void openProjectRef.current(id); };
+    const checkDrive = () => { const id = takePendingDriveProject(); if (id) void openDriveProjectRef.current(id); };
     const connect = () => void connectDriveRef.current();
-    check(); window.addEventListener(OPEN_PROJECT_EVENT, check); window.addEventListener(CONNECT_DRIVE_EVENT, connect);
-    return () => { window.removeEventListener(OPEN_PROJECT_EVENT, check); window.removeEventListener(CONNECT_DRIVE_EVENT, connect); };
+    check(); checkDrive(); window.addEventListener(OPEN_PROJECT_EVENT, check); window.addEventListener(OPEN_DRIVE_PROJECT_EVENT, checkDrive); window.addEventListener(CONNECT_DRIVE_EVENT, connect);
+    return () => { window.removeEventListener(OPEN_PROJECT_EVENT, check); window.removeEventListener(OPEN_DRIVE_PROJECT_EVENT, checkDrive); window.removeEventListener(CONNECT_DRIVE_EVENT, connect); };
   }, []);
   // The Drive connection may be renewed from the History page while the studio stays mounted.
   useEffect(() => { const sync = () => { try { const t = localStorage.getItem(DRIVE_TOKEN_KEY) || ''; const e = Number(localStorage.getItem(DRIVE_TOKEN_EXPIRY_KEY) || 0); setDriveToken(t && e > Date.now() ? t : ''); } catch { /* ignore */ } }; window.addEventListener(DRIVE_TOKEN_EVENT, sync); return () => window.removeEventListener(DRIVE_TOKEN_EVENT, sync); }, []);
-  async function sliceVideo() { if (!hasSourceTimecodes) { setNotice('Accurate cuts require a timestamped SRT/VTT transcript. Plain text has no source timecodes, so any AI timing would be a guess. Upload the matching SRT/VTT before slicing.'); return; } if (!script || !video) { setNotice('Generate a script and choose the source movie file you are authorized to edit.'); return; } const job = startJob('slice'); setBusy(true); setStage('Loading local FFmpeg…'); setProgress(0); setNotice(''); setClips([]); setRoughCut(null); try { const duration = await getVideoDuration(video); const lastTimestamp = Math.max(...script.beats.map(beat => beat.endSeconds)); if (lastTimestamp > duration + 2) throw new Error(`The script references ${Math.round(lastTimestamp)} seconds, but this source video is only ${Math.round(duration)} seconds long. Upload matching subtitles/source video.`); const output = await sliceVideoLocally(video, script.beats.map(b => ({ index: b.index, id: b.id, startSeconds: b.startSeconds, endSeconds: b.endSeconds })), (p, current, total) => { setProgress(Math.round(p * 100)); setStage(current > 0 ? `Slicing clip ${current} of ${total} locally…` : 'Processing video locally…'); }, { fast: fastCut }); if (job.cancelled) return; setClips(output); checkpoint({ clipCount: output.length }); const clipBytes = output.reduce((sum, clip) => sum + clip.size, 0); const roughCutLimit = (Capacitor.isNativePlatform() || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ? 150 : 500) * 1024 * 1024; if (clipBytes > roughCutLimit) { setNotice(`${output.length} clips created (${Math.round(clipBytes / 1024 / 1024)} MB). The combined rough cut was skipped because it needs more memory than this device can safely use — save the clips and join them in your editor, or use a desktop browser.`); } else { setStage('Creating rough cut locally…'); const rough = await concatenateClipsLocally(output, p => setProgress(Math.round(p * 100))); if (job.cancelled) return; setRoughCut(rough); checkpoint({ clipCount: output.length, roughCut: true }); setNotice(`${output.length} clips and a rough cut created on this device${fastCut ? ' with fast cut (a clip can start a second or two before its start time).' : ' with frame-accurate cuts.'}`); } } catch (e) { if (job.cancelled) return; setNotice(e instanceof Error ? e.message : 'Local video slicing failed.'); } finally { if (!job.cancelled) { setBusy(false); setStage(''); setActiveKind(''); } } }
-  async function exportDrive() {
+  async function sliceVideo() { if (!hasSourceTimecodes) { setNotice('Accurate cuts require a timestamped SRT/VTT transcript. Plain text has no source timecodes, so any AI timing would be a guess. Upload the matching SRT/VTT before slicing.'); return; } if (!script || !video) { setNotice('Generate a script and choose the source movie file you are authorized to edit.'); return; } const job = startJob('slice'); setBusy(true); setStage('Loading local FFmpeg…'); setProgress(0); setNotice(''); setClips([]); setRoughCut(null); try { const duration = await getVideoDuration(video); const lastTimestamp = Math.max(...script.beats.map(beat => beat.endSeconds)); if (lastTimestamp > duration + 2) throw new Error(`The script references ${Math.round(lastTimestamp)} seconds, but this source video is only ${Math.round(duration)} seconds long. Upload matching subtitles/source video.`); const output = await sliceVideoLocally(video, script.beats.map(b => ({ index: b.index, id: b.id, startSeconds: b.startSeconds, endSeconds: b.endSeconds })), (p, current, total) => { setProgress(Math.round(p * 100)); setStage(current > 0 ? `Slicing clip ${current} of ${total} locally…` : 'Processing video locally…'); }, { fast: fastCut && !applyAspectRatio, aspectRatio: applyAspectRatio ? aspectRatio : undefined, resolution: (Capacitor.isNativePlatform() || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) ? '720p' : '1080p' }); if (job.cancelled) return; setClips(output); checkpoint({ clipCount: output.length }); const clipBytes = output.reduce((sum, clip) => sum + clip.size, 0); const roughCutLimit = (Capacitor.isNativePlatform() || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ? 60 : 180) * 1024 * 1024; if (clipBytes > roughCutLimit) { setNotice(`${output.length} clips created (${Math.round(clipBytes / 1024 / 1024)} MB). The combined rough cut was skipped because it needs more memory than this device can safely use — save the clips and join them in your editor, or use a desktop browser.`); } else { setStage('Creating rough cut locally…'); const rough = await concatenateClipsLocally(output, p => setProgress(Math.round(p * 100))); if (job.cancelled) return; setRoughCut(rough); checkpoint({ clipCount: output.length, roughCut: true }); setNotice(`${output.length} clips and a rough cut created on this device${fastCut ? ' with fast cut (a clip can start a second or two before its start time).' : ' with frame-accurate cuts.'}`); } } catch (e) { if (job.cancelled) return; setNotice(e instanceof Error ? e.message : 'Local video slicing failed.'); } finally { if (!job.cancelled) { setBusy(false); setStage(''); setActiveKind(''); } } }
+  async function mixSoundsIntoRoughCut() {
+    if (!roughCut || !soundTracks.length || busy) return;
+    const mobile = Capacitor.isNativePlatform() || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    const safeBytes = (mobile ? 90 : 300) * 1024 * 1024;
+    const soundBytes = soundTracks.reduce((sum, track) => sum + track.blob.size, 0);
+    if (roughCut.size + soundBytes > safeBytes) {
+      setNotice(`Sound mixing needs a temporary in-memory copy. This export is too large for a safe local mix on this device. Your video and sound tracks are still available separately; use a smaller resolution or shorter recap to mix them together.`);
+      return;
+    }
+    const job = startJob('slice'); setBusy(true); setStage('Mixing sound layers locally…'); setProgress(2); setNotice('');
+    try {
+      const mixed = await mixAudioTracksLocally(roughCut, soundTracks.map(track => ({ ...track, loop: track.category === 'Background Music' || track.category === 'Ambience' })), p => { if (!job.cancelled) setProgress(Math.round(p * 100)); });
+      if (job.cancelled) return;
+      setRoughCut(mixed); setProgress(100); setNotice('Sound layers mixed into the recap locally. No AI credits were used.');
+    } catch (error) {
+      if (!job.cancelled) setNotice(error instanceof Error ? error.message : 'Could not mix sound layers into this video.');
+    } finally { if (!job.cancelled) { setBusy(false); setStage(''); setActiveKind(''); } }
+  }
+
+  async function exportDrive(finalVideo?: Blob) {
     if (!driveToken) { setNotice('Connect Google Drive first.'); return; }
     if (!script) { setNotice('Generate a clip script before exporting.'); return; }
     startJob('export'); setBusy(true); setStage('Uploading clips and scripts directly to your Google Drive…'); setNotice(''); setDriveFolder('');
@@ -451,54 +543,157 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
         if (beat) files.push({ name: c.filename.replace(/\.mp4$/i, '.txt'), mimeType: 'text/plain', body: beatText(beat), folder: 'video' });
       }
       files.push({ name: 'Timeline_Script.txt', mimeType: 'text/plain', body: script.beats.map(beatText).join('\n'), folder: 'master' });
-      if (roughCut) files.push({ name: 'Full_RoughCut.mp4', mimeType: 'video/mp4', body: roughCut, folder: 'master' });
-      const result = await exportProductionKit(driveToken, title || script.title, files);
-      setDriveFolder(result.folderUrl);
+      const sourceFileName = video ? `SOURCE_ORIGINAL_${safeName(video.name)}` : '';
+      if (video) files.push({ name: sourceFileName, mimeType: video.type || 'video/mp4', body: video, folder: 'video' });
+      const mediaAssets = timelineAssets.map((asset, index) => { const kind = asset.type.startsWith('image/') ? 'image' as const : 'video' as const; const fileName = `TIMELINE_ASSET_${String(index + 1).padStart(2, '0')}_${safeName(asset.name)}`; files.push({ name: fileName, mimeType: asset.type || (kind === 'image' ? 'image/jpeg' : 'video/mp4'), body: asset, folder: 'video' }); return { fileName, name: asset.name, kind }; });
+      files.push({ name: 'Project.json', mimeType: 'application/json', body: JSON.stringify({ schemaVersion: 3, editPlan: normalizeEditPlan({ aspectRatio, filter: effectPreset, effect: visualEffect, transition, speed: playbackRate, volume: 1, mirror: mirrorPreview, crop: cropMode === 'cover' ? 'cover' : 'contain', text: textOverlay ? { value: textOverlay, animation: textAnimation, font: overlayFont, position: 'center' } : undefined, emoji: emojiOverlay, sticker, watermark: showWatermark }), title: title || script.title, recapId, exportedAt: new Date().toISOString(), sourceFileName, mediaAssets, script, settings: { aspectRatio, applyAspectRatio, playbackRate, fastCut, mirrorPreview, cropMode, textOverlay, emojiOverlay, overlayFont, showWatermark, effectPreset, visualEffect, textAnimation, transition, sticker }, sounds: soundTracks.map((track, index) => { const ext = /wav/i.test(track.blob.type) ? 'wav' : /ogg/i.test(track.blob.type) ? 'ogg' : /aac/i.test(track.blob.type) ? 'aac' : /m4a/i.test(track.blob.type) ? 'm4a' : /flac/i.test(track.blob.type) ? 'flac' : 'mp3'; return { index, name: track.name, fileName: `${String(index + 1).padStart(2, '0')}_${safeName(track.name.replace(/\.[^.]+$/, ''))}.${ext}`, category: track.category, startSeconds: track.startSeconds, durationSeconds: track.durationSeconds, volume: track.volume, source: track.source }; }) }, null, 2), folder: 'master' });
+      if (soundTracks.length) {
+        soundTracks.forEach((track, index) => {
+          const extension = /wav/i.test(track.blob.type) ? 'wav' : /ogg/i.test(track.blob.type) ? 'ogg' : /aac/i.test(track.blob.type) ? 'aac' : /m4a/i.test(track.blob.type) ? 'm4a' : /flac/i.test(track.blob.type) ? 'flac' : 'mp3';
+          const audioName = `${String(index + 1).padStart(2, '0')}_${safeName(track.name.replace(/\.[^.]+$/, ''))}.${extension}`;
+          files.push({ name: audioName, mimeType: track.blob.type || (extension === 'mp3' ? 'audio/mpeg' : `audio/${extension}`), body: track.blob, folder: 'voiceover' });
+        });
+        files.push({ name: 'Sound_Timeline.json', mimeType: 'application/json', body: JSON.stringify(soundTracks.map((track, index) => ({ index: index + 1, name: track.name, category: track.category, file: `${String(index + 1).padStart(2, '0')}_${safeName(track.name.replace(/\.[^.]+$/, ''))}.${(/wav/i.test(track.blob.type) ? 'wav' : /ogg/i.test(track.blob.type) ? 'ogg' : /aac/i.test(track.blob.type) ? 'aac' : /m4a/i.test(track.blob.type) ? 'm4a' : /flac/i.test(track.blob.type) ? 'flac' : 'mp3')}`, startSeconds: track.startSeconds, volume: track.volume, source: track.source })), null, 2), folder: 'master' });
+      }
+      if (finalVideo || roughCut) files.push({ name: 'Full_RoughCut.mp4', mimeType: 'video/mp4', body: finalVideo || roughCut!, folder: 'master' });
+      const result = await exportProductionKit(driveToken, title || script.title, files, p => { setExportProgress(p.percent); setProgress(p.percent); setExportStage(p.completedFiles >= p.totalFiles ? 'Verifying saved project…' : `Saving ${p.currentFile} to Google Drive…`); });
+      setDriveFolder(result.folderUrl); setExportProgress(100); setExportStage('Saved successfully'); setExportDone(true);
       if (projectIdRef.current) { exportedRef.current = true; const pid = projectIdRef.current; void saveProject(pid, { status: 'exported', stage: null, progress: null, error: null, drive: { folderId: result.folderId, folderUrl: result.folderUrl, exportedAt: Date.now(), fileCount: result.uploaded.length }, transcript: null, script: null, narrationReady: null, narrationParts: null, sourceSize: null, videoUrl: null, subtitleUrl: null }); void deleteNarrationParts(pid); }
-      setNotice(`Export complete: ${result.uploaded.length} files uploaded directly to Drive${clips.length ? `, including ${clips.length} clips with their scripts` : ''}.`);
+      setNotice(`Export complete: ${result.uploaded.length} files saved to Google Drive${clips.length ? `, including ${clips.length} clips with their scripts` : ''}.`);
     } catch (e) {
       if (e instanceof Error && 'folderUrl' in e && typeof (e as Error & { folderUrl?: unknown }).folderUrl === 'string') setDriveFolder((e as Error & { folderUrl: string }).folderUrl);
-      setNotice(e instanceof Error ? e.message : 'Drive export failed.');
+      setExportDone(false); setExportStage(e instanceof Error ? e.message : 'Drive export failed.'); setNotice(e instanceof Error ? e.message : 'Drive export failed.');
     } finally { setBusy(false); setStage(''); setActiveKind(''); }
   }
-  return <main className="min-h-screen bg-[#080a10] px-4 py-8 text-white sm:px-8">
-  {busy && activeKind && activeKind !== 'export' && !confirmCancel && <button type="button" onClick={() => setConfirmCancel(true)} disabled={cancelling} className="fixed left-4 z-40 flex items-center gap-2 rounded-full border border-red-400/40 bg-[#1a0f14] px-4 py-3 text-sm font-bold text-red-200 shadow-lg shadow-black/50 active:scale-95" style={{ bottom: 'calc(env(safe-area-inset-bottom, 0px) + 1.25rem)' }}><span aria-hidden="true">✕</span> Cancel</button>}
-  {confirmCancel && <div role="dialog" aria-modal="true" aria-labelledby="cancel-title" className="fixed inset-0 z-[60] grid place-items-center bg-black/70 p-5"><div className="w-full max-w-sm rounded-2xl border border-white/10 bg-[#111521] p-6 shadow-2xl"><h2 id="cancel-title" className="text-lg font-black">Stop generation?</h2><p className="mt-2 text-sm leading-6 text-slate-300">Do you want to stop generation?</p><p className="mt-2 text-xs leading-5 text-slate-400">{activeKind === 'slice' ? 'Cutting uses no credits. Yes stops it now; No keeps it going.' : 'Yes stops it now and returns the credits used by this run to your balance. No keeps it going.'}</p><div className="mt-5 grid grid-cols-2 gap-3"><button type="button" autoFocus onClick={() => setConfirmCancel(false)} className="rounded-xl border border-white/15 px-4 py-3 text-sm font-bold">No</button><button type="button" onClick={() => void cancelRef.current()} className="rounded-xl bg-red-500 px-4 py-3 text-sm font-bold text-white">Yes</button></div></div></div>}
-  <div className="mx-auto max-w-6xl"><header className="mb-7 flex flex-wrap items-center justify-between gap-4"><div><div className="flex items-center gap-4"><Link href="/" className="text-sm text-violet-300">← WyCut</Link><Link href="/login?next=/dashboard" aria-label={authEmail ? `Signed in as ${authEmail}; manage account` : "Sign in to WyCut"} className="max-w-[48vw] truncate rounded-lg border border-violet-400/30 bg-violet-500/10 px-3 py-2 text-xs font-bold text-violet-200">{authEmail ? `Signed in · ${authEmail}` : "Sign in / account"}</Link><Link href="/billing" className="rounded-lg border border-white/10 px-3 py-2 text-xs font-bold text-slate-300">Billing</Link>{(credits !== null || freeAccess) && <Link href="/billing" aria-live="polite" className={`rounded-lg border px-3 py-2 text-xs font-bold ${freeAccess ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200' : credits !== null && credits < LOW_BALANCE_CREDITS ? 'border-amber-400/40 bg-amber-400/10 text-amber-200' : 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200'}`}>{freeAccess ? 'Unlimited access' : credits !== null && credits < LOW_BALANCE_CREDITS ? `${formatCredits(credits)} credits · Top up` : `${formatCredits(credits ?? 0)} credits`}</Link>}</div><h1 className="mt-2 text-2xl font-black sm:text-4xl">Recap Studio</h1><p className="mt-2 text-slate-400">Cut your video into clips, each with a script written for it.</p></div><div className="rounded-xl border border-white/10 bg-white/[.03] px-4 py-3"><div className="flex items-center gap-2"><Cloud size={18} className={driveToken ? 'text-emerald-400' : 'text-slate-400'}/><span className="text-sm font-semibold">Google Drive</span></div><p className="mt-1 text-xs text-slate-400">{driveToken ? 'Connected on this device' : 'Not connected'} · drive.file scope</p><div className="mt-2 flex flex-wrap gap-3"><button type="button" onClick={() => void connectDrive()} className="text-xs font-bold text-violet-300">{driveToken ? 'Reconnect Drive' : 'Connect Google Drive'}</button>{driveToken && <button type="button" onClick={disconnectDrive} className="text-xs font-semibold text-slate-400 underline">Disconnect</button>}</div>{!Capacitor.isNativePlatform() && <p className="mt-1 text-[11px] text-slate-500">{googleReady ? 'Google sign-in ready' : googleLoadError || 'Preparing Google sign-in…'}</p>}</div><nav className="flex flex-wrap gap-2 rounded-xl border border-white/10 bg-[#111521] p-2" aria-label="Choose input workflow"><Link href="/dashboard/url" className={`rounded-lg px-3 py-2 text-xs font-bold ${mode === 'url' ? 'bg-violet-500 text-white' : 'text-slate-300 hover:bg-white/5'}`}><Link2 className="mr-1 inline" size={14}/>Video URL</Link><Link href="/dashboard/file" className={`rounded-lg px-3 py-2 text-xs font-bold ${mode === 'file' ? 'bg-violet-500 text-white' : 'text-slate-300 hover:bg-white/5'}`}><UploadCloud className="mr-1 inline" size={14}/>Video file</Link><Link href="/dashboard/subtitles" className={`rounded-lg px-3 py-2 text-xs font-bold ${mode === 'subtitles' ? 'bg-violet-500 text-white' : 'text-slate-300 hover:bg-white/5'}`}><FileText className="mr-1 inline" size={14}/>Subtitles</Link></nav></header>
-  <div className="grid gap-6 lg:grid-cols-[1fr_310px]"><section className="space-y-5"><div className="rounded-2xl border border-white/10 bg-[#111521] p-5 sm:p-7">
-    <h2 className="mb-4 flex items-center gap-2 text-lg font-bold"><Clapperboard size={20} className="text-violet-300"/> {mode === 'url' ? '1. Video URL workflow' : mode === 'file' ? '1. Choose a video file' : '1. Subtitle-to-recap workflow'}</h2>
-    <label className="mb-2 block text-sm font-semibold">Movie / project title</label>
-    <input disabled={busy} value={title} onChange={e=>setTitle(e.target.value)} maxLength={160} className="mb-5 w-full rounded-xl border border-white/10 bg-black/20 px-4 py-3 outline-none focus:ring-2 focus:ring-violet-400"/>
-    {mode === 'url' && <div className="space-y-3">
-      <label className="block text-sm font-semibold">Video URL</label>
-      <input disabled={busy} value={url} onChange={e=>setUrl(e.target.value)} placeholder="Direct HTTPS MP4/M4V/MOV URL or YouTube link" inputMode="url" className="w-full rounded-xl border border-white/10 bg-black/20 px-4 py-3 outline-none focus:ring-2 focus:ring-violet-400"/>
-      <button type="button" disabled={busy||!url.trim()} onClick={()=>void loadVideoFromUrl()} className="w-full rounded-xl border border-violet-400/30 bg-violet-500/10 px-4 py-3 text-sm font-bold text-violet-200 disabled:opacity-40">{busy&&stage.includes('Downloading')?'Loading source…':video?'Replace source video':'Load direct video URL'}</button>
-      <label className="mt-2 block text-sm font-semibold">Subtitle / transcript URL (required for script generation unless you upload a subtitle file)</label>
-      <input disabled={busy} value={subtitleUrl} onChange={e=>{setSubtitleUrl(e.target.value);clearGeneratedOutputs();}} placeholder="https://host.example/captions.en.vtt" inputMode="url" className="w-full rounded-xl border border-white/10 bg-black/20 px-4 py-3 outline-none focus:ring-2 focus:ring-violet-400"/>
-      <p className="text-xs leading-5 text-slate-400">A YouTube watch link is not a direct video file. WyCut will not bypass YouTube download restrictions. To recap a YouTube video, provide subtitles you have permission to use; to cut footage, also load an authorized local video file or a direct video URL from a host that permits downloads.</p>
+  function addTimelineMedia(files?: FileList | null) {
+    if (!files?.length) return;
+    const additions = Array.from(files).filter(f => f.type.startsWith('video/') || f.type.startsWith('image/'));
+    if (!additions.length) { setNotice('Choose a video or image file.'); return; }
+    if (timelineAssets.length + additions.length > 20) { setNotice('A project can hold up to 20 extra video/image timeline assets.'); return; }
+    const tooLarge = additions.find(f => f.size > 100 * 1024 * 1024);
+    if (tooLarge) { setNotice(`${tooLarge.name} is over the 100 MB per-extra-asset limit. Add a smaller file.`); return; }
+    setTimelineAssets(current => [...current, ...additions]);
+    setNotice(`${additions.length} media asset${additions.length === 1 ? '' : 's'} added to the project timeline. Assets are saved to Drive on export; this build does not yet composite extra images/videos into the final MP4.`);
+  }
+  async function downloadRecapScript(format: 'txt'|'json' = 'txt') {
+    if (!script) return;
+    const text = format === 'json'
+      ? JSON.stringify(script, null, 2)
+      : `${script.title}\n\n${script.beats.map((b) => `[${formatTime(b.startSeconds)}–${formatTime(b.endSeconds)}] ${b.title}\n${b.narration}`).join('\n\n')}\n`;
+    await downloadFile(new Blob([text], { type: format === 'json' ? 'application/json' : 'text/plain;charset=utf-8' }), `${safeName(title || script.title)}_recap.${format}`);
+  }
+  function formatTime(seconds: number) { const m = Math.floor(seconds / 60); const sec = Math.floor(seconds % 60); return `${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`; }
+  function safeName(value: string) { return value.replace(/[^a-z0-9_-]+/gi, '_').replace(/^_+|_+$/g, '').slice(0,80) || 'WyCut'; }
+  async function exportToDeviceAndDrive() {
+    if (!script) { setNotice('Generate your recap first.'); return; }
+    if (!roughCut && !clips.length) { setNotice('Generate the recap, then tap Auto-cut clips before exporting the video.'); return; }
+    setExportPage(true); setExportDone(false); setExportProgress(0); setExportStage('Preparing export…');
+    if (!driveToken) { setExportStage('Connect Google Drive to save the editable project and source media, then continue export.'); return; }
+    setBusy(true); setStage('Preparing files for export…');
+    try {
+      const renderSource = roughCut || await concatenateClipsLocally(clips, percent => { setExportProgress(Math.round(percent * 5)); setExportStage(`Preparing clips for export… ${Math.round(percent * 100)}%`); });
+      const plan = normalizeEditPlan({ aspectRatio, filter: effectPreset, effect: visualEffect, transition, speed: playbackRate, volume: 1, mirror: mirrorPreview, crop: cropMode === 'cover' ? 'cover' : 'contain', text: textOverlay ? { value: textOverlay, animation: textAnimation, font: overlayFont, position: 'center' } : undefined, emoji: emojiOverlay, sticker, watermark: showWatermark });
+      setExportStage('Rendering filters, overlays and audio settings…'); setExportProgress(1);
+      const finalVideo = await renderEditPlan(renderSource, plan, percent => { setExportProgress(Math.min(90, Math.round(percent * .9))); setExportStage(`Rendering edited MP4… ${percent}%`); });
+      await downloadFile(finalVideo, `${safeName(title)}_recap.mp4`);
+      await downloadRecapScript('txt');
+      await exportDrive(finalVideo);
+    } catch (error) { setExportStage(error instanceof Error ? error.message : 'Export failed.'); setExportDone(false); }
+    finally { setBusy(false); setStage(''); }
+  }
+  return exportPage ? <main className="min-h-screen bg-[#080a10] px-4 py-8 text-white sm:px-6"><div className="mx-auto max-w-2xl space-y-6 rounded-3xl border border-white/10 bg-[#111521] p-5 sm:p-8"><button type="button" onClick={() => setExportPage(false)} className="inline-flex items-center gap-2 rounded-xl border border-white/10 px-3 py-2 text-sm font-bold"><ArrowLeft size={16}/> Back to editor</button><div className="text-center">{exportDone ? <CheckCircle2 size={58} className="mx-auto text-emerald-300"/> : <Download size={48} className="mx-auto text-violet-300"/>}<h1 className="mt-4 text-2xl font-black">{exportDone ? 'Export successful' : 'Export project'}</h1><p className="mt-2 text-sm text-slate-400">{exportDone ? 'Your project, original source, timeline assets, script and generated media have been saved to Google Drive.' : exportStage}</p></div><div className="h-3 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-emerald-400 transition-all duration-300" style={{width:`${exportProgress}%`}}/></div><div className="flex justify-between text-xs text-slate-400"><span>{exportDone ? '✓ Saved to Drive' : exportStage}</span><strong>{exportProgress}%</strong></div>{exportDone && <div className="rounded-xl border border-emerald-400/20 bg-emerald-400/10 p-4 text-sm text-emerald-100">✓ Saved successfully. You can return to History and reopen this project without choosing the source again.</div>}{!driveToken && <div className="space-y-3"><p className="text-sm text-amber-100">Connect Google Drive so WyCut can store the source video and every timeline asset. Without Drive, the project cannot be restored on another session.</p><button type="button" onClick={() => void connectDrive()} className="w-full rounded-xl bg-violet-500 px-4 py-3 font-bold">Connect Google Drive</button></div>}{busy && exportStage.startsWith('Rendering edited MP4') && <button type="button" onClick={() => { cancelEditExport(); setExportStage('Cancelling render and cleaning temporary files…'); }} className="w-full rounded-xl border border-red-400/40 px-4 py-3 font-bold text-red-200">Cancel render</button>}{driveToken && !exportDone && !busy && <button type="button" onClick={() => void exportToDeviceAndDrive()} className="w-full rounded-xl bg-emerald-400 px-4 py-3 font-black text-black">Continue export</button>}{exportDone && driveFolder && <a href={driveFolder} target="_blank" rel="noopener noreferrer" className="block rounded-xl bg-emerald-400 px-4 py-3 text-center font-black text-black">Open saved project in Google Drive</a>}</div></main> : <main className="min-h-screen bg-[#080a10] px-3 pb-28 pt-4 text-white sm:px-6">
+  {busy && activeKind && activeKind !== 'export' && !confirmCancel && <button type="button" onClick={() => setConfirmCancel(true)} disabled={cancelling} className="fixed left-4 z-40 flex items-center gap-2 rounded-full border border-red-400/40 bg-[#1a0f14] px-4 py-3 text-sm font-bold text-red-200 shadow-lg" style={{ bottom: 'calc(env(safe-area-inset-bottom, 0px) + 1rem)' }}>✕ Cancel</button>}
+  {confirmCancel && <div role="dialog" aria-modal="true" aria-labelledby="cancel-title" className="fixed inset-0 z-[60] grid place-items-center bg-black/75 p-5"><div className="w-full max-w-sm rounded-2xl border border-white/10 bg-[#111521] p-6 shadow-2xl"><h2 id="cancel-title" className="text-lg font-black">Stop generation?</h2><p className="mt-2 text-sm leading-6 text-slate-300">Stop this task now?</p><p className="mt-2 text-xs leading-5 text-slate-400">{activeKind === 'slice' ? 'Local cutting uses no AI credits.' : 'Eligible generation credits are returned when cancellation is confirmed.'}</p><div className="mt-5 grid grid-cols-2 gap-3"><button type="button" autoFocus onClick={() => setConfirmCancel(false)} className="rounded-xl border border-white/15 px-4 py-3 text-sm font-bold">Keep working</button><button type="button" onClick={() => void cancelRef.current()} className="rounded-xl bg-red-500 px-4 py-3 text-sm font-bold">Stop</button></div></div></div>}
+  <div className="mx-auto max-w-7xl">
+    <header className="mb-4 flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
+      <div className="flex items-center gap-3"><Link href="/history" aria-label="Back to projects" className="grid h-10 w-10 place-items-center rounded-xl bg-violet-500/15 text-lg font-black text-violet-300">W</Link><div><h1 className="text-xl font-black sm:text-2xl">WyCut Studio</h1><p className="text-xs text-slate-400">Movie recap editor</p></div></div>
+      <div className="flex flex-wrap items-center gap-2">
+        <Link href="/login?next=/dashboard" className="max-w-[42vw] truncate rounded-lg border border-violet-400/30 bg-violet-500/10 px-3 py-2 text-xs font-bold text-violet-200">{authEmail || 'Sign in'}</Link>
+        <Link href="/billing" className="rounded-lg border border-white/10 px-3 py-2 text-xs font-bold">{freeAccess ? 'Premium access' : `${formatCredits(credits ?? 0)} credits`}</Link>
+        <Link href="/history" className="rounded-lg border border-white/10 px-3 py-2 text-xs font-bold">Projects</Link>
+      </div>
+    </header>
+
+    <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+      <div><h2 className="text-lg font-bold">Create a recap</h2><p className="text-sm text-slate-400">Upload a video. WyCut transcribes the audio, writes an original recap, and builds a clip timeline.</p></div>
+      <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-[#111521] px-3 py-2">
+        <Cloud size={17} className={driveToken ? 'text-emerald-300' : 'text-slate-400'}/><span className="text-xs">{driveToken ? 'Drive connected' : 'Drive not connected'}</span>
+        <button type="button" onClick={() => void connectDrive()} className="rounded-lg bg-white/10 px-3 py-2 text-xs font-bold text-violet-200">{driveToken ? 'Reconnect' : 'Connect'}</button>
+      </div>
+    </div>
+
+    {!video && <label onDragOver={e=>{if(!busy)e.preventDefault();}} onDrop={e=>{e.preventDefault(); if(!busy) selectVideo(e.dataTransfer.files?.[0]);}} className="mb-4 flex min-h-44 cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed border-violet-400/50 bg-[#111521] p-6 text-center hover:bg-violet-500/[.06]">
+      <UploadCloud size={34} className="mb-3 text-violet-300"/><span className="text-lg font-bold">Choose a video to start editing</span><span className="mt-2 text-sm text-slate-400">MP4, M4V or MOV · processed on this device · source limit {MAX_SOURCE_LABEL} (device-dependent)</span>
+      <input disabled={busy} type="file" accept="video/mp4,video/quicktime,.mp4,.m4v,.mov" onChange={e=>{selectVideo(e.target.files?.[0]); e.currentTarget.value='';}} className="sr-only"/>
+    </label>}
+
+    {video && <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+      <section className="min-w-0 space-y-4">
+        <div className="overflow-hidden rounded-2xl border border-white/10 bg-[#111521]">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 px-3 py-3">
+            <div className="min-w-0"><p className="truncate text-sm font-bold">{video.name}</p><p className="text-xs text-slate-500">{(video.size/1024/1024).toFixed(1)} MB{videoSeconds ? ` · ${Math.floor(videoSeconds/60)}:${String(Math.floor(videoSeconds%60)).padStart(2,'0')}` : ''}</p></div>
+            <div className="flex gap-2"><button type="button" disabled={busy} onClick={()=>{setVideo(null);setFile(null);clearGeneratedOutputs();setNotice('');}} className="rounded-lg border border-white/10 px-3 py-2 text-xs font-semibold">Replace</button><button type="button" onClick={()=>void downloadRecapScript('txt')} disabled={!script||busy} className="rounded-lg border border-white/10 px-3 py-2 text-xs font-semibold disabled:opacity-40"><Download size={14} className="mr-1 inline"/>Script</button></div>
+          </div>
+          <div className="flex min-h-[260px] items-center justify-center bg-black p-3 sm:p-5">
+            <div className="relative overflow-hidden rounded-lg bg-black shadow-2xl transition-all" style={{ aspectRatio: aspectRatio.replace(':',' / '), width: aspectRatio==='16:9'?'min(100%, 760px)':aspectRatio==='1:1'?'min(100%, 420px)':aspectRatio==='4:5'?'min(100%, 380px)':'min(100%, 360px)', maxHeight:'58vh' }}>
+              <video src={previewUrl} controls playsInline className="h-full w-full object-contain" style={{ objectFit:'contain' }} onLoadedMetadata={e=>{e.currentTarget.playbackRate=Number(playbackRate);}}/>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 border-t border-white/10 px-3 py-3">
+            <span className="mr-1 text-xs text-slate-400">Canvas</span>
+            {(['9:16','16:9','1:1','4:5'] as const).map(r=><button key={r} type="button" onClick={()=>setAspectRatio(r)} className={`rounded-lg px-3 py-2 text-xs font-bold ${aspectRatio===r?'bg-violet-500 text-white':'bg-white/5 text-slate-300'}`}>{r}</button>)}
+            <label className="ml-auto flex items-center gap-2 text-xs text-slate-400">Preview speed<select value={playbackRate} onChange={e=>{setPlaybackRate(e.target.value);const v=document.querySelector('video');if(v)v.playbackRate=Number(e.target.value);}} className="rounded-lg border border-white/10 bg-[#080a10] px-2 py-2 text-white"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
+          </div>
+          <p className="px-3 pb-3 text-[11px] text-slate-500">{applyAspectRatio ? 'Selected ratio is applied to exported clips using local re-encoding.' : 'Canvas ratio affects preview only; enable “Reframe exports” to apply it to exported clips.'}</p>
+        </div>
+
+        <div className="rounded-2xl border border-violet-400/25 bg-gradient-to-br from-violet-500/[.09] to-[#111521] p-4">
+          <div className="mb-4 rounded-xl border border-violet-400/20 bg-[#080a10]/70 p-3"><div className="flex items-center gap-2"><span className="grid h-8 w-8 place-items-center rounded-lg bg-violet-500/20 text-sm font-black text-violet-200">AI</span><div><h3 className="font-bold text-violet-100">AI recap workflow</h3><p className="text-xs leading-5 text-slate-400">Step 1 generates the recap plan. Step 2 cuts the source video locally using the plan's timestamps.</p></div></div><div className="mt-3 grid gap-2 sm:grid-cols-2"><div className="rounded-lg border border-violet-400/20 bg-violet-500/[.07] p-3"><p className="text-[10px] font-black uppercase tracking-wider text-violet-300">Step 1 · AI</p><p className="mt-1 text-xs text-slate-300">Create or regenerate the scene script and timestamps.</p></div><div className="rounded-lg border border-emerald-400/20 bg-emerald-400/[.05] p-3"><p className="text-[10px] font-black uppercase tracking-wider text-emerald-300">Step 2 · On-device</p><p className="mt-1 text-xs text-slate-300">Cut clips locally. A matching timestamped transcript is required.</p></div></div></div>
+          <div className="flex flex-wrap items-center justify-between gap-2"><div><h3 className="font-bold">Recap timeline</h3><p className="text-xs text-slate-400">{script ? `${script.beats.length} AI-written scenes` : 'Your AI recap scenes will appear here as clip blocks.'}</p></div>
+            <div className="flex flex-wrap gap-2"><label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-white/10 px-3 py-2 text-xs font-bold"><Plus size={15}/>Add video/image<input type="file" accept="video/*,image/*" multiple disabled={busy} onChange={e=>{addTimelineMedia(e.target.files);e.currentTarget.value='';}} className="sr-only"/></label><button type="button" disabled={busy} onClick={()=>void generateScript()} className="rounded-xl bg-violet-500 px-4 py-3 text-sm font-black shadow-lg shadow-violet-950/30 hover:bg-violet-400 disabled:opacity-50">{busy ? <><LoaderCircle size={16} className="mr-2 inline animate-spin"/>{stage||'Working…'}</> : script ? 'Regenerate recap' : 'Generate 10–15 recap clips'}</button></div>
+          </div>
+          {timelineAssets.length > 0 && <div className="mt-3 flex gap-2 overflow-x-auto pb-2">{timelineAssets.map((asset,i)=><div key={`${asset.name}-${i}`} className="flex min-w-44 items-center gap-2 rounded-xl border border-white/10 bg-black/20 p-2"><span className="grid h-8 w-8 place-items-center rounded-lg bg-violet-500/15 text-violet-200">{asset.type.startsWith('image/')?<ImageIcon size={16}/>:<Film size={16}/>}</span><span className="min-w-0 flex-1 truncate text-xs">{asset.name}</span><button type="button" disabled={busy} onClick={()=>setTimelineAssets(current=>current.filter((_,j)=>j!==i))} aria-label={`Remove ${asset.name}`} className="px-1 text-red-300">×</button></div>)}</div>}
+          {script && <div className="mt-4 overflow-x-auto pb-2"><div className="flex min-w-max gap-2">
+            {script.beats.map((b,i)=><button key={`${b.id}-${i}`} type="button" onClick={()=>{const v=document.querySelector('video');if(v){v.currentTime=b.startSeconds;void v.play().catch(()=>undefined);}}} className={`w-48 shrink-0 overflow-hidden rounded-xl border text-left ${clips[i]?'border-emerald-400/40 bg-emerald-400/[.06]':'border-violet-400/30 bg-violet-500/[.07]'}`}>
+              <div className="flex h-14 items-center justify-between bg-gradient-to-br from-violet-500/20 to-fuchsia-500/10 px-3"><span className="text-xs font-black text-violet-200">CLIP {String(i+1).padStart(2,'0')}</span><span className="text-[10px] text-slate-400">{formatTime(b.startSeconds)}–{formatTime(b.endSeconds)}</span></div>
+              <div className="p-3"><p className="line-clamp-2 text-xs font-bold">{b.title}</p><p className="mt-2 line-clamp-4 text-[11px] leading-4 text-slate-300">{b.narration}</p></div>
+              <div className="border-t border-white/10 px-3 py-2 text-[10px] text-slate-500">{clips[i] ? 'Video clip ready' : 'Script block'}</div>
+            </button>)}
+          </div></div>}
+          {script && <div className="mt-3 flex flex-wrap gap-2">
+            <button type="button" disabled={busy} onClick={()=>void sliceVideoLocallyAction()} className="inline-flex items-center gap-2 rounded-xl bg-violet-500 px-4 py-3 text-sm font-black text-white shadow-lg shadow-violet-950/30 hover:bg-violet-400 disabled:opacity-40"><Scissors size={16}/>{clips.length ? 'Re-cut clips locally' : 'Start auto-cut (free)'}</button>
+            <button type="button" disabled={busy} onClick={()=>void downloadRecapScript('txt')} className="inline-flex items-center gap-2 rounded-xl border border-white/10 px-4 py-3 text-sm font-bold"><Download size={16}/>Download script .txt</button>
+            <button type="button" disabled={busy} onClick={()=>void downloadRecapScript('json')} className="inline-flex items-center gap-2 rounded-xl border border-white/10 px-4 py-3 text-sm font-bold"><Download size={16}/>Timeline JSON</button>
+          </div>}
+          {clips.length>0 && <div className="mt-4 grid gap-2 sm:grid-cols-2">{clips.map((clip,i)=><div key={clip.filename} className="flex min-w-0 items-center justify-between gap-2 rounded-lg border border-white/10 p-3"><span className="truncate text-xs text-slate-300">{i+1}. {clip.filename} · {(clip.size/1024/1024).toFixed(1)} MB</span><button type="button" onClick={()=>void downloadFile(clip.blob,clip.filename)} className="rounded-lg bg-white/10 px-3 py-2 text-xs">Save clip</button></div>)}</div>}
+          {roughCut && <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-400/20 bg-emerald-400/[.05] p-3"><div><p className="text-sm font-bold text-emerald-200">Rough cut ready</p><p className="text-xs text-slate-400">Created locally · current renderer does not bake overlays or watermark into MP4 yet</p></div><button type="button" onClick={()=>void downloadFile(roughCut,`${safeName(title)}_recap.mp4`)} className="rounded-lg bg-emerald-400 px-4 py-2 text-sm font-bold text-black"><Download size={15} className="mr-1 inline"/>Save MP4</button></div>}
+        </div>
+
+        <AdvancedEditorTools script={script} onScriptChange={setScript} selected={selectedClipIndex} onSelect={setSelectedClipIndex} watermark={showWatermark} onWatermarkChange={setShowWatermark} zoom={timelineZoom} onZoomChange={setTimelineZoom} mirror={mirrorPreview} onMirrorChange={setMirrorPreview} crop={cropMode} onCropChange={setCropMode} textOverlay={textOverlay} onTextOverlayChange={setTextOverlay} emoji={emojiOverlay} onEmojiChange={setEmojiOverlay} font={overlayFont} onFontChange={setOverlayFont} previewUrl={previewUrl} aspectRatio={aspectRatio} effectPreset={effectPreset} onEffectPresetChange={setEffectPreset} visualEffect={visualEffect} onVisualEffectChange={setVisualEffect} animation={textAnimation} onAnimationChange={setTextAnimation} transition={transition} onTransitionChange={setTransition} sticker={sticker} onStickerChange={setSticker} />
+        <SoundLibrary tracks={soundTracks} onChange={setSoundTracks} disabled={busy} />
+        {roughCut && soundTracks.length > 0 && <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-violet-400/20 bg-violet-500/[.06] p-3"><div><p className="text-sm font-bold">Audio mix</p><p className="text-xs text-slate-400">Mix {soundTracks.length} sound layer{soundTracks.length === 1 ? '' : 's'} into the current rough cut on this device.</p></div><button type="button" disabled={busy} onClick={() => void mixSoundsIntoRoughCut()} className="rounded-xl bg-violet-500 px-4 py-3 text-sm font-black disabled:opacity-40"><Music2 size={16} className="mr-2 inline"/>Mix sounds into video</button></div>}
+
+        {notice && <p ref={noticeRef} role="alert" className={`rounded-xl border px-4 py-3 text-sm leading-6 ${/fail|could not|error|expired|sign in|top up|not enough|limit|invalid/i.test(notice)?'border-red-400/30 bg-red-500/10 text-red-200':'border-emerald-400/30 bg-emerald-400/10 text-emerald-200'}`}>{notice}{needsTopUp&&<Link href="/billing" className="ml-2 inline-block rounded-lg bg-white px-3 py-1 text-xs font-bold text-black">Top up credits</Link>}</p>}
+        {busy && <div role="status" aria-live="polite" className="rounded-xl border border-white/10 bg-[#111521] p-4"><div className="mb-2 flex justify-between text-xs"><span>{stage||'Processing…'}</span><span>{progress}%</span></div><div className="h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-violet-400 transition-all" style={{width:`${Math.max(5,progress)}%`}}/></div></div>}
+      </section>
+
+      <aside className="space-y-4">
+        <div className="rounded-2xl border border-white/10 bg-[#111521] p-4"><h3 className="font-bold">Project details</h3><label className="mt-3 block text-xs font-semibold text-slate-400">Recap title<input value={title} onChange={e=>setTitle(e.target.value)} maxLength={120} className="mt-2 w-full rounded-xl border border-white/10 bg-black/20 px-3 py-3 text-sm text-white outline-none focus:border-violet-400" placeholder="Enter movie or project title"/></label></div>
+        <div className="rounded-2xl border border-white/10 bg-[#111521] p-4"><h3 className="font-bold">Source video</h3><p className="mt-2 text-sm text-slate-400">Your source stays on your device until you choose Export. Export stores the original source and timeline assets in your Google Drive project so you can reopen them from History.</p><label className="mt-4 flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-white/20 px-4 py-4 text-sm font-bold"><UploadCloud size={18}/>Replace video<input type="file" accept="video/mp4,video/quicktime,.mp4,.m4v,.mov" disabled={busy} onChange={e=>{selectVideo(e.target.files?.[0]);e.currentTarget.value='';}} className="sr-only"/></label></div>
+        <div className="rounded-2xl border border-white/10 bg-[#111521] p-4"><h3 className="font-bold">Quick tools</h3><div className="mt-3 space-y-3 text-sm">
+          <div className="flex items-center justify-between gap-3"><span className="text-slate-300">Fast cut</span><input type="checkbox" checked={fastCut} disabled={busy} onChange={e=>setFastCut(e.target.checked)} className="accent-violet-400"/></div>
+          <p className="text-xs leading-5 text-slate-500">Fast cut avoids re-encoding and costs no AI credits. Disable it for frame-accurate cuts, which take longer.</p>
+          <div className="flex items-center justify-between gap-3"><span className="text-slate-300">Aspect ratio</span><span className="text-xs text-violet-200">{aspectRatio}</span></div>
+          <label className="flex items-start gap-2 text-xs leading-5 text-slate-300"><input type="checkbox" checked={applyAspectRatio} disabled={busy} onChange={e=>setApplyAspectRatio(e.target.checked)} className="mt-1 accent-violet-400"/><span><strong>Reframe exports to canvas</strong><br/><span className="text-slate-500">Local re-encoding crops to the selected ratio (720p on mobile, 1080p on desktop). Slower than fast cut, but no AI credits or server processing.</span></span></label>
+          <div className="flex items-center justify-between gap-3"><span className="text-slate-300">Watermark</span><span className="text-xs text-amber-200">Preview only</span></div>
+        </div></div>
+        <div className="rounded-2xl border border-white/10 bg-[#111521] p-4"><h3 className="font-bold">Export</h3><p className="mt-2 text-xs leading-5 text-slate-400">Save the rendered rough cut (or individual clips) and the editable recap script to this device. If Google Drive is connected, a production kit is also uploaded there.</p><button type="button" disabled={busy||!script||(!roughCut&&!clips.length)} onClick={()=>void exportToDeviceAndDrive()} className="mt-4 w-full rounded-xl bg-emerald-400 px-4 py-3 font-black text-black disabled:opacity-40"><Download size={17} className="mr-2 inline"/>Export video + script</button><button type="button" onClick={()=>void connectDrive()} className="mt-2 w-full rounded-xl border border-white/10 px-4 py-3 text-sm font-bold">{driveToken?'Reconnect Google Drive':'Connect Google Drive'}</button>{driveFolder&&<button type="button" onClick={()=>void openDriveFolder()} className="mt-2 text-xs text-emerald-300 underline">Open Drive export folder</button>}</div>
+      </aside>
     </div>}
-    {mode === 'file' && <div className="space-y-3">
-      <label className="block text-sm font-semibold">Source video file (MP4, M4V or MOV)</label>
-      <p className="text-xs leading-5 text-slate-400">Choose a video already on your device. Nothing is uploaded or stored: WyCut reads the file in place, so even full-length movies work (up to {MAX_SOURCE_LABEL}). Processing and cutting happen on your device.</p>
-      <input disabled={busy} type="file" accept=".mp4,.m4v,.mov,video/mp4,video/quicktime" onChange={e=>selectVideo(e.target.files?.[0])} className="block w-full text-sm text-slate-300 file:mr-3 file:rounded-lg file:border-0 file:bg-white/10 file:px-4 file:py-2 file:text-white"/>
-      {video&&<p className="text-xs text-emerald-300">Video ready: {video.name} · {(video.size/1024/1024).toFixed(1)} MB</p>}
-    </div>}
-    {(mode === 'file' || mode === 'url') && <p className="mt-4 rounded-xl border border-emerald-400/20 bg-emerald-400/[.05] px-4 py-3 text-xs leading-5 text-emerald-200">No subtitles? Leave them empty. If a video is loaded, WyCut extracts its audio on your device, transcribes it with AI, then writes the recap. Uploaded subtitles are always used first and skip the transcription charge.</p>}
-    {(mode === 'file' || mode === 'subtitles' || mode === 'url') && <div className="mt-4">
-      <label className="mb-2 block text-sm font-semibold">{mode === 'url' ? 'Or upload subtitles / transcript' : 'Subtitle / transcript file'} (.SRT, .VTT or .TXT)</label>
-      <label onDragOver={e=>{if(!busy)e.preventDefault();}} onDrop={e=>{if(!busy)onDrop(e);}} className="flex min-h-28 cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed border-violet-400/40 bg-violet-400/[.04] p-5 text-center"><UploadCloud size={26} className="mb-2 text-violet-300"/><span className="font-bold">{file?file.name:'Drop subtitle/transcript here or browse'}</span><span className="mt-2 text-sm text-slate-400">SRT, VTT or TXT · Max 5 MB</span><input disabled={busy} type="file" accept=".srt,.vtt,.txt,text/plain,text/vtt,application/x-subrip" onChange={onInput} className="sr-only"/></label>
-      {file&&<button type="button" onClick={()=>{setFile(null);clearGeneratedOutputs();setNotice('Subtitle removed.');}} className="mt-2 text-xs text-slate-400 underline">Remove subtitle file</button>}
-    </div>}
-    {mode === 'subtitles' && <p className="mt-3 text-xs leading-5 text-slate-400">This flow generates the original clip-by-clip recap script from your subtitle file. Video cuts are unavailable until you select a matching authorized video on the Choose video file page.</p>}
-    <button type="button" disabled={busy} aria-live="polite" onClick={generateScript} className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-violet-500 px-5 py-3.5 font-bold hover:bg-violet-400 disabled:cursor-wait disabled:opacity-70">{busy ? <><LoaderCircle size={18} className="animate-spin" aria-hidden="true"/> {stage || 'Generating…'}</> : mode === 'subtitles' ? 'Generate recap from subtitles' : 'Generate recap script'}</button>
-    {!busy && (() => { const hasText = Boolean(file) || (mode === 'url' && subtitleUrl.trim().length > 0); const transcribe = !hasText && video && videoSeconds > 0 ? transcribeCreditsForVideo(videoSeconds) : 0; const low = SCRIPT_CREDITS_MIN + transcribe; const high = SCRIPT_CREDITS_MAX + transcribe; return !freeAccess && (hasText || mode === 'subtitles' || video) ? <p className="mt-3 text-xs leading-5 text-slate-400">This step uses about <strong className="text-slate-200">{low === high ? formatCredits(low) : `${formatCredits(low)}–${formatCredits(high)}`} credits</strong>{transcribe > 0 ? ` (${formatCredits(transcribe)} to transcribe the video audio + the script)` : ' for the script'}. Cutting clips is free. Failed steps are refunded automatically.</p> : null; })()}
-    {!busy && notice && <p ref={noticeRef} role="alert" className={`mt-3 rounded-xl border px-4 py-3 text-sm leading-6 ${/fail|could not|error|expired|sign in|no recap credits|top up|too many|not configured|limit|invalid|\[[A-Z_]+\]/i.test(notice) ? 'border-red-400/30 bg-red-500/10 text-red-200' : 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200'}`}>{notice}{needsTopUp && <Link href="/billing" className="ml-2 inline-block rounded-lg bg-white px-3 py-1 text-xs font-bold text-black">Top up credits</Link>}</p>}
-    {busy && <div className="mt-3" aria-live="polite" role="status"><div className="mb-1 flex justify-between text-xs text-slate-300"><span>{stage || 'Processing…'}</span><span>{progress}%</span></div><div className="h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-violet-400 transition-all" style={{width:`${Math.max(5,progress)}%`}}/></div></div>}
+
+    
   </div>
-  {script&&<div className="rounded-2xl border border-white/10 bg-[#111521] p-5 sm:p-7"><div className="flex flex-wrap items-center justify-between gap-3"><h2 className="flex items-center gap-2 text-lg font-bold"><FileText size={20} className="text-violet-300"/> 2. Clip script</h2><span className="text-xs text-slate-400">{script.beats.length} clips · ~{Math.round(script.beats.reduce((sum,b)=>sum+(b.endSeconds-b.startSeconds),0)/60)} min of footage · {hasSourceTimecodes ? 'timestamped source' : 'estimated timing only'}</span></div><div className="mt-4 max-h-96 space-y-3 overflow-auto">{script.beats.map(b=><article key={`${b.index}-${b.id}`} className="rounded-xl border border-white/10 bg-black/20 p-4"><div className="flex flex-wrap justify-between gap-2 text-xs text-violet-300"><span>{String(b.index).padStart(3,'0')} · Act {b.act} · {b.title}</span><span>{b.startSeconds.toFixed(1)}s–{b.endSeconds.toFixed(1)}s · {clipFit(b)}</span></div><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-300">{b.narration}</p>{b.dialogueCues.map((c,i)=><p key={i} className="mt-2 text-xs text-amber-200">[LET MOVIE AUDIO PLAY: {c.startSeconds}s–{c.endSeconds}s{c.quote?` · “${c.quote}”`:''}]</p>)}</article>)}</div><button disabled={busy} onClick={()=>void downloadFile(new Blob([JSON.stringify(script,null,2)],{type:'application/json'}),'WyCut_Timeline_Script.json')} className="mt-4 inline-flex items-center gap-2 rounded-lg border border-white/10 px-4 py-2 text-sm"><Download size={15}/> Download script JSON</button></div>}
-  {script&&<div className="rounded-2xl border border-white/10 bg-[#111521] p-5 sm:p-7"><h2 className="flex items-center gap-2 text-lg font-bold"><Scissors size={20} className="text-violet-300"/> 3. Cut clips</h2><p className="mt-2 text-sm leading-6 text-slate-400">Cuts each scene out of your video on this device. A timestamped SRT/VTT is required.</p><label className="mt-4 flex items-start gap-2 text-sm leading-5 text-slate-300"><input type="checkbox" className="mt-1" checked={fastCut} disabled={busy} onChange={e=>setFastCut(e.target.checked)}/><span><strong>Fast cut</strong> (recommended): copies the video without re-encoding, so it is many times faster. A clip can start a second or two early. Turn off for frame-accurate (slower) cuts.</span></label><button disabled={busy||!video} onClick={sliceVideoLocallyAction} className="mt-3 w-full rounded-xl bg-violet-500 px-4 py-3 font-bold disabled:opacity-50">{clips.length?`Re-slice ${clips.length} clips`:'Slice clips + build rough cut'}</button>{(busy&&stage.toLowerCase().includes('slic'))&&<div className="mt-3 h-2 overflow-hidden rounded bg-white/10"><div className="h-full bg-violet-400" style={{width:`${progress}%`}}/></div>}{clips.length>0&&<div className="mt-4 flex flex-wrap items-center justify-between gap-3 text-sm"><span className="text-emerald-300">{clips.length} local clips ready</span><button onClick={()=>setShowClipDownloads(value=>!value)} className="rounded-lg bg-white/10 px-3 py-2">{showClipDownloads?'Hide clip files':'Save individual clips'}</button>{roughCut&&<button onClick={()=>void downloadFile(roughCut,'Full_RoughCut.mp4')} className="rounded-lg bg-white/10 px-3 py-2">Save rough cut</button>}{showClipDownloads&&<div className="mt-3 grid w-full gap-2 sm:grid-cols-2">{clips.map(clip=><div key={clip.filename} className="flex items-center justify-between gap-2 rounded-lg border border-white/10 p-2"><span className="min-w-0 truncate text-xs text-slate-300">{clip.filename} · {(clip.size/1024/1024).toFixed(1)} MB</span><button onClick={()=>void downloadFile(clip.blob,clip.filename)} className="shrink-0 rounded bg-white/10 px-2 py-1 text-xs">Save</button></div>)}</div>}</div>}</div>}
-  {script&&<div className="rounded-2xl border border-emerald-400/20 bg-emerald-400/[.04] p-5 sm:p-7"><h2 className="flex items-center gap-2 text-lg font-bold"><FolderUp size={20} className="text-emerald-300"/> 4. Export clips + scripts</h2><p className="mt-2 text-sm leading-6 text-slate-400">Uploads each clip with a matching script text file, the full timeline script and the rough cut directly to your Google Drive. Keep this tab open until the upload finishes.</p><button disabled={busy||!driveToken||!script} onClick={exportDrive} className="mt-4 w-full rounded-xl bg-emerald-500 px-4 py-3 font-bold text-black disabled:opacity-40">{driveToken?'Export generated files to Google Drive':'Connect Google Drive to export'}</button>{driveFolder&&<button onClick={()=>void openDriveFolder()} className="mt-3 inline-block text-sm font-bold text-emerald-300 underline">Open exported Drive folder ↗</button>}</div>}</section>
-  <aside className="space-y-4"><div className="rounded-2xl border border-white/10 bg-[#111521] p-5"><h2 className="font-bold">Production workflow</h2>{['Load source video + transcript URL/file','Generate a script written for each clip','Cut the clips on your device (fast cut)','Upload clips + scripts to Drive'].map((t,i)=><div key={t} className="mt-4 flex gap-3 text-sm"><span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-white/10 text-xs">{i+1}</span><span className="text-slate-300">{t}</span></div>)}</div><div className="rounded-2xl border border-emerald-400/20 bg-emerald-400/[.05] p-5"><CheckCircle2 size={21} className="text-emerald-300"/><h2 className="mt-3 font-bold">Local-first privacy</h2><p className="mt-2 text-sm leading-6 text-slate-400">Video processing stays on your device. Text sent for AI generation is processed by your configured providers.</p></div><div className="rounded-2xl border border-white/10 bg-[#111521] p-5"><h2 className="font-bold">Build status</h2><p role="status" aria-live="polite" aria-atomic="true" className="mt-2 break-words text-sm leading-6 text-slate-300">{busy?<span className="flex items-center gap-2"><LoaderCircle className="animate-spin" size={16}/>{stage||'Working…'}</span>:notice||'Ready. Load an authorized direct video URL or choose a local source file, then add subtitles.'}</p>{notice&&<div className="mt-3 flex gap-2 text-xs text-slate-500"><AlertCircle size={15} className="shrink-0"/>Errors and status are shown here.</div>}</div></aside></div><footer className="mt-10 border-t border-white/10 pt-5 text-xs text-slate-500"><nav aria-label="Legal" className="flex flex-wrap gap-x-5 gap-y-2 text-violet-300"><Link href="/privacy">Privacy</Link><Link href="/terms">Terms</Link><Link href="/refunds">Refunds</Link><Link href="/acceptable-use">Acceptable use</Link></nav></footer></div></main>;
+</main>;
   async function sliceVideoLocallyAction() { await sliceVideo(); }
 }
 

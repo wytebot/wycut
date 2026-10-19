@@ -46,7 +46,7 @@ export default function LoginPage() {
   function continueToApp() {
     const params = new URLSearchParams(window.location.search);
     const next = params.get('next');
-    const safeNext = next && next.startsWith('/') && !next.startsWith('//') ? next : '/dashboard';
+    const safeNext = next && next.startsWith('/') && !next.startsWith('//') ? next : '/history';
     router.replace(safeNext);
   }
 
@@ -118,7 +118,7 @@ export default function LoginPage() {
 
   return <main className="min-h-screen bg-[#080a10] px-4 py-8 text-white sm:px-6">
     <div className="mx-auto max-w-md">
-      <Link href="/" className="inline-flex items-center gap-2 text-sm text-violet-300"><ArrowLeft size={16}/> Back to WyCut</Link>
+      <div className="mb-2 inline-flex items-center gap-2 text-sm font-semibold text-violet-300"><ArrowLeft size={16}/> WyCut Studio</div>
       <section className="mt-7 rounded-3xl border border-white/10 bg-[#111521] p-6 shadow-2xl shadow-black/30 sm:p-8">
         <div className="mb-7 flex items-center gap-3">
           <span className="grid h-12 w-12 place-items-center rounded-2xl bg-violet-500"><Clapperboard size={25}/></span>

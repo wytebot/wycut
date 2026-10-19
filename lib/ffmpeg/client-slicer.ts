@@ -71,7 +71,7 @@ async function openSource(ffmpeg: FFmpeg, file: File, name: string): Promise<{ p
 function safeName(value: string): string { return value.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 45) || 'scene'; }
 
 /** Re-encodes each clip to make trim boundaries frame-accurate. This is slower than stream copy and uses more CPU/memory. */
-export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgress?: (progress: number, current: number, total: number) => void, options: { fast?: boolean } = {}): Promise<SlicedClip[]> {
+export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgress?: (progress: number, current: number, total: number) => void, options: { fast?: boolean; aspectRatio?: '9:16' | '16:9' | '1:1' | '4:5'; resolution?: '720p' | '1080p' } = {}): Promise<SlicedClip[]> {
   return serialized(async () => {
   if (!file || file.size === 0) throw new Error('Choose a non-empty local video file.');
   const extension = (file.name.split('.').pop() || '').toLowerCase();
@@ -96,9 +96,19 @@ export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgr
       const duration = range.endSeconds - range.startSeconds;
       const start = range.startSeconds.toFixed(3); const length = duration.toFixed(3);
       // Fast cut copies the streams (no re-encode): seconds instead of minutes, but it starts at the nearest earlier keyframe.
-      let code = options.fast ? await ffmpeg.exec(['-ss', start, '-i', source.path, '-t', length, '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', '-y', output]) : -1;
-      if (code !== 0) code = await ffmpeg.exec(['-ss', start, '-i', source.path, '-t', length, '-map', '0:v:0', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', '-y', output]);
-      if (code !== 0) throw new Error(`FFmpeg failed while frame-accurately re-encoding ${filename}. The source may use an unsupported codec or this device may be out of memory.`);
+      const lowResolution = options.resolution === '720p';
+      const dimensions = options.aspectRatio === '9:16' ? (lowResolution ? '720:1280' : '1080:1920')
+        : options.aspectRatio === '16:9' ? (lowResolution ? '1280:720' : '1920:1080')
+        : options.aspectRatio === '1:1' ? (lowResolution ? '720:720' : '1080:1080')
+        : options.aspectRatio === '4:5' ? (lowResolution ? '720:900' : '1080:1350') : '';
+      const vf = dimensions ? `scale=${dimensions}:force_original_aspect_ratio=increase,crop=${dimensions},setsar=1` : '';
+      let code = options.fast && !options.aspectRatio ? await ffmpeg.exec(['-ss', start, '-i', source.path, '-t', length, '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', '-y', output]) : -1;
+      const encodeArgs = ['-ss', start, '-i', source.path, '-t', length, '-map', '0:v:0', '-map', '0:a?', ...(vf ? ['-vf', vf] : []), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', '-y', output];
+      if (code !== 0 && !(options.fast && file.size > 150 * 1024 * 1024)) code = await ffmpeg.exec(encodeArgs);
+      if (code !== 0) {
+        if (options.fast && file.size > 150 * 1024 * 1024) throw new Error(`Fast cutting could not read clip ${filename}. To protect memory on this large source, WyCut did not automatically retry with a memory-heavy re-encode. Try another MP4/MOV copy or disable Fast Cut only for smaller files.`);
+        throw new Error(`FFmpeg failed while cutting ${filename}. The source may use an unsupported codec or this device may be out of memory.`);
+      }
       const data = await ffmpeg.readFile(output);
       if (typeof data === 'string' || data.length === 0) throw new Error(`FFmpeg produced an empty clip for ${filename}.`);
       const bytes = new Uint8Array(data as Uint8Array);
@@ -210,6 +220,63 @@ export async function extractAudioChunksLocally(file: File, chunkSeconds: number
       ffmpeg.off('progress', handler);
       await source?.close();
       for (const n of created) { try { await ffmpeg.deleteFile(n); } catch { /* cleanup is best effort */ } }
+    }
+  });
+}
+
+export type LocalAudioLayer = { blob: Blob; name: string; startSeconds: number; volume: number; loop?: boolean };
+
+/** Mixes user-provided/generated audio layers into an existing MP4 locally. Guard the caller against huge blobs first. */
+export async function mixAudioTracksLocally(video: Blob, tracks: LocalAudioLayer[], onProgress?: (progress: number) => void): Promise<Blob> {
+  return serialized(async () => {
+    if (!video.size) throw new Error('The recap video is empty. Re-create the rough cut and try again.');
+    if (!tracks.length || tracks.length > 12) throw new Error('Add between 1 and 12 sound layers before mixing.');
+    for (const [i, track] of tracks.entries()) {
+      if (!track.blob.size) throw new Error(`Sound layer ${i + 1} is empty. Remove it and add it again.`);
+      if (!Number.isFinite(track.startSeconds) || track.startSeconds < 0) throw new Error(`Sound layer ${i + 1} has an invalid start time.`);
+      if (!Number.isFinite(track.volume) || track.volume < 0 || track.volume > 1) throw new Error(`Sound layer ${i + 1} has an invalid volume.`);
+    }
+    const ffmpeg = await getFFmpeg();
+    const videoName = `mix_video_${Date.now()}.mp4`;
+    const audioNames: string[] = [];
+    const handler = ({ progress }: { progress: number }) => onProgress?.(Math.min(1, Math.max(0, progress)));
+    ffmpeg.on('progress', handler);
+    try {
+      await ffmpeg.writeFile(videoName, await fetchFile(video));
+      for (let i = 0; i < tracks.length; i++) {
+        const ext = /wav/i.test(tracks[i].blob.type) ? 'wav' : /ogg/i.test(tracks[i].blob.type) ? 'ogg' : /aac/i.test(tracks[i].blob.type) ? 'aac' : /m4a/i.test(tracks[i].blob.type) ? 'm4a' : /flac/i.test(tracks[i].blob.type) ? 'flac' : 'mp3';
+        const name = `mix_sound_${i}_${Date.now()}.${ext}`;
+        await ffmpeg.writeFile(name, await fetchFile(tracks[i].blob)); audioNames.push(name);
+      }
+      const buildFilter = (includeOriginal: boolean) => {
+        const filters: string[] = []; const inputs: string[] = [];
+        if (includeOriginal) { filters.push('[0:a]volume=0.55[baseaudio]'); inputs.push('[baseaudio]'); }
+        tracks.forEach((track, i) => {
+          const delay = Math.max(0, Math.round(track.startSeconds * 1000));
+          filters.push(`[${i + 1}:a]adelay=${delay}|${delay},volume=${Math.max(0, Math.min(1, track.volume)).toFixed(2)}[fx${i}]`);
+          inputs.push(`[fx${i}]`);
+        });
+        filters.push(`${inputs.join('')}amix=inputs=${inputs.length}:duration=longest:dropout_transition=2,alimiter=limit=0.95[aout]`);
+        return filters.join(';');
+      };
+      const outputName = `mix_output_${Date.now()}.mp4`;
+      const baseArgs = ['-i', videoName, ...audioNames.flatMap((name, i) => [...(tracks[i].loop ? ['-stream_loop', '-1'] : []), '-i', name])];
+      // Prefer preserving the movie's original audio. If it has no audio stream, retry with just the added sound layers.
+      let code = await ffmpeg.exec([...baseArgs, '-filter_complex', buildFilter(true), '-map', '0:v:0', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart', '-y', outputName]);
+      if (code !== 0) {
+        try { await ffmpeg.deleteFile(outputName); } catch { /* retry output may not exist */ }
+        code = await ffmpeg.exec([...baseArgs, '-filter_complex', buildFilter(false), '-map', '0:v:0', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', ...(tracks.some(track => track.loop) ? ['-shortest'] : []), '-movflags', '+faststart', '-y', outputName]);
+      }
+      if (code !== 0) throw new Error('FFmpeg could not mix the audio layers. Try shorter MP3/WAV files, reduce the number of layers, or export the video and sounds separately.');
+      const output = await ffmpeg.readFile(outputName);
+      if (typeof output === 'string' || !output.length) throw new Error('The audio mix produced an empty file. Try again with a shorter video.');
+      onProgress?.(1);
+      return new Blob([new Uint8Array(output as Uint8Array)], { type: 'video/mp4' });
+    } finally {
+      ffmpeg.off('progress', handler);
+      for (const name of [videoName, ...audioNames]) { try { await ffmpeg.deleteFile(name); } catch { /* cleanup is best effort */ } }
+      try { await ffmpeg.deleteFile(`mix_output_${Date.now()}.mp4`); } catch { /* timestamp differs; output cleanup below is best effort */ }
+      try { const files = await ffmpeg.listDir('.'); for (const item of files) if (!item.isDir && item.name.startsWith('mix_output_') && item.name.endsWith('.mp4')) { try { await ffmpeg.deleteFile(item.name); } catch { /* ignore */ } } } catch { /* cleanup is best effort */ }
     }
   });
 }

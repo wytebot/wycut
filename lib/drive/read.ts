@@ -1,6 +1,6 @@
 /** Reads a finished production kit straight from the user's Google Drive. Nothing is copied into local storage. */
 const DRIVE_API = 'https://www.googleapis.com/drive/v3/files';
-export type DriveItem = { id: string; name: string; mimeType: string; size: number; webViewLink?: string; thumbnailLink?: string };
+export type DriveItem = { id: string; name: string; mimeType: string; size: number; webViewLink?: string; thumbnailLink?: string; modifiedTime?: string };
 export type DriveKit = { videos: DriveItem[]; voices: DriveItem[]; master: DriveItem[] };
 export class DriveReadError extends Error { constructor(message: string, readonly kind: 'auth' | 'missing' | 'other') { super(message); } }
 
@@ -22,6 +22,30 @@ async function listChildren(parentId: string, token: string): Promise<DriveItem[
   } while (pageToken);
   return items;
 }
+
+/** Lists only WyCut project folders created in the connected user's Drive. */
+export async function listWyCutProjectFolders(token: string): Promise<Array<{ id: string; name: string; webViewLink?: string; modifiedTime?: string }>> {
+  if (!token) throw new DriveReadError('Connect Google Drive to view your project history.', 'auth');
+  const q = encodeURIComponent("trashed=false and mimeType='application/vnd.google-apps.folder' and name contains 'WyCut_'");
+  const url = `${DRIVE_API}?q=${q}&pageSize=100&orderBy=modifiedTime%20desc&fields=nextPageToken,files(id,name,webViewLink,modifiedTime,mimeType)`;
+  const data = await driveJson<{ files?: Array<{ id: string; name: string; webViewLink?: string; modifiedTime?: string; mimeType?: string }> }>(url, token);
+  return (data.files || []).filter(f => f.id && f.name.startsWith('WyCut_'));
+}
+
+export async function deleteDriveFile(token: string, fileId: string): Promise<void> {
+  if (!token || !fileId) throw new DriveReadError('Reconnect Google Drive before deleting a project.', 'auth');
+  const meta = await driveJson<{ mimeType?: string; trashed?: boolean }>(`${DRIVE_API}/${encodeURIComponent(fileId)}?fields=id,mimeType,trashed`, token);
+  if (meta.trashed) return;
+  if (meta.mimeType === 'application/vnd.google-apps.folder') {
+    const children = await listChildren(fileId, token);
+    // Delete children before the folder so its exports do not become orphaned in the user's Drive.
+    for (const child of children) await deleteDriveFile(token, child.id);
+  }
+  const response = await fetch(`${DRIVE_API}/${encodeURIComponent(fileId)}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` }, cache: 'no-store' });
+  if (response.status === 401) throw new DriveReadError('Google Drive access expired. Reconnect Drive and try again.', 'auth');
+  if (response.status !== 204 && !response.ok) throw new DriveReadError(`Could not delete this project from Drive (HTTP ${response.status}).`, 'other');
+}
+
 export async function loadProductionKit(token: string, rootFolderId: string): Promise<DriveKit> {
   const meta = await driveJson<{ trashed?: boolean }>(`${DRIVE_API}/${encodeURIComponent(rootFolderId)}?fields=id,trashed`, token);
   if (meta.trashed) throw new DriveReadError('This kit is in your Google Drive trash.', 'missing');

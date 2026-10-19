@@ -1,6 +1,6 @@
 /* WyCut PWA service worker. Never cache API responses, authentication, billing, or private Drive data. */
 'use strict';
-const CACHE_VERSION = 'wycut-pwa-v1';
+const CACHE_VERSION = 'wycut-pwa-v38';
 const APP_SHELL = [
   '/offline.html',
   '/manifest.webmanifest',

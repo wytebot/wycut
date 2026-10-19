@@ -37,7 +37,7 @@ export async function POST(req: NextRequest) {
     }, { status: 503, headers: { 'Cache-Control': 'no-store' } });
   }
   try {
-    const result = await generateRecapScript({ title: body.title, transcript: body.transcript, targetRuntimeSeconds: body.targetRuntimeSeconds ?? 600, beatCount: body.beatCount ?? 38 });
+    const result = await generateRecapScript({ title: body.title, transcript: body.transcript, targetRuntimeSeconds: body.targetRuntimeSeconds ?? 600, beatCount: Math.min(15, Math.max(10, Math.floor(Number(body.beatCount) || 12))) });
     await markRecapCreditConsumed(usageId, result.script);
     const srtRanges = [...body.transcript.matchAll(/(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})/g)];
     const vttRanges = [...body.transcript.matchAll(/(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2})\.(\d{3})/g)];

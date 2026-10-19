@@ -7,7 +7,7 @@ export type NarrativeBeat = { index: number; id: string; title: string; startSec
 export type RecapScript = { title: string; targetRuntimeSeconds: number; beats: NarrativeBeat[] };
 export type ScriptInput = { title: string; transcript: string; targetRuntimeSeconds?: number; beatCount?: number };
 
-const schema = `Return ONLY JSON with shape {"title":string,"targetRuntimeSeconds":600,"beats":[{"index":1,"id":"intro","title":"Opening hook","startSeconds":0,"endSeconds":12,"narration":"...","dialogueCues":[{"startSeconds":3,"endSeconds":5,"quote":"...","instruction":"LET MOVIE AUDIO PLAY"}],"act":1}]}. Make the requested number of distinct beats (within four beats of the target count), match the narration word-count target supplied in the prompt, and distribute beats across five acts. Timestamps must refer to the supplied transcript/source timeline and must be nonnegative with endSeconds > startSeconds. Never invent exact source timestamps when the input has no timing data: use estimated ranges and state this in title or beat notes. Dialogue cues are optional and must be short; do not reproduce long copyrighted dialogue. Write original commentary, analysis and transitions, not a substitute for watching the film. Acts must be integers 1 through 5. IDs must be short lowercase snake_case.`;
+const schema = `Return ONLY JSON with shape {"title":string,"targetRuntimeSeconds":600,"beats":[{"index":1,"id":"intro","title":"Opening hook","startSeconds":0,"endSeconds":12,"narration":"...","dialogueCues":[{"startSeconds":3,"endSeconds":5,"quote":"...","instruction":"LET MOVIE AUDIO PLAY"}],"act":1}]}. Make 10 to 15 distinct beats for the short-form recap workflow (aim for the requested target count), match the narration word-count target supplied in the prompt, and distribute beats across five acts. Timestamps must refer to the supplied transcript/source timeline and must be nonnegative with endSeconds > startSeconds. Never invent exact source timestamps when the input has no timing data: use estimated ranges and state this in title or beat notes. Dialogue cues are optional and must be short; do not reproduce long copyrighted dialogue. Write original commentary, analysis and transitions, not a substitute for watching the film. Acts must be integers 1 through 5. IDs must be short lowercase snake_case.`;
 
 export class ScriptValidationError extends Error { constructor(message: string) { super(message); this.name = 'ScriptValidationError'; } }
 function checkedScript(raw: string, count: number, runtime: number, ranges: SourceCueRange[]): RecapScript {
@@ -34,7 +34,7 @@ function validateScript(value: unknown, requestedCount: number, runtime: number,
   if (!value || typeof value !== 'object') throw new Error('Invalid script object.');
   const v = value as Record<string, unknown>;
   if (typeof v.title !== 'string' || !v.title.trim() || !Array.isArray(v.beats)) throw new Error('Script is missing a title or beats array.');
-  if (v.beats.length < Math.max(8, requestedCount - 12) || v.beats.length > Math.min(70, requestedCount + 12)) throw new Error(`Script returned ${v.beats.length} beats; expected about ${requestedCount}.`);
+  if (requestedCount >= 10 && requestedCount <= 15 ? (v.beats.length < 10 || v.beats.length > 15) : (v.beats.length < Math.max(8, requestedCount - 12) || v.beats.length > Math.min(70, requestedCount + 12))) throw new Error(`Script returned ${v.beats.length} beats; expected about ${requestedCount}.`);
   const beats = v.beats.map((raw, i) => {
     if (!raw || typeof raw !== 'object') throw new Error(`Beat ${i + 1} is invalid.`);
     const b = raw as Record<string, unknown>;
@@ -89,7 +89,7 @@ export async function generateRecapScript(input: ScriptInput): Promise<{ script:
   if (!title || transcript.length < 40) throw new Error('Provide a title and at least 40 characters of transcript/subtitle text.');
   if (transcript.length > 120_000) throw new Error('Transcript exceeds the 120,000-character limit. Split it into sections first.');
   const runtime = Math.min(900, Math.max(300, Math.floor(input.targetRuntimeSeconds ?? 600)));
-  const count = Math.min(45, Math.max(10, Math.floor(input.beatCount ?? 38)));
+  const count = Math.min(15, Math.max(10, Math.floor(input.beatCount ?? 12)));
   const timestampMatches = [...transcript.matchAll(/(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})/g)];
   const vttMatches = [...transcript.matchAll(/(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2})\.(\d{3})/g)];
   const sourceRanges: SourceCueRange[] = timestampMatches.length
