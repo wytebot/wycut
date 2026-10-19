@@ -1,2 +1,2 @@
-import { DashboardWorkspace } from '@/components/dashboard-workspace';
-export default function DashboardPage() { return <DashboardWorkspace initialFlow="subtitles" />; }
+// The studio itself lives in components/app-shell.tsx so a running generation survives page changes.
+export default function Page() { return null; }

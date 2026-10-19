@@ -1,5 +1,6 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
+import { extractAacTrack } from './audio-demux';
 
 export type ClipRange = { index: number; id: string; startSeconds: number; endSeconds: number };
 export type SlicedClip = { filename: string; blob: Blob; size: number };
@@ -22,12 +23,19 @@ async function getFFmpeg(): Promise<FFmpeg> {
   if (!ffmpeg.loaded) {
     if (!loadPromise) {
       loadPromise = (async () => {
-        const base = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd';
-        // Keep the core and JS wrapper on the same pinned 0.12.10 version to avoid ABI mismatches.
-        const [coreURL, wasmURL] = await Promise.all([
-          toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
-          toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'),
-        ]);
+        // Prefer the copy bundled with the app (cached, works offline, no 30 MB download each time); fall back to the CDN.
+        const sources = ['/ffmpeg', 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd'];
+        let coreURL = ''; let wasmURL = ''; let lastError: unknown = null;
+        for (const base of sources) {
+          try {
+            [coreURL, wasmURL] = await Promise.all([
+              toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
+              toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'),
+            ]);
+            lastError = null; break;
+          } catch (error) { lastError = error; }
+        }
+        if (lastError || !coreURL) throw lastError instanceof Error ? lastError : new Error('Could not load the video engine.');
         await ffmpeg.load({ coreURL, wasmURL });
         return ffmpeg;
       })().finally(() => { loadPromise = null; });
@@ -153,14 +161,19 @@ export async function extractAudioChunksLocally(file: File, chunkSeconds: number
     const extension = (file.name.split('.').pop() || '').toLowerCase();
     if (!['mp4', 'm4v', 'mov'].includes(extension)) throw new Error('Audio extraction supports MP4, M4V and MOV sources.');
     if (file.size > MAX_SOURCE_BYTES) throw new Error(`This video is larger than ${MAX_SOURCE_LABEL}. Use a smaller copy or upload subtitles instead.`);
+    // Fast path: copy just the audio track out of the video (reads ~2-3% of the file), then let FFmpeg work on that small file.
+    const demuxed = await extractAacTrack(file, p => onProgress?.(p * 0.5));
+    const workFile = demuxed?.file ?? file;
+    const workExtension = demuxed ? 'aac' : extension;
+    const base = demuxed ? 0.5 : 0; const span = demuxed ? 0.5 : 1;
     const ffmpeg = await getFFmpeg();
-    const sourceName = `audio_src_${Date.now()}.${extension}`;
-    const handler = ({ progress }: { progress: number }) => onProgress?.(Math.min(1, Math.max(0, progress)));
+    const sourceName = `audio_src_${Date.now()}.${workExtension}`;
+    const handler = ({ progress }: { progress: number }) => onProgress?.(base + Math.min(1, Math.max(0, progress)) * span);
     ffmpeg.on('progress', handler);
     const created: string[] = [];
     let source: Awaited<ReturnType<typeof openSource>> | null = null;
     try {
-      source = await openSource(ffmpeg, file, sourceName);
+      source = await openSource(ffmpeg, workFile, sourceName);
       const attempts: Array<{ ext: string; mime: string; codec: string[] }> = [
         { ext: 'mp3', mime: 'audio/mp3', codec: ['-c:a', 'libmp3lame', '-b:a', '24k'] },
         { ext: 'aac', mime: 'audio/aac', codec: ['-c:a', 'aac', '-b:a', '32k'] },

@@ -21,3 +21,16 @@ No dependencies were installed in the build environment: `npm install`, `npm run
 - Videos picked from the device are now read in place (FFmpeg WORKERFS) instead of being copied into memory twice, so the 80/100/300 MB limits are gone; the cap is 2 GB. Downloads from a URL still have to be held in RAM and keep the smaller limit.
 - The last (shorter) audio part is no longer billed as a full 5-minute part.
 - Rough-cut joining is skipped (clips are still saved) when the clips total more than 150 MB on phones / 500 MB on desktop.
+
+## v30.4 — fast audio extraction
+- Audio is now copied straight out of the MP4/MOV (reads only the movie header and the audio byte ranges, no re-encode) into a small .aac file, and FFmpeg only processes that. Typically seconds instead of minutes, far less memory, and the 2 GB cap stays. If the audio is not plain AAC or anything fails to parse, it silently uses the old full-file FFmpeg path.
+- FFmpeg core is served from /ffmpeg (copied by postinstall from @ffmpeg/core, bundled into the APK) with the unpkg CDN as fallback.
+- New dependencies: mp4box, @ffmpeg/core (run npm install). Not run/tested in the build environment: run typecheck and try a real phone video.
+
+## v30.5 — menu + history
+- Collapsible floating menu (bottom-right): tap to expand, tap anywhere else on the screen to collapse. Items: Subtitles recap, Video file, Video URL, History, Credits & billing, Account. Shows a pulsing dot while a generation is running.
+- The studio now stays mounted while you move between pages (components/app-shell.tsx), so opening History/Billing no longer interrupts a running generation.
+- New /history page: Ongoing and Completed tabs. Ongoing projects are saved locally (IndexedDB) at every stage: transcript, script, narration parts, progress. After an app restart tap Resume to return to the project; paid transcription parts and narration are reused, never charged twice. Re-pick the source video to slice clips again.
+- Completed projects (exported to Drive) keep only a Drive folder reference locally. Clips, rough cut, voice files, captions and script are read live from the user's Drive (watch/listen/save/read) and are not stored on the device.
+- The screen stays awake while a job runs. Android may still freeze or kill a backgrounded WebView; the checkpoints make that recoverable. Truly continuous background work would need a native foreground-service plugin.
+- Not run here: run npm install, typecheck, lint and test on a phone.

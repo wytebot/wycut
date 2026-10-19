@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from 'next';
 import PWARegister from '@/components/pwa-register';
+import { AppShell } from '@/components/app-shell';
 import './globals.css';
 
 export const viewport: Viewport = {
@@ -42,5 +43,5 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  return <html lang="en"><body>{children}<PWARegister /></body></html>;
+  return <html lang="en"><body><AppShell>{children}</AppShell><PWARegister /></body></html>;
 }

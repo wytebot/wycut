@@ -2,6 +2,7 @@ import { extractAudioChunksLocally, type AudioChunk } from '@/lib/ffmpeg/client-
 import { apiUrl } from '@/lib/api-client';
 import { transcribeCredits } from '@/lib/billing/pricing';
 import { TopUpError } from '@/lib/billing/client-errors';
+import { getChunk, putChunk } from '@/lib/projects/store';
 
 const CHUNK_SECONDS = 300;
 const MAX_TRANSCRIPT_CHARS = 110_000; // script API limit is 120,000 characters
@@ -65,7 +66,8 @@ export async function transcribeVideoToSrt(video: File, getToken: () => Promise<
   const chunks = await extractAudioChunksLocally(video, CHUNK_SECONDS, p => onStatus('Extracting audio from your video on this device…', 3 + Math.round(p * 7)));
   const results: ApiSegment[][] = new Array(chunks.length);
   const keyFor = (i: number) => (options.cacheKey ? `${options.cacheKey}:${chunks.length}:${i}` : '');
-  chunks.forEach((_, i) => { const cached = keyFor(i) ? chunkCache.get(keyFor(i)) : undefined; if (cached) results[i] = cached; });
+  // Paid parts survive an app restart too: re-picking the same video finds them again, so nothing is paid for twice.
+  for (let i = 0; i < chunks.length; i++) { const key = keyFor(i); if (!key) continue; const cached = chunkCache.get(key) || await getChunk<ApiSegment[]>(key) || undefined; if (cached) { results[i] = cached; chunkCache.set(key, cached); } }
   // Check the balance for the whole video BEFORE paying for any part, so a short balance never leaves a half-transcribed video.
   const needed = chunks.reduce((sum, chunk, i) => sum + (results[i] ? 0 : transcribeCredits(chunk.durationSeconds)), 0);
   if (needed > 0 && options.ensureCredits) await options.ensureCredits(needed);
@@ -76,7 +78,7 @@ export async function transcribeVideoToSrt(video: File, getToken: () => Promise<
       if (i >= chunks.length) return;
       if (results[i]) continue;
       results[i] = await transcribeChunk(chunks[i], getToken);
-      if (keyFor(i)) chunkCache.set(keyFor(i), results[i]);
+      if (keyFor(i)) { chunkCache.set(keyFor(i), results[i]); void putChunk(keyFor(i), results[i]); }
       done++;
       onStatus(`Transcribing audio… ${done} of ${chunks.length} parts`, 10 + Math.round(done / chunks.length * 12));
     }

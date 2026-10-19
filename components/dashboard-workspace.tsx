@@ -15,6 +15,8 @@ import type { RecapScript } from '@/lib/ai/script-generator';
 import { transcribeVideoToSrt } from '@/lib/transcribe/client';
 import { LOW_BALANCE_CREDITS, SCRIPT_CREDITS_MAX, SCRIPT_CREDITS_MIN, formatCredits, narrationCredits, scriptCredits, transcribeCreditsForVideo } from '@/lib/billing/pricing';
 import { TopUpError } from '@/lib/billing/client-errors';
+import { saveProject, getProject, getNarrationParts, putNarrationPart, deleteNarrationParts, newProjectId, liveProjects } from '@/lib/projects/store';
+import { OPEN_PROJECT_EVENT, CONNECT_DRIVE_EVENT, DRIVE_TOKEN_EVENT, takePendingProject } from '@/lib/projects/bus';
 
 type GoogleTokenResponse = { access_token?: string; expires_in?: number; error?: string };
 type GoogleIdentity = { accounts: { oauth2: { initTokenClient: (config: { client_id: string; scope: string; callback: (response: GoogleTokenResponse) => void }) => { requestAccessToken: (options?: { prompt?: string }) => void } } } };
@@ -24,7 +26,7 @@ type SourceMode = 'url' | 'file' | 'subtitles';
 const MAX_SUBTITLE_URL_BYTES = 5 * 1024 * 1024;
 const DRIVE_TOKEN_KEY = 'wycut_drive_access_token';
 const DRIVE_TOKEN_EXPIRY_KEY = 'wycut_drive_access_token_expiry';
-function persistDriveToken(token: string, expiresIn = 3600) { try { localStorage.setItem(DRIVE_TOKEN_KEY, token); localStorage.setItem(DRIVE_TOKEN_EXPIRY_KEY, String(Date.now() + Math.max(60, expiresIn - 120) * 1000)); } catch { /* storage may be disabled */ } }
+function persistDriveToken(token: string, expiresIn = 3600) { try { localStorage.setItem(DRIVE_TOKEN_KEY, token); localStorage.setItem(DRIVE_TOKEN_EXPIRY_KEY, String(Date.now() + Math.max(60, expiresIn - 120) * 1000)); window.dispatchEvent(new Event(DRIVE_TOKEN_EVENT)); } catch { /* storage may be disabled */ } }
 function clearPersistedDriveToken() { try { localStorage.removeItem(DRIVE_TOKEN_KEY); localStorage.removeItem(DRIVE_TOKEN_EXPIRY_KEY); } catch { /* ignore */ } }
 function platformWatchUrl(value: string): 'YouTube' | 'TikTok' | null { try { const host = new URL(value).hostname.toLowerCase().replace(/^www\./, ''); if (host === 'youtube.com' || host === 'm.youtube.com' || host === 'youtu.be' || host === 'youtube-nocookie.com') return 'YouTube'; if (host === 'tiktok.com' || host.endsWith('.tiktok.com')) return 'TikTok'; return null; } catch { return null; } }
 function transcriptText(raw: string, name = ''): string { const isVtt = /^\s*WEBVTT/i.test(raw) || /\.vtt(?:$|[?#])/i.test(name); if (!isVtt) return raw.replace(/^\uFEFF/, '').trim(); return raw.replace(/^\uFEFF?WEBVTT[^\n]*\n/i, '').replace(/<[^>]+>/g, '').replace(/(\d{2}:\d{2}:\d{2}\.\d{3})\s+[^-\n]+(-->)/g, '$1 $2').trim(); }
@@ -143,6 +145,10 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
   const [notice, setNotice] = useState(''); const [busy, setBusy] = useState(false); const [authEmail, setAuthEmail] = useState(''); const [credits, setCredits] = useState<number | null>(null); const [freeAccess, setFreeAccess] = useState(false); const [needsTopUp, setNeedsTopUp] = useState(false); const [videoSeconds, setVideoSeconds] = useState(0);
   const narrationCache = useRef(new Map<string, { id: string; text: string; audioBase64: string }>()); const [stage, setStage] = useState(''); const [progress, setProgress] = useState(0);
   useEffect(() => { setMode(initialFlow); }, [initialFlow]);
+  // ---- local project history: every stage is checkpointed so work can be resumed from the History page ----
+  const projectIdRef = useRef(''); const keepOutputs = useRef(false); const exportedRef = useRef(false); const restoredTranscript = useRef<string | null>(null);
+  const [autoRebuild, setAutoRebuild] = useState(false); const lastCheckpoint = useRef(0);
+  const checkpoint = (patch: Parameters<typeof saveProject>[1]) => { if (projectIdRef.current) void saveProject(projectIdRef.current, patch); };
   const noticeRef = useRef<HTMLParagraphElement | null>(null);
   // Remember the transcript made from the video so a retry never pays for transcription twice.
   const transcriptCache = useRef<{ key: string; text: string } | null>(null);
@@ -181,7 +187,7 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
   }
   useEffect(() => { if (Capacitor.isNativePlatform()) return; let active = true; void loadGoogleIdentityServices().then(() => { if (active) { setGoogleReady(true); setGoogleLoadError(''); } }).catch(error => { if (active) setGoogleLoadError(error instanceof Error ? error.message : 'Google Drive sign-in could not load.'); }); return () => { active = false; }; }, []);
   useEffect(() => { if (!googleReady || Capacitor.isNativePlatform()) return; let connected = false; let expires = 0; try { connected = Boolean(localStorage.getItem(DRIVE_TOKEN_KEY)); expires = Number(localStorage.getItem(DRIVE_TOKEN_EXPIRY_KEY) || 0); } catch { return; } if (!connected || expires > Date.now() || !window.google?.accounts?.oauth2) return; const clientId = process.env.NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID; if (!clientId || !clientId.endsWith('.apps.googleusercontent.com')) return; const client = window.google.accounts.oauth2.initTokenClient({ client_id: clientId, scope: 'https://www.googleapis.com/auth/drive.file', callback: (response) => { if (response.access_token && !response.error) { persistDriveToken(response.access_token, response.expires_in || 3600); setDriveToken(response.access_token); setNotice('Google Drive connection refreshed automatically.'); } else { setNotice('Your Google Drive connection is saved, but Google requires you to reconnect to renew permission. Tap Reconnect Drive.'); } } }); try { client.requestAccessToken({ prompt: '' }); } catch { /* silent refresh can be blocked; keep saved connection and offer manual reconnect */ } }, [googleReady]);
-  const clearGeneratedOutputs = () => { setScript(null); setRecapId(''); setHasSourceTimecodes(false); setNarration(null); setClips([]); setRoughCut(null); };
+  const clearGeneratedOutputs = () => { projectIdRef.current = ''; keepOutputs.current = false; exportedRef.current = false; restoredTranscript.current = null; setScript(null); setRecapId(''); setHasSourceTimecodes(false); setNarration(null); setClips([]); setRoughCut(null); };
   const selectFile = (candidate?: File) => {
     if (!candidate) return;
     if (!/\.(srt|vtt|txt)$/i.test(candidate.name) && !['text/plain','text/vtt','application/x-subrip'].includes(candidate.type)) {
@@ -209,7 +215,9 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
       setNotice(`This video is larger than ${MAX_SOURCE_LABEL}. Use a lower-resolution copy or split it first. Previous video outputs were cleared.`);
       return;
     }
-    setVideo(candidate); clearGeneratedOutputs(); setNotice('');
+    setVideo(candidate);
+    if (keepOutputs.current && projectIdRef.current) { setClips([]); setRoughCut(null); setNotice(`Video ready. Your saved project was restored, so you can slice clips now.`); checkpoint({ sourceName: candidate.name, sourceSize: candidate.size }); }
+    else { clearGeneratedOutputs(); setNotice(''); }
   }
   async function downloadFile(blob: Blob, name: string) {
     try { await download(blob, name); }
@@ -292,6 +300,7 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
     } finally { setBusy(false); setStage(''); }
   }
   async function getTranscript(): Promise<{ text: string; label: string }> {
+    if (restoredTranscript.current && !file && !(mode === 'url' && subtitleUrl.trim())) return { text: restoredTranscript.current, label: title || 'Restored project' };
     if (mode === 'url' && subtitleUrl.trim()) {
       let parsed: URL; try { parsed = new URL(subtitleUrl.trim()); } catch { throw new Error('Enter a valid HTTPS subtitle/transcript URL.'); }
       if (parsed.protocol !== 'https:') throw new Error('Subtitle URLs must use HTTPS.');
@@ -318,10 +327,14 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
   }
   async function generateScript() {
     if (busy) return;
+    if (exportedRef.current) { projectIdRef.current = ''; exportedRef.current = false; }
+    if (!projectIdRef.current) projectIdRef.current = newProjectId();
+    checkpoint({ title: title.trim() || 'My Movie', mode, status: 'running', stage: 'Starting…', progress: 0, error: null, sourceName: video?.name ?? file?.name, sourceSize: video?.size ?? file?.size, subtitleUrl: subtitleUrl.trim() || null, videoUrl: url.trim() || null });
     setBusy(true); setNeedsTopUp(false); setStage('Checking source and preparing transcript…'); setProgress(5); setNotice('');
     setScript(null); setRecapId(''); setNarration(null); setClips([]); setRoughCut(null); setHasSourceTimecodes(false);
     try {
       const source = await getTranscript();
+      checkpoint({ transcript: source.text.slice(0, 400_000) });
       if (!source.text.trim() || source.text.trim().length < 40) throw new Error('The selected transcript is empty or too short. Upload a readable SRT, VTT or TXT transcript, or enter a public subtitle URL.');
       setStage('Refreshing sign-in and checking generation access…'); setProgress(15);
       let freshIdToken: string;
@@ -351,7 +364,7 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
         throw new Error(`${data.error || `Script generation failed (HTTP ${response.status}).`}${code}`);
       }
       if (!data.script || !Array.isArray(data.script.beats) || data.script.beats.length === 0) throw new Error('The AI request returned successfully but no usable script was included. Check the configured AI provider and server logs.');
-      setScript(data.script); setRecapId(data.recapId || ''); setHasSourceTimecodes(data.hasSourceTimecodes === true); setNarration(null); setClips([]); setRoughCut(null); setProgress(100);
+      setScript(data.script); setRecapId(data.recapId || ''); setHasSourceTimecodes(data.hasSourceTimecodes === true); setNarration(null); setClips([]); setRoughCut(null); setProgress(100); keepOutputs.current = true; checkpoint({ script: data.script, recapId: data.recapId || '', hasSourceTimecodes: data.hasSourceTimecodes === true, narrationReady: null, narrationParts: null, clipCount: null, roughCut: null });
       void loadBalance(freshIdToken); setNotice(`Script generated with ${data.provider || 'AI'}. ${data.script.beats.length} beats ready. ${data.hasSourceTimecodes ? 'Timestamped subtitle timeline detected; review cut points.' : 'No source timestamps found; upload matching SRT/VTT before slicing.'}`);
     } catch (e) {
       if (e instanceof TopUpError) setNeedsTopUp(true);
@@ -362,6 +375,56 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
     } finally { setBusy(false); setStage(''); setProgress(0); }
   }
 
+  // Progress checkpoints (throttled), live/interrupted tracking and a screen wake lock while a job runs.
+  useEffect(() => {
+    const id = projectIdRef.current; if (!id) return;
+    if (busy) {
+      liveProjects.add(id);
+      const now = Date.now(); if (now - lastCheckpoint.current > 1500) { lastCheckpoint.current = now; void saveProject(id, { status: 'running', stage: stage || 'Working…', progress }); }
+    }
+  }, [busy, stage, progress]);
+  useEffect(() => {
+    if (busy) return; const id = projectIdRef.current; if (!id) return;
+    liveProjects.delete(id);
+    if (exportedRef.current) return;
+    const failed = /fail|could not|error|expired|top up|not enough|\[[A-Z_]+\]/i.test(notice);
+    void saveProject(id, { status: failed ? 'failed' : 'idle', stage: null, progress: null, error: failed ? notice.slice(0, 400) : null });
+  }, [busy]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!busy || typeof navigator === 'undefined') return; type Lock = { release: () => Promise<void> }; let lock: Lock | null = null; let cancelled = false;
+    const acquire = async () => { try { const wl = (navigator as Navigator & { wakeLock?: { request: (t: 'screen') => Promise<Lock> } }).wakeLock; if (wl && !cancelled && document.visibilityState === 'visible') lock = await wl.request('screen'); } catch { /* not allowed */ } };
+    const onVisible = () => { if (document.visibilityState === 'visible') void acquire(); else if (projectIdRef.current) void saveProject(projectIdRef.current, { status: 'running', stage: stage || 'Working…', progress }); };
+    void acquire(); document.addEventListener('visibilitychange', onVisible);
+    return () => { cancelled = true; document.removeEventListener('visibilitychange', onVisible); void lock?.release().catch(() => undefined); };
+  }, [busy]); // eslint-disable-line react-hooks/exhaustive-deps
+  async function openProject(id: string) {
+    if (!id || projectIdRef.current === id) return;
+    if (busy) { setNotice('Wait for the current generation to finish before opening another project.'); return; }
+    const record = await getProject(id);
+    if (!record) { setNotice('That project is no longer stored on this device.'); return; }
+    clearGeneratedOutputs(); setVideo(null); setFile(null); setNeedsTopUp(false);
+    projectIdRef.current = record.id; keepOutputs.current = true; exportedRef.current = record.status === 'exported';
+    setTitle(record.title); setMode(record.mode); setSubtitleUrl(record.subtitleUrl || ''); setUrl(record.videoUrl || '');
+    restoredTranscript.current = record.transcript || null;
+    if (record.script) {
+      const parts = await getNarrationParts(record.id); parts.forEach((value, key) => narrationCache.current.set(key, value));
+      setScript(record.script); setRecapId(record.recapId || ''); setHasSourceTimecodes(record.hasSourceTimecodes === true);
+      if (record.narrationReady && parts.size) setAutoRebuild(true);
+      setNotice(`Project restored: script${record.narrationReady ? ' and narration' : ''} are back. ${record.sourceName ? `To slice clips, choose the source video again (${record.sourceName}).` : 'Choose the source video again to slice clips.'}`);
+    } else if (record.transcript) setNotice('Project restored. Your transcript is saved, so tap Generate to continue without paying for transcription again.');
+    else setNotice(`Project restored. ${record.sourceName ? `Choose ${record.sourceName} again and tap Generate to continue; transcription parts already paid for are reused.` : 'Add your source and tap Generate to continue.'}`);
+  }
+  const openProjectRef = useRef(openProject); openProjectRef.current = openProject;
+  const connectDriveRef = useRef(connectDrive); connectDriveRef.current = connectDrive;
+  useEffect(() => {
+    const check = () => { const id = takePendingProject(); if (id) void openProjectRef.current(id); };
+    const connect = () => void connectDriveRef.current();
+    check(); window.addEventListener(OPEN_PROJECT_EVENT, check); window.addEventListener(CONNECT_DRIVE_EVENT, connect);
+    return () => { window.removeEventListener(OPEN_PROJECT_EVENT, check); window.removeEventListener(CONNECT_DRIVE_EVENT, connect); };
+  }, []);
+  useEffect(() => { if (autoRebuild && script && !busy) { setAutoRebuild(false); void generateVoice(); } }, [autoRebuild, script, busy]); // eslint-disable-line react-hooks/exhaustive-deps
+  // The Drive connection may be renewed from the History page while the studio stays mounted.
+  useEffect(() => { const sync = () => { try { const t = localStorage.getItem(DRIVE_TOKEN_KEY) || ''; const e = Number(localStorage.getItem(DRIVE_TOKEN_EXPIRY_KEY) || 0); setDriveToken(t && e > Date.now() ? t : ''); } catch { /* ignore */ } }; window.addEventListener(DRIVE_TOKEN_EVENT, sync); return () => window.removeEventListener(DRIVE_TOKEN_EVENT, sync); }, []);
   const beatKey = (beat: { index: number; id: string }) => `${recapId}:${beat.index}:${beat.id}`;
   const pendingNarrationChars = script ? script.beats.filter(beat => !narrationCache.current.has(beatKey(beat))).reduce((sum, beat) => sum + beat.narration.length, 0) : 0;
   async function generateVoice() {
@@ -395,7 +458,7 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
           if (response.status === 402 || data.code === 'INSUFFICIENT_CREDITS') throw new TopUpError(data.error || 'You need more credits to finish the narration.');
           if (response.ok && Array.isArray(data.segments) && data.segments.length) {
             if (data.provider) providers.add(data.provider);
-            data.segments.forEach(item => { const beat = beats.find(candidate => candidate.id === item.id); if (beat) narrationCache.current.set(beatKey(beat), { id: item.id, text: item.text, audioBase64: item.audioBase64 }); });
+            data.segments.forEach(item => { const beat = beats.find(candidate => candidate.id === item.id); if (beat) { narrationCache.current.set(beatKey(beat), { id: item.id, text: item.text, audioBase64: item.audioBase64 }); if (projectIdRef.current) void putNarrationPart(projectIdRef.current, beatKey(beat), { id: item.id, text: item.text, audioBase64: item.audioBase64 }); } });
             return;
           }
           lastError = data.error || `Narration batch failed (HTTP ${response.status}).`;
@@ -419,7 +482,7 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
       const provider = providers.size > 1 ? 'mixed' : [...providers][0] || 'openai';
       const fullVoiceover = new Blob(segments.map(segment => segment.audio), { type: 'audio/mpeg' });
       const captionsSrt = await buildTimedCaptionsSrt(segments);
-      setNarration({ provider, captionsSrt, fullVoiceover, segments });
+      setNarration({ provider, captionsSrt, fullVoiceover, segments }); checkpoint({ narrationReady: true, narrationParts: segments.length });
       void loadBalance(await getAuthToken(idToken).catch(() => idToken));
       setNotice(`Narration generated. ${segments.length} MP3 segments ready.`);
     } catch (e) {
@@ -429,8 +492,8 @@ export function DashboardWorkspace({ initialFlow = 'url' }: { initialFlow?: Sour
     }
     finally { setBusy(false); setStage(''); }
   }
-  async function sliceVideo() { if (!hasSourceTimecodes) { setNotice('Accurate cuts require a timestamped SRT/VTT transcript. Plain text has no source timecodes, so any AI timing would be a guess. Upload the matching SRT/VTT before slicing.'); return; } if (!script || !video) { setNotice('Generate a script and choose the source movie file you are authorized to edit.'); return; } setBusy(true); setStage('Loading local FFmpeg…'); setProgress(0); setNotice(''); setClips([]); setRoughCut(null); try { const duration = await getVideoDuration(video); const lastTimestamp = Math.max(...script.beats.map(beat => beat.endSeconds)); if (lastTimestamp > duration + 2) throw new Error(`The script references ${Math.round(lastTimestamp)} seconds, but this source video is only ${Math.round(duration)} seconds long. Upload matching subtitles/source video.`); const output = await sliceVideoLocally(video, script.beats.map(b => ({ index: b.index, id: b.id, startSeconds: b.startSeconds, endSeconds: b.endSeconds })), (p, current, total) => { setProgress(Math.round(p * 100)); setStage(current > 0 ? `Slicing clip ${current} of ${total} locally…` : 'Processing video locally…'); }); setClips(output); const clipBytes = output.reduce((sum, clip) => sum + clip.size, 0); const roughCutLimit = (Capacitor.isNativePlatform() || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ? 150 : 500) * 1024 * 1024; if (clipBytes > roughCutLimit) { setNotice(`${output.length} clips created (${Math.round(clipBytes / 1024 / 1024)} MB). The combined rough cut was skipped because it needs more memory than this device can safely use — save the clips and join them in your editor, or use a desktop browser.`); } else { setStage('Creating rough cut locally…'); const rough = await concatenateClipsLocally(output, p => setProgress(Math.round(p * 100))); setRoughCut(rough); setNotice(`${output.length} clips and a rough cut created locally with re-encoded frame-accurate boundaries. Processing may take longer on mobile devices.`); } } catch (e) { setNotice(e instanceof Error ? e.message : 'Local video slicing failed.'); } finally { setBusy(false); setStage(''); } }
-  async function exportDrive() { if (!driveToken) { setNotice('Connect Google Drive first.'); return; } if (!clips.length && !script && !narration) { setNotice('Generate a script or narration before exporting.'); return; } if (!script) { setNotice('Generate a recap script before exporting the cuts.'); return; } setBusy(true); setStage('Uploading cut sections directly to your Google Drive…'); setNotice(''); setDriveFolder(''); try { const files: DriveExportFile[] = []; for (const c of clips) files.push({ name: c.filename, mimeType: 'video/mp4', body: c.blob, folder: 'video' }); if (narration) { for (const segment of narration.segments) files.push({ name: segment.filename, mimeType: 'audio/mpeg', body: segment.audio, folder: 'voiceover' }); files.push({ name: 'Full_Voiceover.mp3', mimeType: 'audio/mpeg', body: narration.fullVoiceover, folder: 'master' }); files.push({ name: 'Captions.srt', mimeType: 'text/plain', body: narration.captionsSrt, folder: 'master' }); } files.push({ name: 'Timeline_Script.txt', mimeType: 'text/plain', body: script.beats.map(b => `${String(b.index).padStart(3, '0')} ${b.title}\nSource: ${b.startSeconds.toFixed(2)}s–${b.endSeconds.toFixed(2)}s | Act ${b.act}\n${b.narration}\n${b.dialogueCues.map(c => `[LET MOVIE AUDIO PLAY: ${c.startSeconds}s - ${c.quote || c.instruction}]`).join('\n')}\n`).join('\n'), folder: 'master' }); if (roughCut) files.push({ name: 'Full_RoughCut.mp4', mimeType: 'video/mp4', body: roughCut, folder: 'master' }); const result = await exportProductionKit(driveToken, title || script.title, files); setDriveFolder(result.folderUrl); setNotice(`Export complete: ${result.uploaded.length} files uploaded directly to Drive${clips.length ? `, including ${clips.length} cut video sections` : ''}${narration ? ' and narration files' : ''}.`); } catch (e) { if (e instanceof Error && 'folderUrl' in e && typeof (e as Error & { folderUrl?: unknown }).folderUrl === 'string') setDriveFolder((e as Error & { folderUrl: string }).folderUrl); setNotice(e instanceof Error ? e.message : 'Drive export failed.'); } finally { setBusy(false); setStage(''); } }
+  async function sliceVideo() { if (!hasSourceTimecodes) { setNotice('Accurate cuts require a timestamped SRT/VTT transcript. Plain text has no source timecodes, so any AI timing would be a guess. Upload the matching SRT/VTT before slicing.'); return; } if (!script || !video) { setNotice('Generate a script and choose the source movie file you are authorized to edit.'); return; } setBusy(true); setStage('Loading local FFmpeg…'); setProgress(0); setNotice(''); setClips([]); setRoughCut(null); try { const duration = await getVideoDuration(video); const lastTimestamp = Math.max(...script.beats.map(beat => beat.endSeconds)); if (lastTimestamp > duration + 2) throw new Error(`The script references ${Math.round(lastTimestamp)} seconds, but this source video is only ${Math.round(duration)} seconds long. Upload matching subtitles/source video.`); const output = await sliceVideoLocally(video, script.beats.map(b => ({ index: b.index, id: b.id, startSeconds: b.startSeconds, endSeconds: b.endSeconds })), (p, current, total) => { setProgress(Math.round(p * 100)); setStage(current > 0 ? `Slicing clip ${current} of ${total} locally…` : 'Processing video locally…'); }); setClips(output); checkpoint({ clipCount: output.length }); const clipBytes = output.reduce((sum, clip) => sum + clip.size, 0); const roughCutLimit = (Capacitor.isNativePlatform() || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ? 150 : 500) * 1024 * 1024; if (clipBytes > roughCutLimit) { setNotice(`${output.length} clips created (${Math.round(clipBytes / 1024 / 1024)} MB). The combined rough cut was skipped because it needs more memory than this device can safely use — save the clips and join them in your editor, or use a desktop browser.`); } else { setStage('Creating rough cut locally…'); const rough = await concatenateClipsLocally(output, p => setProgress(Math.round(p * 100))); setRoughCut(rough); checkpoint({ clipCount: output.length, roughCut: true }); setNotice(`${output.length} clips and a rough cut created locally with re-encoded frame-accurate boundaries. Processing may take longer on mobile devices.`); } } catch (e) { setNotice(e instanceof Error ? e.message : 'Local video slicing failed.'); } finally { setBusy(false); setStage(''); } }
+  async function exportDrive() { if (!driveToken) { setNotice('Connect Google Drive first.'); return; } if (!clips.length && !script && !narration) { setNotice('Generate a script or narration before exporting.'); return; } if (!script) { setNotice('Generate a recap script before exporting the cuts.'); return; } setBusy(true); setStage('Uploading cut sections directly to your Google Drive…'); setNotice(''); setDriveFolder(''); try { const files: DriveExportFile[] = []; for (const c of clips) files.push({ name: c.filename, mimeType: 'video/mp4', body: c.blob, folder: 'video' }); if (narration) { for (const segment of narration.segments) files.push({ name: segment.filename, mimeType: 'audio/mpeg', body: segment.audio, folder: 'voiceover' }); files.push({ name: 'Full_Voiceover.mp3', mimeType: 'audio/mpeg', body: narration.fullVoiceover, folder: 'master' }); files.push({ name: 'Captions.srt', mimeType: 'text/plain', body: narration.captionsSrt, folder: 'master' }); } files.push({ name: 'Timeline_Script.txt', mimeType: 'text/plain', body: script.beats.map(b => `${String(b.index).padStart(3, '0')} ${b.title}\nSource: ${b.startSeconds.toFixed(2)}s–${b.endSeconds.toFixed(2)}s | Act ${b.act}\n${b.narration}\n${b.dialogueCues.map(c => `[LET MOVIE AUDIO PLAY: ${c.startSeconds}s - ${c.quote || c.instruction}]`).join('\n')}\n`).join('\n'), folder: 'master' }); if (roughCut) files.push({ name: 'Full_RoughCut.mp4', mimeType: 'video/mp4', body: roughCut, folder: 'master' }); const result = await exportProductionKit(driveToken, title || script.title, files); setDriveFolder(result.folderUrl); if (projectIdRef.current) { exportedRef.current = true; const pid = projectIdRef.current; void saveProject(pid, { status: 'exported', stage: null, progress: null, error: null, drive: { folderId: result.folderId, folderUrl: result.folderUrl, exportedAt: Date.now(), fileCount: result.uploaded.length }, transcript: null, script: null, narrationReady: null, narrationParts: null, sourceSize: null, videoUrl: null, subtitleUrl: null }); void deleteNarrationParts(pid); } setNotice(`Export complete: ${result.uploaded.length} files uploaded directly to Drive${clips.length ? `, including ${clips.length} cut video sections` : ''}${narration ? ' and narration files' : ''}.`); } catch (e) { if (e instanceof Error && 'folderUrl' in e && typeof (e as Error & { folderUrl?: unknown }).folderUrl === 'string') setDriveFolder((e as Error & { folderUrl: string }).folderUrl); setNotice(e instanceof Error ? e.message : 'Drive export failed.'); } finally { setBusy(false); setStage(''); } }
   return <main className="min-h-screen bg-[#080a10] px-4 py-8 text-white sm:px-8"><div className="mx-auto max-w-6xl"><header className="mb-7 flex flex-wrap items-center justify-between gap-4"><div><div className="flex items-center gap-4"><Link href="/" className="text-sm text-violet-300">← WyCut</Link><Link href="/login?next=/dashboard" aria-label={authEmail ? `Signed in as ${authEmail}; manage account` : "Sign in to WyCut"} className="max-w-[48vw] truncate rounded-lg border border-violet-400/30 bg-violet-500/10 px-3 py-2 text-xs font-bold text-violet-200">{authEmail ? `Signed in · ${authEmail}` : "Sign in / account"}</Link><Link href="/billing" className="rounded-lg border border-white/10 px-3 py-2 text-xs font-bold text-slate-300">Billing</Link>{(credits !== null || freeAccess) && <Link href="/billing" aria-live="polite" className={`rounded-lg border px-3 py-2 text-xs font-bold ${freeAccess ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200' : credits !== null && credits < LOW_BALANCE_CREDITS ? 'border-amber-400/40 bg-amber-400/10 text-amber-200' : 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200'}`}>{freeAccess ? 'Unlimited access' : credits !== null && credits < LOW_BALANCE_CREDITS ? `${formatCredits(credits)} credits · Top up` : `${formatCredits(credits ?? 0)} credits`}</Link>}</div><h1 className="mt-2 text-2xl font-black sm:text-4xl">Recap Studio</h1><p className="mt-2 text-slate-400">Create a script, narration and edit-ready files.</p></div><div className="rounded-xl border border-white/10 bg-white/[.03] px-4 py-3"><div className="flex items-center gap-2"><Cloud size={18} className={driveToken ? 'text-emerald-400' : 'text-slate-400'}/><span className="text-sm font-semibold">Google Drive</span></div><p className="mt-1 text-xs text-slate-400">{driveToken ? 'Connected on this device' : 'Not connected'} · drive.file scope</p><div className="mt-2 flex flex-wrap gap-3"><button type="button" onClick={() => void connectDrive()} className="text-xs font-bold text-violet-300">{driveToken ? 'Reconnect Drive' : 'Connect Google Drive'}</button>{driveToken && <button type="button" onClick={disconnectDrive} className="text-xs font-semibold text-slate-400 underline">Disconnect</button>}</div>{!Capacitor.isNativePlatform() && <p className="mt-1 text-[11px] text-slate-500">{googleReady ? 'Google sign-in ready' : googleLoadError || 'Preparing Google sign-in…'}</p>}</div><nav className="flex flex-wrap gap-2 rounded-xl border border-white/10 bg-[#111521] p-2" aria-label="Choose input workflow"><Link href="/dashboard/url" className={`rounded-lg px-3 py-2 text-xs font-bold ${mode === 'url' ? 'bg-violet-500 text-white' : 'text-slate-300 hover:bg-white/5'}`}><Link2 className="mr-1 inline" size={14}/>Video URL</Link><Link href="/dashboard/file" className={`rounded-lg px-3 py-2 text-xs font-bold ${mode === 'file' ? 'bg-violet-500 text-white' : 'text-slate-300 hover:bg-white/5'}`}><UploadCloud className="mr-1 inline" size={14}/>Video file</Link><Link href="/dashboard/subtitles" className={`rounded-lg px-3 py-2 text-xs font-bold ${mode === 'subtitles' ? 'bg-violet-500 text-white' : 'text-slate-300 hover:bg-white/5'}`}><FileText className="mr-1 inline" size={14}/>Subtitles</Link></nav></header>
   <div className="grid gap-6 lg:grid-cols-[1fr_310px]"><section className="space-y-5"><div className="rounded-2xl border border-white/10 bg-[#111521] p-5 sm:p-7">
     <h2 className="mb-4 flex items-center gap-2 text-lg font-bold"><Clapperboard size={20} className="text-violet-300"/> {mode === 'url' ? '1. Video URL workflow' : mode === 'file' ? '1. Choose a video file' : '1. Subtitle-to-recap workflow'}</h2>

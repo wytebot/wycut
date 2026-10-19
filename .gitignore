@@ -19,3 +19,4 @@ service-account*.json
 
 # TypeScript incremental build cache
 /tsconfig.tsbuildinfo
+public/ffmpeg/

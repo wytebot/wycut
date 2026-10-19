@@ -3,6 +3,7 @@
   "version": "0.30.0",
   "private": true,
   "scripts": {
+    "postinstall": "node scripts/copy-ffmpeg-core.mjs",
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
@@ -22,7 +23,9 @@
     "@codetrix-studio/capacitor-google-auth": "^3.3.0",
     "@deepgram/sdk": "^3.11.0",
     "@ffmpeg/ffmpeg": "^0.12.10",
+    "@ffmpeg/core": "0.12.10",
     "@ffmpeg/util": "^0.12.1",
+    "mp4box": "^0.5.2",
     "@google/generative-ai": "^0.24.1",
     "google-auth-library": "^9.15.1",
     "lucide-react": "^0.468.0",
