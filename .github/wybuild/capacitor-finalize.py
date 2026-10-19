@@ -154,4 +154,26 @@ if source_google.exists():
     if 'com.google.gms.google-services' not in g:
         g += "\napply plugin: 'com.google.gms.google-services'\n"
         gradle.write_text(g, encoding='utf-8')
+# Enable the Firebase Authentication plugin's Google provider. Without this the plugin's GoogleAuthProviderHandler is null and
+# sign-in crashes with "Attempt to invoke virtual method ... GoogleAuthProviderHandler.signIn ... on a null object reference".
+try:
+    # 1) project variable that compiles the Google provider into the plugin
+    var_gradle = project / 'variables.gradle'
+    if var_gradle.exists():
+        vg = var_gradle.read_text(encoding='utf-8')
+        if 'rgcfaIncludeGoogle' not in vg:
+            vg = re.sub(r'(ext\s*\{)', r'\1\n    rgcfaIncludeGoogle = true', vg, count=1)
+            var_gradle.write_text(vg, encoding='utf-8')
+    # 2) runtime plugin config inside the APK assets
+    for cfg_path in (project / 'app/src/main/assets/capacitor.config.json', project / 'capacitor.config.json'):
+        if cfg_path.exists():
+            cj = json.loads(cfg_path.read_text(encoding='utf-8'))
+            fa = cj.setdefault('plugins', {}).setdefault('FirebaseAuthentication', {})
+            providers = set(fa.get('providers') or [])
+            providers.add('google.com')
+            fa['providers'] = sorted(providers)
+            cfg_path.write_text(json.dumps(cj, indent=2), encoding='utf-8')
+except Exception as exc:
+    print(f'::warning::Could not enable the Google sign-in provider automatically: {exc}')
+
 print('WyBuild Capacitor Android project finalized: release signing and requested permissions configured.')
