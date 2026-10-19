@@ -1,5 +1,7 @@
-# wybuild-twa-workflow-version: 32
+# wybuild-twa-workflow-version: 34
 name: WyBuild Capacitor + Gradle (TWA fallback)
+# v34: Capacitor builds apply the project icon (launcher + splash) instead of Capacitor's default.
+# v33: enables the Firebase Google provider (fixes GoogleAuthProviderHandler null crash).
 # v32: Capacitor is also chosen for framework apps (Next.js static export script), keeps google-services.json from config/android, prints signing SHA-1.
 # v31: release signing happens on the WyBuild signing service. This repository only builds; the release key never enters it.
 concurrency:
@@ -439,6 +441,77 @@ jobs:
           # 3) Optional hook for anything else: runs inside the generated project
           if [ -f wybuild/twa-patch.sh ]; then
             echo "Running wybuild/twa-patch.sh"; (cd "$P" && bash "$GITHUB_WORKSPACE/wybuild/twa-patch.sh")
+          fi
+
+      - name: Apply the app icon (Capacitor)
+        if: ${{ env.WYBUILD_ENGINE == 'capacitor' }}
+        run: |
+          set -euo pipefail
+          # `cap add android` ships Capacitor's default icon and splash logo. Replace them with the icon from the project's web manifest.
+          mkdir -p "$WB_TOOLS/icon"
+          (cd "$WB_TOOLS/icon" && { [ -f package.json ] || echo '{"name":"wybuild-icon","private":true}' > package.json; } && npm install --no-audit --no-fund --package-lock=false sharp@0.33.5) || echo "::warning::Could not install the image tool; Capacitor's default icon stays."
+          if [ -d "$WB_TOOLS/icon/node_modules/sharp" ]; then
+          node - <<'NODEICON'
+          // Applies the project's own icon to the generated Capacitor Android project (replaces Capacitor's default launcher icon and splash logo).
+          const fs = require('fs');
+          const path = require('path');
+          const sharp = require(path.join(process.env.WB_TOOLS, 'icon', 'node_modules', 'sharp'));
+          const cfg = JSON.parse(process.env.TWA_CONFIG || '{}');
+          const res = path.join('android', 'app', 'src', 'main', 'res');
+          const get = async (u) => {
+            if (!u) return null;
+            try { const r = await fetch(u, { redirect: 'follow' }); if (!r.ok) throw new Error('HTTP ' + r.status); return Buffer.from(await r.arrayBuffer()); }
+            catch (e) { console.log('::warning::Could not download the app icon ' + u + ': ' + e.message); return null; }
+          };
+          (async () => {
+            const any = await get(cfg.iconUrl);
+            const mask = await get(cfg.maskableIconUrl);
+            const width = async (b) => (b ? (await sharp(b).metadata()).width || 0 : 0);
+            const [wAny, wMask] = [await width(any), await width(mask)];
+            if (!any && !mask) { console.log('::warning::No app icon could be downloaded (iconUrl/maskableIconUrl), so Capacitor\'s default icon stays.'); return; }
+            // Largest available image is the adaptive-icon source; the regular icon is used for pre-Android-8 launchers.
+            const fgSrc = wMask >= wAny ? (mask || any) : any;
+            const legacySrc = any || mask;
+            // A full-bleed (opaque-corner) icon becomes the foreground on its own background colour; a transparent one gets more padding.
+            const { data } = await sharp(fgSrc).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+            const opaque = data[3] > 200;
+            const hex = (n) => n.toString(16).padStart(2, '0');
+            const bg = opaque ? '#' + hex(data[0]) + hex(data[1]) + hex(data[2]) : (/^#[0-9a-fA-F]{6}$/.test(cfg.backgroundColor || '') ? cfg.backgroundColor : '#ffffff');
+            const fgScale = opaque ? 0.8 : 0.62;
+            const dens = { mdpi: [48, 108], hdpi: [72, 162], xhdpi: [96, 216], xxhdpi: [144, 324], xxxhdpi: [192, 432] };
+            // Remove Capacitor's default launcher images (a leftover .webp next to our .png would be a duplicate resource).
+            for (const d of fs.existsSync(res) ? fs.readdirSync(res) : []) {
+              if (!d.startsWith('mipmap-')) continue;
+              for (const f of fs.readdirSync(path.join(res, d))) if (/^ic_launcher.*\.(png|webp)$/.test(f)) fs.rmSync(path.join(res, d, f));
+            }
+            for (const [d, [legacy, fg]] of Object.entries(dens)) {
+              const dir = path.join(res, 'mipmap-' + d); fs.mkdirSync(dir, { recursive: true });
+              const square = await sharp(legacySrc).resize(legacy, legacy, { fit: 'cover' }).png().toBuffer();
+              fs.writeFileSync(path.join(dir, 'ic_launcher.png'), square);
+              const circle = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="' + legacy + '" height="' + legacy + '"><circle cx="' + legacy / 2 + '" cy="' + legacy / 2 + '" r="' + legacy / 2 + '"/></svg>');
+              fs.writeFileSync(path.join(dir, 'ic_launcher_round.png'), await sharp(square).composite([{ input: circle, blend: 'dest-in' }]).png().toBuffer());
+              const inner = Math.round(fg * fgScale);
+              const layer = await sharp({ create: { width: fg, height: fg, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } })
+                .composite([{ input: await sharp(fgSrc).resize(inner, inner, { fit: 'cover' }).png().toBuffer(), gravity: 'center' }]).png().toBuffer();
+              fs.writeFileSync(path.join(dir, 'wybuild_icon_fg.png'), layer);
+            }
+            const adaptive = '<?xml version="1.0" encoding="utf-8"?>\n<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n    <background android:drawable="@color/wybuild_icon_bg"/>\n    <foreground android:drawable="@mipmap/wybuild_icon_fg"/>\n</adaptive-icon>\n';
+            fs.mkdirSync(path.join(res, 'mipmap-anydpi-v26'), { recursive: true });
+            fs.writeFileSync(path.join(res, 'mipmap-anydpi-v26', 'ic_launcher.xml'), adaptive);
+            fs.writeFileSync(path.join(res, 'mipmap-anydpi-v26', 'ic_launcher_round.xml'), adaptive);
+            fs.mkdirSync(path.join(res, 'values'), { recursive: true });
+            fs.writeFileSync(path.join(res, 'values', 'wybuild_icon.xml'), '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="wybuild_icon_bg">' + bg + '</color>\n</resources>\n');
+            // Capacitor's default splash image also carries its logo: replace it with the app background and icon.
+            for (const d of fs.readdirSync(res)) {
+              const file = path.join(res, d, 'splash.png');
+              if (!d.startsWith('drawable') || !fs.existsSync(file)) continue;
+              const m = await sharp(file).metadata(); const w = m.width || 480, h = m.height || 320; const s = Math.round(Math.min(w, h) * 0.3);
+              const logo = await sharp(legacySrc).resize(s, s, { fit: 'cover' }).png().toBuffer();
+              fs.writeFileSync(file, await sharp({ create: { width: w, height: h, channels: 4, background: bg } }).composite([{ input: logo, gravity: 'center' }]).png().toBuffer());
+            }
+            console.log('Applied app icon (background ' + bg + ', ' + (opaque ? 'full-bleed' : 'transparent') + ' source, ' + Math.max(wAny, wMask) + 'px).');
+          })().catch((e) => { console.log('::warning::Could not apply the app icon (' + e.message + '); Capacitor\'s default icon stays.'); });
+          NODEICON
           fi
 
       - name: Finalize Capacitor native permissions and release signing
