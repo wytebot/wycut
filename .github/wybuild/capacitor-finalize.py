@@ -85,7 +85,20 @@ if 'wybuild-signing.properties' not in g:
     gradle.write_text(g, encoding='utf-8')
 
 # If Firebase Android config is present, wire Google's Gradle plugin so native Google sign-in and FCM can work.
-source_google = Path(os.environ.get('GITHUB_WORKSPACE','')) / 'google-services.json'
+workspace = Path(os.environ.get('GITHUB_WORKSPACE',''))
+# Firebase client config may live at the repo root, under config/android (WyCut layout), in android/app, or arrive as a base64 variable.
+source_google = workspace / 'google-services.json'
+for candidate in ('google-services.json', 'config/android/google-services.json', 'android/app/google-services.json', 'app/google-services.json'):
+    if (workspace / candidate).exists():
+        source_google = workspace / candidate
+        break
+else:
+    b64 = os.environ.get('GOOGLE_SERVICES_JSON_BASE64', '').strip()
+    if b64:
+        import base64
+        source_google = workspace / '.wybuild-out' / 'google-services.json'
+        source_google.parent.mkdir(parents=True, exist_ok=True)
+        source_google.write_bytes(base64.b64decode(b64))
 if 'sharetarget' in (config.get('nativeFeatures') or []):
     raise SystemExit('Share-target receiving is supported only by the URL-based WyBuild native shell. Disable sharetarget for Capacitor source builds; outgoing Share.share is still available.')
 
@@ -102,6 +115,23 @@ if source_google.exists():
     except json.JSONDecodeError as exc:
         raise SystemExit(f'google-services.json is not valid JSON: {exc}')
     shutil.copy2(source_google, project / 'app/google-services.json')
+    # Native Google sign-in only works when the APK's signing SHA-1 is registered for this package in Firebase.
+    try:
+        import subprocess
+        registered = {o.get('android_info', {}).get('certificate_hash', '').lower()
+                      for c in firebase_cfg.get('client', [])
+                      if c.get('client_info', {}).get('android_client_info', {}).get('package_name') == meta.get('packageId')
+                      for o in c.get('oauth_client', []) if o.get('client_type') == 1 and o.get('android_info')}
+        if os.environ.get('SIGN_MODE') == 'remote':
+            print('::notice::Release signing is done by WyBuild after this build; make sure its SHA-1 is registered in Firebase for ' + str(meta.get('packageId')) + '.')
+        elif ks.exists():
+            out = subprocess.run(['keytool', '-list', '-v', '-keystore', str(ks), '-alias', os.environ.get('WB_KEY_ALIAS', ''), '-storepass', os.environ.get('BUBBLEWRAP_KEYSTORE_PASSWORD', '')], capture_output=True, text=True).stdout
+            m = re.search(r'SHA1:\s*([0-9A-Fa-f:]+)', out)
+            sha1 = m.group(1).replace(':', '').lower() if m else ''
+            if sha1 and sha1 not in registered:
+                print(f'::warning::Native Google sign-in will fail with DEVELOPER_ERROR: this build is signed with SHA-1 {m.group(1)}, which is not registered for {meta.get("packageId")} in google-services.json. Add it in Firebase > Project settings > your Android app > Add fingerprint, download a fresh google-services.json, commit it, and rebuild.')
+    except Exception as exc:  # diagnostics only
+        print(f'::notice::Could not check the Firebase SHA-1 registration: {exc}')
     if root_gradle.exists():
         rg = root_gradle.read_text(encoding='utf-8')
         if 'com.google.gms.google-services' not in rg and 'com.google.gms:google-services' not in rg:
