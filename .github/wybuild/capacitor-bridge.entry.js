@@ -50,8 +50,8 @@ const native = {
     onAction: (callback) => PushNotifications.addListener('pushNotificationActionPerformed', callback),
   },
   auth: {
-    google: () => safe(() => FirebaseAuthentication.signInWithGoogle()),
-    apple: () => safe(() => FirebaseAuthentication.signInWithApple()),
+    google: (options = {}) => safe(() => FirebaseAuthentication.signInWithGoogle(options)),
+    apple: (options = {}) => safe(() => FirebaseAuthentication.signInWithApple(options)),
     signOut: () => safe(() => FirebaseAuthentication.signOut()),
     current: () => safe(() => FirebaseAuthentication.getCurrentUser()),
   },
