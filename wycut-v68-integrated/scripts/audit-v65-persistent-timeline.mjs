@@ -1,0 +1,16 @@
+import { readFileSync } from 'node:fs';
+import assert from 'node:assert/strict';
+const read = (p) => readFileSync(new URL(`../${p}`, import.meta.url), 'utf8');
+const editor = read('components/editor-v42-layout.tsx');
+const workspace = read('components/dashboard-workspace.tsx');
+const store = read('lib/projects/store.ts');
+assert.match(editor, /audio\.map\(\(a, trackIndex\)/, 'each sound clip must get its own visible lane');
+assert.match(editor, /Add sound track/, 'adding another sound track must remain available after the first one');
+assert.match(editor, /targetTime/, 'dragging must maintain a drop preview target');
+assert.match(editor, /onMoveClip\?\.\(completed\.index, completed\.targetTime\)/, 'video move must commit on drop, not every pointer move');
+assert.match(workspace, /editHistory: \{ version: 1, stack, index: h\.index \}/, 'history must persist after edits');
+assert.match(workspace, /soundTrackIds/, 'persisted history must reference audio media instead of duplicating blobs per snapshot');
+assert.match(workspace, /record\.editHistoryMediaData/, 'history must hydrate its referenced audio tracks on restore');
+assert.match(store, /editHistoryMediaData/, 'history media must be stored separately from project metadata');
+assert.doesNotMatch(workspace, /soundTracks\.length >= MAX_AUDIO_LAYERS/, 'audio track count must not be artificially capped by the old UI limit');
+console.log('v65 persistent timeline audit passed: per-track audio lanes, drop-only commits, unbounded audio lane count, versioned persisted undo/redo and deduplicated audio blob storage.');

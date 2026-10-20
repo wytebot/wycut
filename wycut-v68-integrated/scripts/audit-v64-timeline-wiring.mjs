@@ -1,0 +1,17 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+const ui = await readFile('components/editor-v42-layout.tsx', 'utf8');
+const workspace = await readFile('components/dashboard-workspace.tsx', 'utf8');
+assert.match(ui, /onPointerDown=\{e => beginMove\('video'/, 'video clips expose long-press drag initiation');
+assert.match(ui, /onPointerDown=\{e => beginMove\('audio'/, 'audio clips expose long-press drag initiation');
+assert.match(ui, /onPointerDown=\{e => beginMove\('asset'/, 'additional video/image clips expose long-press drag initiation');
+assert.match(ui, /onMoveVisualAsset/, 'visual asset drag commits its timeline placement');
+assert.match(ui, /setTimeout\(\(\) => \{ longPressArmed\.current = true/, 'drag initiation is delayed for long-press');
+assert.match(ui, /Disable snapping|Enable snapping/, 'snap toggle is present');
+assert.match(ui, /Fit timeline to screen/, 'fit-to-screen zoom is present');
+assert.match(ui, /suppressClick\.current/, 'drag completion suppresses accidental click selection');
+assert.match(workspace, /onSelectClip=\{i=>\{setSelectedClipIndex\(current => current === i \? -1 : i\);setSelectedAudioId\(''\);setSelectedVisualAssetId\(''\);\}/, 're-tapping selected video clip toggles selection off and clears other selections');
+assert.match(workspace, /onMoveAudio=\{\(id, start\) => setSoundTracks/, 'audio drag writes back into editor sound state');
+assert.match(workspace, /onMoveClip=\{\(i, start\) => \{ setScript/, 'video clip drag writes back into script timeline state');
+assert.match(workspace, /selectedClipIndex < 0 \|\| selectedClipIndex >= script\.beats\.length/, 'delete is guarded when no video clip is selected');
+console.log('v64 timeline wiring audit passed: long-press drag, snapping, fit zoom, audio/video state integration, toggle selection, guarded delete.');

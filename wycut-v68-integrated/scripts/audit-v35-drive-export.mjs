@@ -1,0 +1,17 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const read = p => fs.readFileSync(p, 'utf8');
+const workspace = read('components/dashboard-workspace.tsx');
+assert.match(workspace, /schemaVersion: 3/, 'exports must use versioned EditPlan manifest schema v3');
+assert.match(workspace, /settings: \{ aspectRatio, applyAspectRatio/, 'exports must retain legacy settings for backwards-compatible restore');
+assert.match(workspace, /editPlan: normalizeEditPlan/, 'exports must persist the normalized EditPlan');
+assert.match(workspace, /SOURCE_ORIGINAL_/, 'export must include original source media');
+assert.match(workspace, /mediaAssets/, 'export must persist extra timeline media assets');
+assert.match(workspace, /fetchDriveBlob\(driveToken, sourceItem\.id\)/, 'restore must read source media from Drive');
+assert.match(read('components/editor-v42-layout.tsx'), /Add video or image/, 'media timeline must have an add control');
+assert.match(workspace, /exportPage \? <main/, 'export must switch to its export screen');
+assert.match(workspace, /Export successful/, 'export screen must show successful completion');
+assert.match(workspace, /setExportProgress\(p\.percent\)/, 'Drive export must report progress');
+assert.match(read('components/sound-library.tsx'), /Add audio from device/, 'audio timeline must expose add control');
+assert.match(read('lib/drive/export.ts'), /onProgress\?: \(progress:/, 'Drive uploader must support progress reporting');
+console.log('WyCut v35 Drive restore, media timeline and export-screen static audit passed.');

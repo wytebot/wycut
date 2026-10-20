@@ -1,0 +1,18 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const workspace = fs.readFileSync('components/dashboard-workspace.tsx', 'utf8');
+const sounds = fs.readFileSync('components/sound-library.tsx', 'utf8');
+const ffmpeg = fs.readFileSync('lib/ffmpeg/client-slicer.ts', 'utf8');
+const packageJson = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+assert.doesNotMatch(workspace, /async async function/, 'Guard against the duplicate async syntax regression');
+assert.match(workspace, /SoundLibrary tracks=\{soundTracks\}/, 'Studio must mount the sound timeline');
+assert.match(workspace, /mixAudioTracksLocally/, 'Sound timeline must support local video mixing');
+assert.match(workspace, /roughCutLimit = .*\? 60 : 180/, 'Concatenation must use conservative memory limits for mobile and desktop');
+assert.match(workspace, /soundTracks\.forEach/, 'Drive export must include added sound layers');
+assert.match(ffmpeg, /WORKERFS/, 'Large source videos must use disk-backed FFmpeg source mounting where supported');
+assert.match(ffmpeg, /operationQueue/, 'FFmpeg jobs must remain serialized to avoid shared filesystem races');
+assert.match(ffmpeg, /mixAudioTracksLocally/, 'Local audio mixing helper must exist');
+assert.doesNotMatch(sounds, /OfflineAudioContext|synthesize\(/, 'v44: built-in synthesized sounds were removed; audio comes from the device only');
+assert.match(sounds, /accept="audio\/*/, 'Device audio picker must accept audio formats on browser and Android');
+assert.equal(packageJson.scripts['audit:v32'], 'node scripts/audit-v32-reliability.mjs', 'Reliability audit must be available as an npm script');
+console.log('WyCut v32 static reliability audit passed. This does not replace dependency-backed typecheck, browser tests, or an Android build.');
