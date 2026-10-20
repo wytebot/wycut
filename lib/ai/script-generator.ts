@@ -21,6 +21,33 @@ function extractJson(raw: string): unknown {
   return JSON.parse(clean.slice(start, end + 1));
 }
 type SourceCueRange = { startSeconds: number; endSeconds: number };
+/** Reduce provider prompt latency for long subtitle files while sampling across the entire source timeline. */
+function compactTranscriptForPrompt(source: string, maxChars = 52_000): { text: string; compacted: boolean } {
+  if (source.length <= maxChars) return { text: source, compacted: false };
+  const blocks = source.split(/\n\s*\n/).map(block => block.trim()).filter(Boolean);
+  if (blocks.length > 1) {
+    // Uniformly sample subtitle blocks, preserving their original timecodes and ordering.
+    const targetCount = Math.max(1, Math.floor(blocks.length * maxChars / source.length));
+    const selected: string[] = [];
+    for (let i = 0; i < targetCount; i++) {
+      const index = Math.min(blocks.length - 1, Math.floor(i * (blocks.length - 1) / Math.max(1, targetCount - 1)));
+      selected.push(blocks[index]);
+    }
+    let text = selected.join('\n\n');
+    while (text.length > maxChars && selected.length > 1) { selected.splice(Math.floor(selected.length / 2), 1); text = selected.join('\n\n'); }
+    return { text, compacted: true };
+  }
+  // Plain-text transcript fallback: sample equal windows from start, middle and end.
+  const windowSize = Math.max(800, Math.floor(maxChars / 12));
+  const windows = Math.max(1, Math.floor(maxChars / (windowSize + 40)));
+  const chunks: string[] = [];
+  for (let i = 0; i < windows; i++) {
+    const start = Math.floor(i * Math.max(0, source.length - windowSize) / Math.max(1, windows - 1));
+    chunks.push(source.slice(start, start + windowSize));
+  }
+  return { text: chunks.join('\n\n[...middle source text sampled out; continue with the next source-time region...]\n\n').slice(0, maxChars), compacted: true };
+}
+
 function nearestCueTime(seconds: number, ranges: SourceCueRange[], edge: 'startSeconds' | 'endSeconds') {
   // Snap to the closest real subtitle boundary. Films have long silent stretches, so a
   // fixed distance limit rejected valid scripts; snapping keeps every cut on a real cue.
@@ -97,8 +124,9 @@ export async function generateRecapScript(input: ScriptInput): Promise<{ script:
     : vttMatches.map(m => ({ startSeconds: Number(m[1]) * 60 + Number(m[2]) + Number(m[3]) / 1000, endSeconds: Number(m[4]) * 60 + Number(m[5]) + Number(m[6]) / 1000 }));
   const validRangesForPrompt = sourceRanges.filter(range => Number.isFinite(range.startSeconds) && Number.isFinite(range.endSeconds) && range.startSeconds >= 0 && range.endSeconds > range.startSeconds);
   const sourceDuration = validRangesForPrompt.length ? Math.max(...validRangesForPrompt.map(range => range.endSeconds)) : undefined;
+  const promptSource = compactTranscriptForPrompt(transcript);
   const operations = await getAiOperationsConfig();
-  const prompt = `Write a compelling, original, transformative film recap with commentary—not a substitute for the film and not a reproduction of its dialogue or another recap. Explain the important story events, character goals, turning points, cause-and-effect, stakes, climax and resolution so viewers can follow the story and understand why key scenes matter. Prioritize relevant scenes that meet normal viewer expectations, omit repetitive filler, and cover the full timeline rather than only the opening. Use fresh phrasing and concise analysis; do not copy distinctive dialogue, lyrics, screenplay text, or existing summaries. Do not make claims that wording can evade copyright detection or guarantees fair use/monetization. Do not invent facts or visual details not supported by the transcript. Additional writing guidance: ${operations.script.promptGuidance}. TARGET FINISHED RECAP DURATION: ${runtime} seconds (${Math.round(runtime / 60)} minutes). This is a hard planning target, not a suggestion. Create ${count} timestamped source clips where practical; use more clips for longer targets. The sum of (endSeconds-startSeconds) across all selected clips must be as close as possible to ${runtime} seconds, ideally within 5% when the source has enough material. Do not exceed the source duration. If the source does not contain enough usable material to meet the target, return the best possible coverage and clearly say so in the title. beats: ${count}; target narration length: about ${Math.round(runtime / 60 * 130)}–${Math.round(runtime / 60 * 160)} words. Film/source title: ${title}. Source transcript duration: ${sourceDuration ? `${Math.round(sourceDuration)} seconds` : 'NOT PROVIDED; do not invent exact timestamps and clearly label timing as estimates'}. When timestamped cues are present, align beat boundaries to real subtitle cues, distribute beats across the full source timeline, and never use the recap narration runtime as the source-video timeline. Every beat should contribute a distinct plot fact, character decision, consequence, or useful interpretation. Each beat is ONE cut of the source video from startSeconds to endSeconds, and its narration will be read aloud over exactly that clip, so write it for that clip: describe only what happens in that stretch of the transcript, size it to the clip length (about 2.3 words per second of endSeconds minus startSeconds, never more than 2.6, and fewer words when dialogueCues let the movie audio play), open with a short natural link from the previous clip, keep names and pronouns consistent, and make the clip lengths add up to about ${runtime} seconds so the beats play back as one continuous story.\n\n${schema}\n\nSOURCE TRANSCRIPT / SUBTITLES:\n${transcript}`;
+  const prompt = `Write a compelling, original, transformative film recap with commentary—not a substitute for the film and not a reproduction of its dialogue or another recap. Explain the important story events, character goals, turning points, cause-and-effect, stakes, climax and resolution so viewers can follow the story and understand why key scenes matter. Prioritize relevant scenes that meet normal viewer expectations, omit repetitive filler, and cover the full timeline rather than only the opening. Use fresh phrasing and concise analysis; do not copy distinctive dialogue, lyrics, screenplay text, or existing summaries. Do not make claims that wording can evade copyright detection or guarantees fair use/monetization. Do not invent facts or visual details not supported by the transcript. Additional writing guidance: ${operations.script.promptGuidance}. TARGET FINISHED RECAP DURATION: ${runtime} seconds (${Math.round(runtime / 60)} minutes). This is a hard planning target, not a suggestion. Create ${count} timestamped source clips where practical; use more clips for longer targets. The sum of (endSeconds-startSeconds) across all selected clips must be as close as possible to ${runtime} seconds, ideally within 5% when the source has enough material. Do not exceed the source duration. If the source does not contain enough usable material to meet the target, return the best possible coverage and clearly say so in the title. beats: ${count}; target narration length: about ${Math.round(runtime / 60 * 130)}–${Math.round(runtime / 60 * 160)} words. Film/source title: ${title}. Source transcript duration: ${sourceDuration ? `${Math.round(sourceDuration)} seconds` : 'NOT PROVIDED; do not invent exact timestamps and clearly label timing as estimates'}. When timestamped cues are present, align beat boundaries to real subtitle cues, distribute beats across the full source timeline, and never use the recap narration runtime as the source-video timeline. Every beat should contribute a distinct plot fact, character decision, consequence, or useful interpretation. Each beat is ONE cut of the source video from startSeconds to endSeconds, and its narration will be read aloud over exactly that clip, so write it for that clip: describe only what happens in that stretch of the transcript, size it to the clip length (about 2.3 words per second of endSeconds minus startSeconds, never more than 2.6, and fewer words when dialogueCues let the movie audio play), open with a short natural link from the previous clip, keep names and pronouns consistent, and make the clip lengths add up to about ${runtime} seconds so the beats play back as one continuous story.\n\n${schema}\n\nSOURCE TRANSCRIPT / SUBTITLES${promptSource.compacted ? ' (uniformly sampled across the full source timeline to reduce long-video latency)' : ''}:\n${promptSource.text}`;
   const errors: string[] = [];
   let providerCallStarted = false;
   const markProviderStart = async (provider: 'gemini' | 'openai') => { providerCallStarted = true; await input.onProviderStart?.(provider); };

@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation';
 import {
   browserLocalPersistence,
   getRedirectResult,
+  onAuthStateChanged,
   GoogleAuthProvider,
   setPersistence,
   signInWithPopup,
@@ -61,16 +62,24 @@ export default function LoginPage() {
     if (redirectHandled.current) return;
     redirectHandled.current = true;
     let active = true;
+    let unsubscribe = () => {};
     void (async () => {
       try {
+        // Restore the persisted Firebase user before deciding whether login is needed.
+        // Firebase refreshes expired ID tokens when finishLogin calls getIdToken(true).
+        await firebaseAuth.authStateReady();
         if (!Capacitor.isNativePlatform()) await setPersistence(firebaseAuth, browserLocalPersistence);
         const result = await getRedirectResult(firebaseAuth);
-        if (active && result?.user) await finishLogin(result.user);
+        if (active && result?.user) { await finishLogin(result.user); return; }
+        if (active && firebaseAuth.currentUser) { await finishLogin(firebaseAuth.currentUser); return; }
+        unsubscribe = onAuthStateChanged(firebaseAuth, user => {
+          if (active && user) { unsubscribe(); void finishLogin(user).catch(e => setError(readableAuthError(e))); }
+        });
       } catch (e) {
         if (active) setError(readableAuthError(e));
       }
     })();
-    return () => { active = false; };
+    return () => { active = false; unsubscribe(); };
     // This runs once to process Firebase's redirect result after returning from Google.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

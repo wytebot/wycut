@@ -19,6 +19,12 @@ export type EditPlan = {
   emoji?: string;
   sticker?: string;
   watermark: boolean;
+  /** Non-destructive mask applied to a video overlay track during export. */
+  overlayMask: { shape: 'none' | 'rectangle' | 'ellipse' | 'split'; x: number; y: number; width: number; height: number; feather: number; invert: boolean };
+  /** Chroma-key settings for a video overlay track. */
+  chromaKey: { enabled: boolean; color: string; similarity: number; blend: number };
+  /** Manual background mask strokes, normalized to 0..100 canvas coordinates. */
+  manualMaskStrokes: { mode: 'erase' | 'restore'; radius: number; points: { x: number; y: number }[] }[];
   /** Colour adjustments, each -100..100 (0 = unchanged). */
   adjust: Adjust;
 };
@@ -62,8 +68,34 @@ export function normalizeEditPlan(value: unknown): EditPlan {
     fadeInSeconds: Math.min(5, Math.max(0, Number(v.fadeInSeconds) || 0)), fadeOutSeconds: Math.min(5, Math.max(0, Number(v.fadeOutSeconds) || 0)),
     mirror: Boolean(v.mirror), crop: v.crop === 'cover' ? 'cover' : 'contain',
     text: v.text && typeof v.text.value === 'string' ? { value: v.text.value.slice(0, 500), animation: String(v.text.animation || 'None'), font: String(v.text.font || 'Inter'), position: ['top','center','bottom'].includes(String(v.text.position)) ? v.text.position! : 'center', x: clampPercent(v.text.x, 50), y: clampPercent(v.text.y, v.text.position === 'top' ? 15 : v.text.position === 'bottom' ? 85 : 50), scale: Math.max(0.5, Math.min(2, Number(v.text.scale) || 1)), rotation: Math.max(-180, Math.min(180, Number(v.text.rotation) || 0)) } : undefined,
-    emoji: typeof v.emoji === 'string' ? v.emoji.slice(0, 12) : '', sticker: typeof v.sticker === 'string' ? v.sticker.slice(0, 120) : '', watermark: Boolean(v.watermark), adjust: normalizeAdjust(v.adjust) };
+    emoji: typeof v.emoji === 'string' ? v.emoji.slice(0, 12) : '', sticker: typeof v.sticker === 'string' ? v.sticker.slice(0, 120) : '', watermark: Boolean(v.watermark), overlayMask: normalizeMask(v.overlayMask), chromaKey: normalizeChromaKey(v.chromaKey), manualMaskStrokes: normalizeManualMaskStrokes(v.manualMaskStrokes), adjust: normalizeAdjust(v.adjust) };
 }
+
+export type OverlayMask = EditPlan['overlayMask'];
+export type ChromaKey = EditPlan['chromaKey'];
+export function normalizeMask(value: unknown): OverlayMask {
+  const v = value && typeof value === 'object' ? value as Partial<OverlayMask> : {};
+  const n = (x: unknown, fallback: number) => { const a = Number(x); return Number.isFinite(a) ? a : fallback; };
+  const shape = ['none','rectangle','ellipse','split'].includes(String(v.shape)) ? v.shape! : 'none';
+  return { shape, x: Math.max(0, Math.min(100, n(v.x, 50))), y: Math.max(0, Math.min(100, n(v.y, 50))), width: Math.max(1, Math.min(100, n(v.width, 80))), height: Math.max(1, Math.min(100, n(v.height, 80))), feather: Math.max(0, Math.min(25, n(v.feather, 0))), invert: Boolean(v.invert) };
+}
+export function normalizeChromaKey(value: unknown): ChromaKey {
+  const v = value && typeof value === 'object' ? value as Partial<ChromaKey> : {};
+  const color = /^#[0-9a-fA-F]{6}$/.test(String(v.color || '')) ? String(v.color) : '#00ff00';
+  const n = (x: unknown, fallback: number) => { const a = Number(x); return Number.isFinite(a) ? a : fallback; };
+  return { enabled: Boolean(v.enabled), color, similarity: Math.max(0.01, Math.min(0.5, n(v.similarity, 0.12))), blend: Math.max(0, Math.min(0.5, n(v.blend, 0.08))) };
+}
+
+export type ManualMaskStroke = EditPlan['manualMaskStrokes'][number];
+export function normalizeManualMaskStrokes(value: unknown): EditPlan['manualMaskStrokes'] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(-200).map((raw: any) => ({
+    mode: raw?.mode === 'restore' ? 'restore' as const : 'erase' as const,
+    radius: Math.max(0.2, Math.min(15, Number(raw?.radius) || 2)),
+    points: (Array.isArray(raw?.points) ? raw.points : []).slice(0, 1000).map((point: any) => ({ x: Math.max(0, Math.min(100, Number(point?.x) || 0)), y: Math.max(0, Math.min(100, Number(point?.y) || 0)) })),
+  })).filter((stroke: ManualMaskStroke) => stroke.points.length > 0);
+}
+
 export function videoFilterForPlan(planValue: unknown): string {
   const p = normalizeEditPlan(planValue); const filters: string[] = [];
   const dimensions: Record<string, Record<'720p' | '1080p' | '2K', string>> = { '9:16': { '720p': '720:1280', '1080p': '1080:1920', '2K': '1440:2560' }, '1:1': { '720p': '720:720', '1080p': '1080:1080', '2K': '2048:2048' }, '16:9': { '720p': '1280:720', '1080p': '1920:1080', '2K': '2560:1440' }, '4:5': { '720p': '720:900', '1080p': '1080:1350', '2K': '2048:2560' } };

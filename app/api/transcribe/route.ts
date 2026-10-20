@@ -8,6 +8,7 @@ import { getAdminDb } from '@/lib/firebase-admin';
 import { hasLifetimeFreeAccess } from '@/lib/billing/entitlements';
 import { InsufficientCreditsError, JobCancelledError, cleanJobId, chargeCredits, refundCharge } from '@/lib/billing/credits';
 import { transcribeCredits } from '@/lib/billing/pricing';
+import pricingConfig from '@/config/credit-pricing.json';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -97,7 +98,8 @@ export async function POST(req: NextRequest) {
   try { identity = await verifyGoogleIdentity(body.idToken || ''); } catch (e) { return NextResponse.json({ error: e instanceof Error ? e.message : 'Sign in to transcribe.' }, { status: 401 }); }
   if (identity.email.endsWith('@phone.wycut.invalid') && !hasLifetimeFreeAccess(identity.email)) return NextResponse.json({ error: 'A verified Google email is required to transcribe video.', code: 'GOOGLE_EMAIL_REQUIRED' }, { status: 403 });
   const deviceId = req.headers.get('x-device-id') || body.deviceId || '';
-  const amount = transcribeCredits(duration);
+  const selectedProvider = process.env.GEMINI_API_KEY ? 'gemini' : 'whisper';
+  const amount = transcribeCredits(duration, selectedProvider);
   try { await chargeDailyChunk(identity.userId); }
   catch (e) {
     if (e instanceof Error && e.message === 'TRANSCRIBE_DAILY_CAP') return NextResponse.json({ error: 'Daily transcription limit reached for this account. Try again tomorrow or upload a subtitle file.', code: 'TRANSCRIBE_DAILY_CAP' }, { status: 429 });
@@ -114,9 +116,11 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'WyCut could not use your credits (billing database). Check Firebase configuration in Vercel logs.', code: 'CREDIT_DATABASE_CONFIGURATION' }, { status: 503 });
   }
   let providerStarted = false;
-  const markProviderStarted = async () => {
+  const markProviderStarted = async (provider: 'gemini' | 'whisper', model: string) => {
     if (providerStarted) return;
-    if (ledgerId) await getAdminDb().collection('wycut_credit_ledger').doc(ledgerId).set({ status: 'started', providerStartedAt: new Date().toISOString() }, { merge: true });
+    const ratePerChunk = provider === 'whisper' ? pricingConfig.costModelUsd.transcribeWhisperPer300sChunk : pricingConfig.costModelUsd.transcribePer300sChunk;
+    const estimatedProviderCostUsd = Math.max(0, duration / 300 * ratePerChunk);
+    if (ledgerId) await getAdminDb().collection('wycut_credit_ledger').doc(ledgerId).set({ status: 'started', provider, model, durationSeconds: duration, estimatedProviderCostUsd, estimatedCostWithOverheadUsd: estimatedProviderCostUsd * pricingConfig.costModelUsd.overheadFactor, providerCostEstimateType: 'conservative_model_estimate', providerStartedAt: new Date().toISOString() }, { merge: true });
     providerStarted = true;
   };
   const markProviderCompleted = async () => { if (ledgerId && providerStarted) await getAdminDb().collection('wycut_credit_ledger').doc(ledgerId).set({ status: 'consumed', completedAt: new Date().toISOString() }, { merge: true }); };
@@ -124,12 +128,12 @@ export async function POST(req: NextRequest) {
   const headers = { 'Cache-Control': 'no-store', 'X-Credits-Charged': String(ledgerId ? amount : 0) };
   const errors: string[] = [];
   if (process.env.GEMINI_API_KEY) {
-    try { await markProviderStarted(); const segments = await transcribeWithGemini(body.audioBase64, mimeType, duration); await markProviderCompleted(); return NextResponse.json({ provider: 'gemini', creditsCharged: ledgerId ? amount : 0, segments }, { headers }); }
+    try { await markProviderStarted('gemini', process.env.GEMINI_TRANSCRIBE_MODEL || 'gemini-2.5-flash-lite'); const segments = await transcribeWithGemini(body.audioBase64, mimeType, duration); await markProviderCompleted(); return NextResponse.json({ provider: 'gemini', creditsCharged: ledgerId ? amount : 0, segments }, { headers }); }
     catch (e) { errors.push(`Gemini: ${e instanceof Error ? e.message : 'failed'}`); }
   }
   // Only choose Whisper when Gemini is not configured. Never invoke a second provider after a potentially billable first attempt.
   if (!process.env.GEMINI_API_KEY && process.env.OPENAI_API_KEY && process.env.TRANSCRIBE_ALLOW_WHISPER_FALLBACK !== '0') {
-    try { await markProviderStarted(); const segments = await transcribeWithWhisper(body.audioBase64, mimeType); await markProviderCompleted(); return NextResponse.json({ provider: 'whisper', creditsCharged: ledgerId ? amount : 0, segments }, { headers }); }
+    try { await markProviderStarted('whisper', 'whisper-1'); const segments = await transcribeWithWhisper(body.audioBase64, mimeType); await markProviderCompleted(); return NextResponse.json({ provider: 'whisper', creditsCharged: ledgerId ? amount : 0, segments }, { headers }); }
     catch (e) { errors.push(`Whisper: ${e instanceof Error ? e.message : 'failed'}`); }
   }
   await refundAll();

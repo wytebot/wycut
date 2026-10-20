@@ -16,7 +16,7 @@ const now = () => new Date().toISOString();
 export class InsufficientCreditsError extends Error {
   constructor(public needed: number, public balance: number) { super('INSUFFICIENT_CREDITS'); this.name = 'InsufficientCreditsError'; }
 }
-export type CreditKind = 'script' | 'narration' | 'transcribe';
+export type CreditKind = 'script' | 'narration' | 'transcribe' | 'background-removal';
 export class JobCancelledError extends Error { constructor() { super('JOB_CANCELLED'); this.name = 'JobCancelledError'; } }
 const JOB_ID = /^[A-Za-z0-9-]{8,80}$/;
 export const cleanJobId = (value: unknown): string => (typeof value === 'string' && JOB_ID.test(value) ? value : '');

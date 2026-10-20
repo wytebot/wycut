@@ -1,6 +1,6 @@
 {
   "name": "wycut-recap-studio",
-  "version": "0.38.0",
+  "version": "0.40.0",
   "private": true,
   "scripts": {
     "postinstall": "node scripts/copy-ffmpeg-core.mjs",
@@ -22,7 +22,10 @@
     "audit:v42": "node scripts/audit-v42-editor-layout.mjs",
     "audit:storage-cost": "node scripts/audit-storage-cost-guards.mjs",
     "audit:v51": "node scripts/audit-v51-export-tools.mjs",
-    "audit:v53": "node scripts/audit-v53-image-export.mjs"
+    "audit:v53": "node scripts/audit-v53-image-export.mjs",
+    "audit:v56": "node scripts/audit-v56-overlay-auth.mjs",
+    "audit:provider-costs": "node scripts/audit-provider-costs.mjs",
+    "audit:v58": "node scripts/audit-v58-provider-pricing.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^5.7.8",

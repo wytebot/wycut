@@ -12,9 +12,9 @@ import { CREDIT_PACKS, SCRIPT_CREDITS_MAX, SCRIPT_CREDITS_MIN, formatCredits, fo
 type ProductId = string;
 const productIds: ProductId[] = CREDIT_PACKS.map(pack => pack.id);
 const EXAMPLES = [
-  { label: '20-min video → 3-min recap', credits: transcribeCreditsForVideo(1200) + scriptCredits(20_000) + narrationCredits(2700) },
-  { label: '90-min movie → 8-min recap', credits: transcribeCreditsForVideo(5400) + scriptCredits(70_000) + narrationCredits(7200) },
-  { label: 'Any subtitle file → script only', credits: scriptCredits(30_000) },
+  { label: '20-min video → 3-min recap', credits: transcribeCreditsForVideo(1200) + scriptCredits(20_000, 1200, 180, 12) + narrationCredits(2700) },
+  { label: '90-min movie → 8-min recap', credits: transcribeCreditsForVideo(5400) + scriptCredits(70_000, 5400, 480, 20) + narrationCredits(7200) },
+  { label: 'Any subtitle file → script only', credits: scriptCredits(30_000, 0, 600, 12) },
 ];
 function getIdentityLabel(token: string) {
   try { const part = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'); const payload = JSON.parse(atob(part.padEnd(Math.ceil(part.length / 4) * 4, '='))) as { email?: string; phone_number?: string }; return String(payload.email || payload.phone_number || 'Signed-in account'); } catch { return 'Signed-in account'; }

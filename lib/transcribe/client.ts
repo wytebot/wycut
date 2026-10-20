@@ -79,8 +79,16 @@ export async function transcribeVideoToSrt(video: File, getToken: () => Promise<
   // Paid parts survive an app restart too: re-picking the same video finds them again, so nothing is paid for twice.
   for (let i = 0; i < chunks.length; i++) { const key = keyFor(i); if (!key) continue; const cached = chunkCache.get(key) || await getChunk<ApiSegment[]>(key) || undefined; if (cached) { results[i] = cached; chunkCache.set(key, cached); } }
   // Check the balance for the whole video BEFORE paying for any part, so a short balance never leaves a half-transcribed video.
-  const needed = chunks.reduce((sum, chunk, i) => sum + (results[i] ? 0 : transcribeCredits(chunk.durationSeconds)), 0);
-  if (needed > 0 && options.ensureCredits) await options.ensureCredits(needed);
+  let needed = chunks.reduce((sum, chunk, i) => sum + (results[i] ? 0 : transcribeCredits(chunk.durationSeconds)), 0);
+  if (needed > 0 && options.ensureCredits) {
+    // Ask the server which already-configured provider will be used so the balance preflight matches the real charge.
+    try {
+      const estimateToken = await getToken();
+      const estimateResponse = await fetch(apiUrl('/api/transcribe/estimate'), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Device-Id': deviceId() }, body: JSON.stringify({ idToken: estimateToken, durations: chunks.filter((_, i) => !results[i]).map(chunk => chunk.durationSeconds) }), cache: 'no-store' });
+      if (estimateResponse.ok) { const estimate = await estimateResponse.json() as { creditsNeeded?: number }; if (Number.isFinite(estimate.creditsNeeded)) needed = Math.max(0, Math.ceil(Number(estimate.creditsNeeded))); }
+    } catch { /* Keep conservative local estimate if provider preflight is temporarily unavailable. */ }
+    await options.ensureCredits(needed);
+  }
   let done = chunks.filter((_, i) => results[i]).length; let cursor = 0;
   const worker = async () => {
     while (true) {

@@ -4,11 +4,12 @@
   "welcomeCredits": 30,
   "legacyRecapToCredits": 150,
   "rates": {
-    "transcribeSecondsPerCredit": 150,
-    "scriptCredits": 14,
-    "scriptLongCredits": 18,
+    "transcribeSecondsPerCredit": 80,
+    "scriptCredits": 34,
+    "scriptLongCredits": 44,
     "scriptLongThresholdChars": 60000,
-    "narrationCreditsPer1000Chars": 5
+    "narrationCreditsPer1000Chars": 11,
+    "transcribeWhisperSecondsPerCredit": 18
   },
   "packs": [
     {
@@ -54,12 +55,13 @@
     }
   ],
   "costModelUsd": {
-    "_note": "Provider cost estimates used only by scripts/audit-pricing.mjs. Re-check against provider price pages before changing prices.",
+    "_note": "Provider-aware conservative pricing audit. Gemini 2.5 Flash-Lite transcription allowance is $0.0052 per 300-second chunk; OpenAI Whisper fallback is budgeted at $0.006/minute ($0.03 per 300 seconds). Script allowance covers Gemini 2.5 Flash / OpenAI GPT-4o-mini. TTS allowance covers OpenAI TTS-1 / Deepgram Aura. overheadFactor=1.5 reserves for provider price variance, infrastructure, payment fees and operational leakage. Estimates are not live invoice usage. Minimum gross margin target is 65% at the cheapest credit-pack rate.",
     "transcribePer300sChunk": 0.0052,
     "scriptPerGeneration": 0.046,
     "ttsPer1000Chars": 0.015,
-    "overheadFactor": 1.15,
-    "minimumMarginAtCheapestPack": 0.5
+    "overheadFactor": 1.5,
+    "minimumMarginAtCheapestPack": 0.65,
+    "transcribeWhisperPer300sChunk": 0.03
   },
   "editorAssets": {
     "policyVersion": 1,

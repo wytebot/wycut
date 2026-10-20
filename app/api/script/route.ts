@@ -4,7 +4,7 @@ import { generateRecapScript } from '@/lib/ai/script-generator';
 import { isAllowedApiOrigin } from '@/lib/server/origin';
 import { verifyGoogleIdentity } from '@/lib/billing/google-identity';
 import { InsufficientCreditsError, JobCancelledError, cleanJobId, markRecapCreditConsumed, markRecapCreditStarted, refundRecapCredit, reserveRecapCredit } from '@/lib/billing/credits';
-import { scriptCredits } from '@/lib/billing/pricing';
+import { scriptCredits, transcriptDurationSeconds } from '@/lib/billing/pricing';
 export const runtime = 'nodejs';
 export const maxDuration = 120;
 export async function POST(req: NextRequest) {
@@ -21,7 +21,11 @@ export async function POST(req: NextRequest) {
   if (identity.email.endsWith('@phone.wycut.invalid')) return NextResponse.json({ error: 'A verified Google email is required to use WyCut credits.', code: 'GOOGLE_EMAIL_REQUIRED' }, { status: 403 });
   let usageId = '';
   try {
-    usageId = await reserveRecapCredit(identity.userId, identity.email, body.title, deviceId, scriptCredits(body.transcript.length), cleanJobId(body.jobId));
+    const sourceDuration = transcriptDurationSeconds(body.transcript);
+    const targetRuntime = Math.min(3600, Math.max(60, Math.floor(Number(body.targetRuntimeSeconds) || 600)));
+    const beatCount = Math.min(70, Math.max(10, Math.floor(Number(body.beatCount) || 12)));
+    const requiredCredits = scriptCredits(body.transcript.length, sourceDuration, targetRuntime, beatCount);
+    usageId = await reserveRecapCredit(identity.userId, identity.email, body.title, deviceId, requiredCredits, cleanJobId(body.jobId));
   } catch (e) {
     if (e instanceof JobCancelledError) return NextResponse.json({ error: 'This generation was cancelled.', code: 'JOB_CANCELLED' }, { status: 409, headers: { 'Cache-Control': 'no-store' } });
     if (e instanceof InsufficientCreditsError) return NextResponse.json({ error: `This script needs ${e.needed} credits and your balance is ${Math.floor(e.balance)}. Top up to continue.`, code: 'INSUFFICIENT_CREDITS', needed: e.needed, balance: Math.floor(e.balance), billingUrl: '/billing' }, { status: 402, headers: { 'Cache-Control': 'no-store' } });

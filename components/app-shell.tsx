@@ -4,6 +4,7 @@ import dynamic from 'next/dynamic';
 import { usePathname, useRouter } from 'next/navigation';
 import { useEffect, useState, type ReactNode } from 'react';
 import { AppMenu } from '@/components/app-menu';
+import { firebaseAuth } from '@/lib/firebase/client';
 
 // The studio is loaded on demand and then kept mounted while the user moves between pages, so a running
 // generation keeps going when they open History, Billing or the menu instead of being cut off by the navigation.
@@ -22,9 +23,22 @@ export function AppShell({ children }: { children: ReactNode }) {
   useEffect(() => {
     const protectedPath = path === '/dashboard' || path.startsWith('/dashboard/') || path === '/history' || path === '/billing';
     if (!protectedPath) return;
-    let token = '';
-    try { token = localStorage.getItem('wycut_google_id_token') || sessionStorage.getItem('wycut_google_id_token') || ''; } catch { /* storage may be unavailable */ }
-    if (!token) router.replace(`/login?next=${encodeURIComponent(path)}`);
+    let cancelled = false;
+    void (async () => {
+      // Wait for Firebase's persistent browser/Capacitor session to restore before redirecting.
+      try {
+        await firebaseAuth.authStateReady();
+        if (cancelled) return;
+        if (firebaseAuth.currentUser) {
+          try { const fresh = await firebaseAuth.currentUser.getIdToken(); if (cancelled) return; localStorage.setItem('wycut_google_id_token', fresh); localStorage.setItem('wycut_auth_email', firebaseAuth.currentUser.email || ''); return; } catch { /* fall back to a stored token during transient network errors */ }
+        }
+      } catch { /* Firebase restore failed; check the previous token below */ }
+      if (cancelled) return;
+      let token = '';
+      try { token = localStorage.getItem('wycut_google_id_token') || sessionStorage.getItem('wycut_google_id_token') || ''; } catch { /* storage may be unavailable */ }
+      if (!token) router.replace(`/login?next=${encodeURIComponent(path)}`);
+    })();
+    return () => { cancelled = true; };
   }, [path, router]);
   useEffect(() => { if (onStudio) setFlow('file'); }, [path, onStudio]);
   return <>
