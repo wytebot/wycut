@@ -20,10 +20,14 @@ import { signInWithGoogleNative } from '@/lib/auth/google-native';
 
 const TOKEN_KEY = 'wycut_google_id_token';
 
-function readableAuthError(error: unknown): string {
-  const code = typeof error === 'object' && error && 'code' in error
+function authErrorCode(error: unknown): string {
+  return typeof error === 'object' && error && 'code' in error
     ? String((error as { code?: unknown }).code)
     : '';
+}
+
+function readableAuthError(error: unknown): string {
+  const code = authErrorCode(error);
   const messages: Record<string, string> = {
     'auth/popup-blocked': 'Your browser blocked the Google sign-in popup. Please allow popups and try again.',
     'auth/popup-closed-by-user': 'The Google sign-in window was closed before sign-in finished.',
@@ -33,6 +37,7 @@ function readableAuthError(error: unknown): string {
     'auth/network-request-failed': 'Network connection failed. Check your internet connection and retry.',
     'auth/account-exists-with-different-credential': 'An account already exists with this email using a different sign-in method. Contact support for help.',
     'auth/web-storage-unsupported': 'Browser storage is unavailable. Allow site storage or try another browser.',
+    'auth/argument-error': 'Firebase rejected the sign-in configuration. Refresh this page once; if it continues, the deployed Firebase Auth configuration or SDK initialization needs correction.',
   };
   return messages[code] || (error instanceof Error ? error.message : 'Google sign-in failed. Please try again.');
 }
@@ -43,6 +48,7 @@ export default function LoginPage() {
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
   const redirectHandled = useRef(false);
+  const authStep = useRef('initializing Firebase Auth');
 
   function continueToApp() {
     const params = new URLSearchParams(window.location.search);
@@ -67,8 +73,13 @@ export default function LoginPage() {
       try {
         // Restore the persisted Firebase user before deciding whether login is needed.
         // Firebase refreshes expired ID tokens when finishLogin calls getIdToken(true).
+        authStep.current = 'restoring Firebase Auth session';
         await firebaseAuth.authStateReady();
-        if (!Capacitor.isNativePlatform()) await setPersistence(firebaseAuth, browserLocalPersistence);
+        if (!Capacitor.isNativePlatform()) {
+          authStep.current = 'setting browser session persistence';
+          await setPersistence(firebaseAuth, browserLocalPersistence);
+        }
+        authStep.current = 'checking Google redirect result';
         const result = await getRedirectResult(firebaseAuth);
         if (active && result?.user) { await finishLogin(result.user); return; }
         if (active && firebaseAuth.currentUser) { await finishLogin(firebaseAuth.currentUser); return; }
@@ -76,7 +87,8 @@ export default function LoginPage() {
           if (active && user) { unsubscribe(); void finishLogin(user).catch(e => setError(readableAuthError(e))); }
         });
       } catch (e) {
-        if (active) setError(readableAuthError(e));
+        console.error('[WyCut Google login] session restore failed at:', authStep.current, e);
+        if (active) setError(`${readableAuthError(e)} (Step: ${authStep.current}; code: ${authErrorCode(e) || 'unknown'}.)`);
       }
     })();
     return () => { active = false; unsubscribe(); };
@@ -90,17 +102,21 @@ export default function LoginPage() {
     setNotice('Opening Google sign-in…');
     try {
       if (Capacitor.isNativePlatform()) {
+        authStep.current = 'native Google account selection';
         const nativeUser = await signInWithGoogleNative();
         localStorage.setItem(TOKEN_KEY, nativeUser.authentication.idToken);
         localStorage.setItem('wycut_auth_email', nativeUser.email || '');
         continueToApp();
         return;
       }
+      authStep.current = 'setting browser session persistence';
       await setPersistence(firebaseAuth, browserLocalPersistence);
+      authStep.current = 'starting Google OAuth popup';
       const provider = new GoogleAuthProvider();
       provider.setCustomParameters({ prompt: 'select_account' });
       try {
         const result = await signInWithPopup(firebaseAuth, provider);
+        authStep.current = 'saving Firebase user session';
         await finishLogin(result.user);
       } catch (e) {
         const code = typeof e === 'object' && e && 'code' in e
@@ -114,12 +130,14 @@ export default function LoginPage() {
           'auth/web-storage-unsupported',
         ];
         if (!fallbackCodes.includes(code)) throw e;
+        authStep.current = 'starting Google OAuth redirect';
         setNotice('Popup unavailable. Switching to Google redirect sign-in…');
         await signInWithRedirect(firebaseAuth, provider);
         return;
       }
     } catch (e) {
-      setError(readableAuthError(e));
+      console.error('[WyCut Google login] sign-in failed at:', authStep.current, e);
+      setError(`${readableAuthError(e)} (Step: ${authStep.current}; code: ${authErrorCode(e) || 'unknown'}.)`);
       setNotice('');
       setBusy(false);
     }

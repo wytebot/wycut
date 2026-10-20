@@ -1,5 +1,5 @@
 import { getApp, getApps, initializeApp } from 'firebase/app';
-import { browserLocalPersistence, getAuth, indexedDBLocalPersistence, initializeAuth, inMemoryPersistence } from 'firebase/auth';
+import { getAuth } from 'firebase/auth';
 
 // Firebase web configuration is public client configuration, not a server secret.
 const firebaseConfig = {
@@ -12,11 +12,9 @@ const firebaseConfig = {
   measurementId: 'G-L4G5PVMJTM',
 };
 
+// Use Firebase's standard Auth initialization. The previous custom initializeAuth()
+// persistence array could leave Auth initialized differently depending on module load
+// order (especially after a client-side navigation or hot reload). Login explicitly
+// selects browserLocalPersistence on web before starting the OAuth flow.
 export const firebaseApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
-// Keep sessions across visits in browser and Capacitor WebView. IndexedDB survives app restarts;
-// browserLocalPersistence is retained as a fallback for WebViews with restricted IndexedDB.
-function createPersistentAuth() {
-  try { return initializeAuth(firebaseApp, { persistence: [indexedDBLocalPersistence, browserLocalPersistence, inMemoryPersistence] }); }
-  catch { return getAuth(firebaseApp); } // Another module may already have initialized Firebase Auth.
-}
-export const firebaseAuth = createPersistentAuth();
+export const firebaseAuth = getAuth(firebaseApp);
