@@ -16,7 +16,17 @@ export type EditPlan = {
   emoji?: string;
   sticker?: string;
   watermark: boolean;
+  /** Colour adjustments, each -100..100 (0 = unchanged). */
+  adjust: Adjust;
 };
+export type Adjust = { brightness: number; contrast: number; saturation: number; temperature: number; sharpness: number; vignette: number };
+export const NO_ADJUST: Adjust = { brightness: 0, contrast: 0, saturation: 0, temperature: 0, sharpness: 0, vignette: 0 };
+export function normalizeAdjust(value: unknown): Adjust {
+  const v = value && typeof value === 'object' ? value as Partial<Adjust> : {};
+  const n = (x: unknown) => { const num = Number(x); return Number.isFinite(num) ? Math.round(Math.min(100, Math.max(-100, num))) : 0; };
+  return { brightness: n(v.brightness), contrast: n(v.contrast), saturation: n(v.saturation), temperature: n(v.temperature), sharpness: Math.max(0, n(v.sharpness)), vignette: Math.max(0, n(v.vignette)) };
+}
+export function hasAdjust(a: Adjust): boolean { return Object.values(a).some(x => x !== 0); }
 export const FREE_ASSETS = {
   filters: ['Original','Cinematic','Vivid','Monochrome','Warm','Cool','Vintage','Dream','Dramatic','Fade'],
   effects: ['None','Glow','Blur','Sharpen','Grain','Glitch','Chromatic','Vignette','Bloom','Soft'],
@@ -40,11 +50,11 @@ export function normalizeEditPlan(value: unknown): EditPlan {
   const v = value && typeof value === 'object' ? value as Partial<EditPlan> : {};
   const ratio = ['9:16','1:1','16:9','4:5'].includes(String(v.aspectRatio)) ? v.aspectRatio! : '9:16';
   return { schemaVersion: EDIT_PLAN_VERSION, aspectRatio: ratio, filter: String(v.filter || 'Original'), effect: String(v.effect || 'None'), transition: String(v.transition || 'Cut'),
-    speed: Math.min(2, Math.max(0.25, Number(v.speed) || 1)), volume: Math.min(2, Math.max(0, Number(v.volume ?? 1))),
+    speed: Math.min(2, Math.max(0.5, Number(v.speed) || 1)), volume: Math.min(2, Math.max(0, Number(v.volume ?? 1))),
     fadeInSeconds: Math.min(5, Math.max(0, Number(v.fadeInSeconds) || 0)), fadeOutSeconds: Math.min(5, Math.max(0, Number(v.fadeOutSeconds) || 0)),
     mirror: Boolean(v.mirror), crop: v.crop === 'cover' ? 'cover' : 'contain',
     text: v.text && typeof v.text.value === 'string' ? { value: v.text.value.slice(0, 500), animation: String(v.text.animation || 'None'), font: String(v.text.font || 'Inter'), position: ['top','center','bottom'].includes(String(v.text.position)) ? v.text.position! : 'center' } : undefined,
-    emoji: typeof v.emoji === 'string' ? v.emoji.slice(0, 12) : '', sticker: typeof v.sticker === 'string' ? v.sticker.slice(0, 120) : '', watermark: Boolean(v.watermark) };
+    emoji: typeof v.emoji === 'string' ? v.emoji.slice(0, 12) : '', sticker: typeof v.sticker === 'string' ? v.sticker.slice(0, 120) : '', watermark: Boolean(v.watermark), adjust: normalizeAdjust(v.adjust) };
 }
 export function videoFilterForPlan(planValue: unknown): string {
   const p = normalizeEditPlan(planValue); const filters: string[] = [];
@@ -52,12 +62,32 @@ export function videoFilterForPlan(planValue: unknown): string {
   const size = dimensions[p.aspectRatio] || dimensions['9:16'];
   filters.push(`scale=${size}:force_original_aspect_ratio=increase`, `crop=${size}`, 'setsar=1');
   const f = FILTERS[p.filter]; if (f && f !== 'null') filters.push(f);
+  filters.push(...adjustFilters(p.adjust));
   if (p.mirror) filters.push('hflip');
   const effects: Record<string,string> = { Glow:'eq=brightness=0.04:saturation=1.2', Blur:'gblur=sigma=1.2', Sharpen:'unsharp=5:5:0.8:3:3:0', Grain:'noise=alls=8:allf=t', Glitch:'hue=h=18,eq=contrast=1.25', Chromatic:'hue=h=8:s=1.2', Vignette:'vignette=PI/4', Bloom:'eq=brightness=0.06', Soft:'gblur=sigma=0.45', HighContrast:'eq=contrast=1.55', LowContrast:'eq=contrast=0.78', Invert:'negate', Solarize:'negate,hue=s=1.3', Posterize:'eq=contrast=1.4:saturation=1.4', Thermal:'hue=h=220:s=1.8', Underwater:'hue=h=40:s=0.85', Heatwave:'colorbalance=rs=0.1:bs=-0.08', LightLeak:'eq=brightness=0.08', Dreamy:'gblur=sigma=0.25,eq=brightness=0.04', CCTV:'hue=s=0,eq=contrast=1.5:brightness=-0.08' };
   if (effects[p.effect]) filters.push(effects[p.effect]);
   if (p.speed !== 1) filters.push(`setpts=${(1 / p.speed).toFixed(4)}*PTS`);
   if (p.fadeInSeconds > 0) filters.push(`fade=t=in:st=0:d=${p.fadeInSeconds}`);
   return filters.join(',');
+}
+/** ffmpeg filters for the Adjust sliders. Order: exposure/colour first, then sharpness and vignette. */
+export function adjustFilters(a: Adjust): string[] {
+  const out: string[] = [];
+  if (a.brightness || a.contrast || a.saturation) out.push(`eq=brightness=${(a.brightness / 250).toFixed(3)}:contrast=${(1 + a.contrast / 200).toFixed(3)}:saturation=${(1 + a.saturation / 100).toFixed(3)}`);
+  if (a.temperature) { const t = (a.temperature / 400).toFixed(3); out.push(`colorbalance=rs=${t}:gs=0:bs=${(-a.temperature / 400).toFixed(3)}`); }
+  if (a.sharpness > 0) out.push(`unsharp=5:5:${(a.sharpness / 50).toFixed(2)}:3:3:0`);
+  if (a.vignette > 0) out.push(`vignette=a=${(Math.PI / 2 * a.vignette / 100).toFixed(3)}`);
+  return out;
+}
+/** CSS filter that mirrors the Adjust sliders in the live preview (vignette is drawn separately). */
+export function previewAdjustForPlan(value: unknown): string {
+  const a = normalizeAdjust(value); const parts: string[] = [];
+  if (a.brightness) parts.push(`brightness(${(1 + a.brightness / 200).toFixed(3)})`);
+  if (a.contrast) parts.push(`contrast(${(1 + a.contrast / 200).toFixed(3)})`);
+  if (a.saturation) parts.push(`saturate(${(1 + a.saturation / 100).toFixed(3)})`);
+  if (a.temperature > 0) parts.push(`sepia(${(a.temperature / 250).toFixed(3)})`);
+  if (a.temperature < 0) parts.push(`hue-rotate(${(a.temperature / 5).toFixed(1)}deg)`);
+  return parts.join(' ');
 }
 export function audioFilterForPlan(planValue: unknown, duration = 0): string {
   const p = normalizeEditPlan(planValue); const filters = [`volume=${p.volume}`]; if (p.speed !== 1) filters.push(`atempo=${p.speed}`); if (p.fadeInSeconds > 0) filters.push(`afade=t=in:st=0:d=${p.fadeInSeconds}`); if (p.fadeOutSeconds > 0 && duration > p.fadeOutSeconds) filters.push(`afade=t=out:st=${Math.max(0, duration - p.fadeOutSeconds).toFixed(3)}:d=${p.fadeOutSeconds}`); return filters.join(',');

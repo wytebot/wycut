@@ -7,6 +7,7 @@ export type SlicedClip = { filename: string; blob: Blob; size: number };
 let ffmpegInstance: FFmpeg | null = null;
 let loadPromise: Promise<FFmpeg> | null = null;
 let operationQueue: Promise<unknown> = Promise.resolve();
+let coreCache: { coreURL: string; wasmURL: string } | null = null;
 
 // FFmpeg uses one in-memory filesystem; serialize jobs so overlapping UI actions
 // cannot overwrite shared filenames or terminate another operation.
@@ -25,8 +26,8 @@ async function getFFmpeg(): Promise<FFmpeg> {
       loadPromise = (async () => {
         // Prefer the copy bundled with the app (cached, works offline, no 30 MB download each time); fall back to the CDN.
         const sources = ['/ffmpeg', 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd'];
-        let coreURL = ''; let wasmURL = ''; let lastError: unknown = null;
-        for (const base of sources) {
+        let coreURL = coreCache?.coreURL || ''; let wasmURL = coreCache?.wasmURL || ''; let lastError: unknown = null;
+        for (const base of coreCache ? [] : sources) {
           try {
             [coreURL, wasmURL] = await Promise.all([
               toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
@@ -36,6 +37,7 @@ async function getFFmpeg(): Promise<FFmpeg> {
           } catch (error) { lastError = error; }
         }
         if (lastError || !coreURL) throw lastError instanceof Error ? lastError : new Error('Could not load the video engine.');
+        coreCache = { coreURL, wasmURL };
         await ffmpeg.load({ coreURL, wasmURL });
         return ffmpeg;
       })().finally(() => { loadPromise = null; });
@@ -45,6 +47,9 @@ async function getFFmpeg(): Promise<FFmpeg> {
   return ffmpeg;
 }
 /** Largest video WyCut will open. The file is read in place (not copied into memory), so this is a technical limit, not a RAM limit. */
+/** Starts loading the video engine in the background so the first cut does not wait for it. Safe to call repeatedly. */
+export function warmFFmpeg(): void { if (typeof window === 'undefined') return; void getFFmpeg().catch(() => undefined); }
+
 export const MAX_SOURCE_BYTES = 2 * 1024 * 1024 * 1024 - 1;
 export const MAX_SOURCE_LABEL = '2 GB';
 const MEMORY_FALLBACK_BYTES = 100 * 1024 * 1024;
@@ -83,18 +88,22 @@ export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgr
   const ffmpeg = await getFFmpeg();
   const sourceName = `source_${Date.now()}.${extension}`;
   let source: Awaited<ReturnType<typeof openSource>> | null = null;
-  const progressHandler = ({ progress }: { progress: number }) => onProgress?.(Math.min(1, Math.max(0, progress)), 0, sorted.length);
+  let activeClip = 0;
+  const progressHandler = ({ progress }: { progress: number }) => { const within = Number.isFinite(progress) ? Math.min(0.99, Math.max(0, progress)) : 0; onProgress?.(Math.min(0.99, (activeClip + within) / sorted.length), activeClip + 1, sorted.length); };
   ffmpeg.on('progress', progressHandler);
   const results: SlicedClip[] = [];
   try {
     source = await openSource(ffmpeg, file, sourceName);
     for (let i = 0; i < sorted.length; i++) {
+      activeClip = i; onProgress?.(i / sorted.length, i + 1, sorted.length);
       const range = sorted[i]; const id = safeName(range.id); const filename = `${String(range.index).padStart(3, '0')}_${id}.mp4`;
       if (range.endSeconds - range.startSeconds > 3600) throw new Error(`Clip ${filename} is over one hour long; split the range before processing.`);
       // Re-encode after accurate seeking. All clips use the same H.264/AAC settings so the rough-cut concat is more reliable.
       const output = `out_${i}.mp4`;
       const duration = range.endSeconds - range.startSeconds;
       const start = range.startSeconds.toFixed(3); const length = duration.toFixed(3);
+      // Precise path: start half a millisecond early so rounding can never drop the first frame, and end 3 ms early so the last frame is never one too many.
+      const preciseStart = Math.max(0, range.startSeconds - 0.0005).toFixed(4); const preciseLength = Math.max(0.01, duration - 0.003).toFixed(4); // ffmpeg's -t keeps one frame too many on frame-aligned ends; 3 ms is less than any frame gap up to 240 fps (tested: exact frame counts)
       // Fast cut copies the streams (no re-encode): seconds instead of minutes, but it starts at the nearest earlier keyframe.
       const lowResolution = options.resolution === '720p';
       const dimensions = options.aspectRatio === '9:16' ? (lowResolution ? '720:1280' : '1080:1920')
@@ -102,8 +111,8 @@ export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgr
         : options.aspectRatio === '1:1' ? (lowResolution ? '720:720' : '1080:1080')
         : options.aspectRatio === '4:5' ? (lowResolution ? '720:900' : '1080:1350') : '';
       const vf = dimensions ? `scale=${dimensions}:force_original_aspect_ratio=increase,crop=${dimensions},setsar=1` : '';
-      let code = options.fast && !options.aspectRatio ? await ffmpeg.exec(['-ss', start, '-i', source.path, '-t', length, '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', '-y', output]) : -1;
-      const encodeArgs = ['-ss', start, '-i', source.path, '-t', length, '-map', '0:v:0', '-map', '0:a?', ...(vf ? ['-vf', vf] : []), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', '-y', output];
+      let code = options.fast && !options.aspectRatio ? await ffmpeg.exec(['-ss', start, '-i', source.path, '-t', length, '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', '-sn', '-dn', '-avoid_negative_ts', 'make_zero', '-y', output]) : -1;
+      const encodeArgs = ['-accurate_seek', '-ss', preciseStart, '-i', source.path, '-t', preciseLength, '-map', '0:v:0', '-map', '0:a?', ...(vf ? ['-vf', vf] : []), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-af', 'aresample=async=1:first_pts=0', '-sn', '-dn', '-pix_fmt', 'yuv420p', '-avoid_negative_ts', 'make_zero', '-y', output];
       if (code !== 0 && !(options.fast && file.size > 150 * 1024 * 1024)) code = await ffmpeg.exec(encodeArgs);
       if (code !== 0) {
         if (options.fast && file.size > 150 * 1024 * 1024) throw new Error(`Fast cutting could not read clip ${filename}. To protect memory on this large source, WyCut did not automatically retry with a memory-heavy re-encode. Try another MP4/MOV copy or disable Fast Cut only for smaller files.`);
@@ -111,8 +120,7 @@ export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgr
       }
       const data = await ffmpeg.readFile(output);
       if (typeof data === 'string' || data.length === 0) throw new Error(`FFmpeg produced an empty clip for ${filename}.`);
-      const bytes = new Uint8Array(data as Uint8Array);
-      results.push({ filename, blob: new Blob([bytes.buffer as ArrayBuffer], { type: 'video/mp4' }), size: bytes.byteLength });
+      results.push({ filename, blob: new Blob([data as unknown as BlobPart], { type: 'video/mp4' }), size: data.length });
       await ffmpeg.deleteFile(output);
       onProgress?.((i + 1) / sorted.length, i + 1, sorted.length);
     }
@@ -159,7 +167,7 @@ export async function concatenateClipsLocally(clips: SlicedClip[], onProgress?: 
     const output = await ffmpeg.readFile('Full_RoughCut.mp4');
     if (typeof output === 'string' || !output.length) throw new Error('FFmpeg produced an empty rough cut.');
     onProgress?.(1);
-    return new Blob([new Uint8Array(output as Uint8Array)], { type: 'video/mp4' });
+    return new Blob([output as unknown as BlobPart], { type: 'video/mp4' });
   } finally {
     ffmpeg.off('progress', progressHandler);
     for (const name of [...names, 'concat_list.txt', 'Full_RoughCut.mp4']) { try { await ffmpeg.deleteFile(name); } catch { /* cleanup is best effort */ } }

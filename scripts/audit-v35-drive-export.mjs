@@ -8,10 +8,10 @@ assert.match(workspace, /editPlan: normalizeEditPlan/, 'exports must persist the
 assert.match(workspace, /SOURCE_ORIGINAL_/, 'export must include original source media');
 assert.match(workspace, /mediaAssets/, 'export must persist extra timeline media assets');
 assert.match(workspace, /fetchDriveBlob\(driveToken, sourceItem\.id\)/, 'restore must read source media from Drive');
-assert.match(workspace, /Add video\/image/, 'media timeline must have an add control');
+assert.match(read('components/editor-v42-layout.tsx'), /Add video or image/, 'media timeline must have an add control');
 assert.match(workspace, /exportPage \? <main/, 'export must switch to its export screen');
 assert.match(workspace, /Export successful/, 'export screen must show successful completion');
 assert.match(workspace, /setExportProgress\(p\.percent\)/, 'Drive export must report progress');
-assert.match(read('components/sound-library.tsx'), /Add sound/, 'sound timeline must expose add control');
+assert.match(read('components/sound-library.tsx'), /Add audio from device/, 'audio timeline must expose add control');
 assert.match(read('lib/drive/export.ts'), /onProgress\?: \(progress:/, 'Drive uploader must support progress reporting');
 console.log('WyCut v35 Drive restore, media timeline and export-screen static audit passed.');

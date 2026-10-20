@@ -56,10 +56,11 @@ export async function renderEditPlan(input: Blob, planInput: EditPlan | unknown,
     await ff.writeFile(inputName, await fetchFile(input));
     const overlay = await makeOverlay(plan);
     let vf = videoFilterForPlan(plan);
-    if (plan.fadeOutSeconds > 0 && duration > plan.fadeOutSeconds) vf = [vf, `fade=t=out:st=${Math.max(0, duration - plan.fadeOutSeconds).toFixed(3)}:d=${plan.fadeOutSeconds}`].filter(Boolean).join(',');
+    const outDuration = duration / plan.speed;
+    if (plan.fadeOutSeconds > 0 && outDuration > plan.fadeOutSeconds) vf = [vf, `fade=t=out:st=${Math.max(0, outDuration - plan.fadeOutSeconds).toFixed(3)}:d=${plan.fadeOutSeconds}`].filter(Boolean).join(',');
     const args = ['-i', inputName];
     if (overlay) { await ff.writeFile(overlayName, await fetchFile(overlay)); args.push('-i', overlayName); }
-    const audio = audioFilterForPlan(plan, duration);
+    const audio = audioFilterForPlan(plan, outDuration);
     if (overlay) { const chain = vf ? `[0:v]${vf}[base];[base][1:v]overlay=(W-w)/2:(H-h)/2:format=auto[vout]` : '[0:v][1:v]overlay=(W-w)/2:(H-h)/2:format=auto[vout]'; args.push('-filter_complex', chain); }
     else if (vf) args.push('-vf', vf);
     args.push('-map', overlay ? '[vout]' : '0:v:0', '-map', '0:a:0?', '-af', audio, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', '-y', outputName);

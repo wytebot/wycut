@@ -31,7 +31,7 @@ export function AppMenu({ path }: { path: string }) {
   const isActive = (href: string) => { const base = href.split('?')[0]; return path === base || (base === '/dashboard' && path.startsWith('/dashboard')); };
   return <>
     {open && <div aria-hidden="true" onPointerDown={() => setOpen(false)} className="fixed inset-0 z-40 bg-black/40 backdrop-blur-[1px]" />}
-    <div className="fixed right-4 z-50 flex flex-col items-end gap-2" style={{ bottom: 'calc(env(safe-area-inset-bottom, 0px) + 1rem)' }}>
+    <div data-app-menu="true" className="fixed right-4 z-50 flex flex-col items-end gap-2" style={{ bottom: 'calc(env(safe-area-inset-bottom, 0px) + 1rem)' }}>
       <nav id="wycut-menu" aria-label="Main menu" aria-hidden={!open} className={`w-60 origin-bottom-right overflow-y-auto rounded-2xl border border-white/10 bg-[#111521] shadow-2xl shadow-black/60 transition-all duration-200 ${open ? 'max-h-[75vh] scale-100 opacity-100' : 'pointer-events-none max-h-0 scale-95 opacity-0'}`}>
         <ul className="p-2">
           {ITEMS.map(({ href, label, Icon }) => <li key={href}>

@@ -40,3 +40,7 @@ button, input { font: inherit; }
   #timeline-editor { overscroll-behavior: contain; }
   #timeline-editor > div { max-width: 100%; }
 }
+
+/* The floating app menu would cover the editor tool bar, so hide it while a video is open. Closing the editor brings it back. */
+body.wycut-editor-open [data-app-menu] { display: none; }
+body.wycut-editor-open { overflow: hidden; overscroll-behavior: none; }
