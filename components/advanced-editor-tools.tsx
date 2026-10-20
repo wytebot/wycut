@@ -1,5 +1,5 @@
 'use client';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Capacitor } from '@capacitor/core';
 import type { ReactNode } from 'react';
 import { Download, ArrowLeft, ArrowRight, ChevronLeft, ChevronRight, Copy, Crop, FlipHorizontal, Gauge, Maximize2, Scissors, ShieldCheck, Trash2, Timer, Volume2, Type, Smile } from 'lucide-react';
