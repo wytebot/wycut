@@ -44,3 +44,11 @@ button, input { font: inherit; }
 /* The floating app menu would cover the editor tool bar, so hide it while a video is open. Closing the editor brings it back. */
 body.wycut-editor-open [data-app-menu] { display: none; }
 body.wycut-editor-open { overflow: hidden; overscroll-behavior: none; }
+
+
+/* Brief, self-contained previews for effect/filter/animation catalog tiles. */
+@keyframes wy-asset-preview { 0%,100%{transform:scale(1) rotate(0);filter:brightness(1)} 20%{transform:scale(1.08) rotate(-2deg);filter:brightness(1.25)} 45%{transform:translateX(3px) scale(.98);filter:contrast(1.35) saturate(1.4)} 70%{transform:translateX(-2px) scale(1.04);filter:brightness(1.1)} }
+@keyframes wy-transition-preview { 0%{transform:translateX(0) scale(1);filter:brightness(1)} 35%{transform:translateX(5px) scale(1.04);filter:brightness(1.5)} 65%{transform:translateX(-5px) scale(.98);filter:contrast(1.5)} 100%{transform:translateX(0) scale(1);filter:brightness(1)} }
+.wy-asset-preview { animation: wy-asset-preview 850ms ease-in-out both; }
+.wy-transition-preview { animation: wy-transition-preview 850ms ease-in-out both; }
+@media (prefers-reduced-motion: reduce) { .wy-asset-preview, .wy-transition-preview { animation-duration: 1ms; } }

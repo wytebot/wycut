@@ -5,6 +5,8 @@ import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { LoaderCircle, Trash2, PlayCircle, CheckCircle2, Cloud, ChevronDown, FileText, Mic2, Film, ExternalLink, Download, RefreshCw, Plus } from 'lucide-react';
 import type { ProjectRecord } from '@/lib/projects/store';
+import { listProjects } from '@/lib/projects/store';
+import { requestOpenProject } from '@/lib/projects/bus';
 import { requestDriveConnect, requestOpenDriveProject, readDriveToken } from '@/lib/projects/bus';
 import { DRIVE_TOKEN_EVENT } from '@/lib/projects/bus';
 import { listWyCutProjectFolders, deleteDriveFile, loadProductionKit, fetchDriveBlob, fetchDriveText, DriveReadError, type DriveKit, type DriveItem } from '@/lib/drive/read';
@@ -15,9 +17,11 @@ const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MB`;
 
 export function HistoryView() {
   const [projects, setProjects] = useState<ProjectRecord[] | null>(null);
+  const [localProjects, setLocalProjects] = useState<ProjectRecord[]>([]);
   const [driveConnected, setDriveConnected] = useState(false);
   const [message, setMessage] = useState('');
   const refresh = useCallback(async () => {
+    setLocalProjects(await listProjects());
     const token = readDriveToken();
     setDriveConnected(Boolean(token));
     if (!token) { setProjects([]); return; }
@@ -33,12 +37,13 @@ export function HistoryView() {
   }, []);
   useEffect(() => { void refresh(); const onFocus = () => void refresh(); window.addEventListener('focus', onFocus); window.addEventListener(DRIVE_TOKEN_EVENT, onFocus); const timer = window.setInterval(() => void refresh(), 30000); return () => { window.removeEventListener('focus', onFocus); window.removeEventListener(DRIVE_TOKEN_EVENT, onFocus); window.clearInterval(timer); }; }, [refresh]);
   return <main className="min-h-screen bg-[#080a10] px-4 pb-28 pt-8 text-white sm:px-8"><div className="mx-auto max-w-3xl">
-    <header className="mb-6"><div className="flex items-center justify-between gap-3"><div><h1 className="text-2xl font-black sm:text-4xl">Your projects</h1><p className="mt-2 text-sm text-slate-400">Saved projects are read from your Google Drive.</p></div><Link href="/dashboard" aria-label="Create new project" className="grid h-12 w-12 shrink-0 place-items-center rounded-full bg-violet-500 text-white shadow-lg"><Plus size={24}/></Link></div><button onClick={() => requestDriveConnect()} className="mt-3 rounded-xl border border-white/10 px-3 py-2 text-xs font-bold text-violet-200">{driveConnected ? 'Reconnect Google Drive' : 'Connect Google Drive'}</button></header>
+    <header className="mb-6"><div className="flex items-center justify-between gap-3"><div><h1 className="text-2xl font-black sm:text-4xl">Your projects</h1><p className="mt-2 text-sm text-slate-400">Recent editing projects are saved on this device immediately. Exported projects are also available in Google Drive.</p></div><Link href="/dashboard" aria-label="Create new project" className="grid h-12 w-12 shrink-0 place-items-center rounded-full bg-violet-500 text-white shadow-lg"><Plus size={24}/></Link></div><button onClick={() => requestDriveConnect()} className="mt-3 rounded-xl border border-white/10 px-3 py-2 text-xs font-bold text-violet-200">{driveConnected ? 'Reconnect Google Drive' : 'Connect Google Drive'}</button></header>
     {message && <p role="alert" className="mb-4 rounded-xl border border-amber-400/30 bg-amber-400/10 p-3 text-sm text-amber-100">{message}</p>}
     {projects === null && <p className="flex items-center gap-2 text-sm text-slate-400"><LoaderCircle size={16} className="animate-spin" /> Reading your Google Drive…</p>}
-    {projects !== null && !driveConnected && <div className="rounded-2xl border border-dashed border-white/15 p-8 text-center"><Cloud className="mx-auto mb-3 text-violet-300" size={28}/><h2 className="font-bold">Connect Google Drive</h2><p className="mt-2 text-sm leading-6 text-slate-400">Connect Drive to see projects saved to your account. History is not read from this device.</p><button onClick={() => requestDriveConnect()} className="mt-4 rounded-xl bg-violet-500 px-4 py-3 text-sm font-bold">Connect Google Drive</button></div>}
+    {projects !== null && !driveConnected && localProjects.length === 0 && <div className="rounded-2xl border border-dashed border-white/15 p-8 text-center"><Cloud className="mx-auto mb-3 text-violet-300" size={28}/><h2 className="font-bold">Connect Google Drive</h2><p className="mt-2 text-sm leading-6 text-slate-400">Connect Drive to see projects saved to your account. Local editing history is available below; connect Drive to browse exported project files.</p><button onClick={() => requestDriveConnect()} className="mt-4 rounded-xl bg-violet-500 px-4 py-3 text-sm font-bold">Connect Google Drive</button></div>}
     {projects !== null && driveConnected && projects.length === 0 && !message && <div className="rounded-2xl border border-dashed border-white/15 p-8 text-center text-sm leading-6 text-slate-400">No WyCut project folders found in the connected Drive. Finish an export to save a project here.<div className="mt-4"><Link href="/dashboard" className="rounded-xl bg-violet-500 px-4 py-2.5 text-sm font-bold">New project</Link></div></div>}
-    <div className="space-y-4">{(projects || []).map(p => <CompletedCard key={p.id} p={p} onDelete={() => void refresh()} />)}</div>
+    {localProjects.length > 0 && <section className="mb-6"><h2 className="mb-3 text-sm font-black uppercase tracking-wider text-slate-400">On this device · recent edits</h2><div className="space-y-2">{localProjects.map(p => <button key={p.id} type="button" onClick={() => requestOpenProject(p.id)} className="flex w-full items-center justify-between gap-3 rounded-2xl border border-white/10 bg-[#111521] p-4 text-left"><span className="min-w-0"><strong className="block truncate text-sm">{p.title || p.sourceName || 'Untitled project'}</strong><span className="mt-1 block text-xs text-slate-400">{p.sourceName || 'Source selected'} · {p.status === 'running' ? 'In progress' : p.status === 'failed' ? 'Needs attention' : 'Saved locally'} · {ago(p.updatedAt)}</span></span><span className="shrink-0 rounded-lg bg-violet-500/20 px-3 py-2 text-xs font-bold text-violet-100">Open</span></button>)}</div></section>}
+    <div className="space-y-4">{(projects || []).filter(p => p.drive).map(p => <CompletedCard key={p.id} p={p} onDelete={() => void refresh()} />)}</div>
   </div></main>;
 }
 

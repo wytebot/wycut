@@ -210,7 +210,7 @@
       ]
     },
     "premiumExportCostCredits": 5,
-    "note": "Premium editor assets are unlocked once per account and asset through the server-side /api/editor/assets/unlock endpoint. Never deduct credits in client-only code. Premium items remain locked if the unlock request fails.",
+    "note": "Premium editor assets are unlocked once per account and asset through the server-side /api/editor/assets/unlock endpoint. 2K exports separately cost premiumExportCostCredits per successfully rendered export, charged server-side after rendering and before download. Never deduct credits in client-only code. Premium items remain locked if the unlock request fails.",
     "premiumUnlockCosts": {
       "font": 3,
       "animation": 4,

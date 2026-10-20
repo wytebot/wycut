@@ -1,15 +1,18 @@
 'use client';
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import pricing from '@/config/credit-pricing.json';
 import type { PointerEvent as ReactPointerEvent, ReactNode, RefObject } from 'react';
-import { Check, Pause, Play, Redo2, Scissors, Sparkles, Music2, Type, Smile, Wand2, Crop, Undo2, Volume2, VolumeX, X, Plus, Minus, Maximize2, ChevronLeft, ChevronRight, Trash2, SlidersHorizontal } from 'lucide-react';
+import { Check, Pause, Play, Redo2, Scissors, Sparkles, Music2, Type, Smile, Wand2, Crop, Undo2, Volume2, VolumeX, X, Plus, Minus, Maximize2, ChevronLeft, ChevronRight, Trash2, SlidersHorizontal, AudioLines, Crosshair, Gauge, Timer, Layers, Film, Captions, Mic, ImagePlus } from 'lucide-react';
 
 /* Palette note: only the app's existing colors are used (#080a10, #111521, violet accents, white/slate text). */
 
-export type EditorToolName = 'Edit' | 'Audio' | 'Text' | 'Stickers' | 'Effects' | 'Adjust' | 'Canvas';
+export type EditorToolName = 'Edit' | 'Audio' | 'Text' | 'Overlay' | 'Captions' | 'Stickers' | 'Effects' | 'Filters' | 'Adjust' | 'Speed' | 'Beat' | 'Keyframe' | 'In/Out' | 'Combo' | 'Canvas' | 'Voice';
 export const EDITOR_TOOLS: { name: EditorToolName; icon: typeof Scissors }[] = [
-  { name: 'Edit', icon: Scissors }, { name: 'Audio', icon: Music2 }, { name: 'Text', icon: Type },
-  { name: 'Stickers', icon: Smile }, { name: 'Effects', icon: Wand2 }, { name: 'Adjust', icon: SlidersHorizontal }, { name: 'Canvas', icon: Crop },
+  { name: 'Edit', icon: Scissors }, { name: 'Audio', icon: Music2 }, { name: 'Beat', icon: AudioLines }, { name: 'Keyframe', icon: Crosshair },
+  { name: 'Speed', icon: Gauge }, { name: 'In/Out', icon: Timer }, { name: 'Combo', icon: Layers }, { name: 'Text', icon: Type },
+  { name: 'Overlay', icon: ImagePlus }, { name: 'Captions', icon: Captions }, { name: 'Stickers', icon: Smile }, { name: 'Effects', icon: Wand2 },
+  { name: 'Filters', icon: Film }, { name: 'Adjust', icon: SlidersHorizontal }, { name: 'Canvas', icon: Crop }, { name: 'Voice', icon: Mic },
 ];
 
 export function fmtClock(n: number) { const s = Math.max(0, Math.floor(n || 0)); return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`; }
@@ -19,13 +22,16 @@ export function fmtFrames(n: number, fps = 30) { const t = Math.max(0, n || 0); 
 function haptic(ms = 8) { try { navigator.vibrate?.(ms); } catch { /* not supported */ } }
 
 export function EditorTopBar({ onClose, credits, quality, onQuality, onExport, exportDisabled }: { onClose: () => void; credits: number | null; quality: '720p' | '1080p' | '2K'; onQuality: (v: '720p' | '1080p' | '2K') => void; onExport: () => void; exportDisabled: boolean }) {
-  return <header className="flex h-14 shrink-0 items-center justify-between gap-2 px-2">
+  const [qualityOpen, setQualityOpen] = useState(false);
+  const qualities: ('720p' | '1080p' | '2K')[] = ['720p', '1080p', '2K'];
+  return <header className="relative flex h-14 shrink-0 items-center justify-between gap-2 px-2">
     <button type="button" aria-label="Close editor" onClick={onClose} className="grid h-11 w-11 place-items-center rounded-xl"><X size={24} /></button>
     <div className="flex min-w-0 items-center gap-2">
       <a href="/billing" aria-label="Credits" className="flex h-10 items-center gap-1 rounded-xl bg-violet-500/15 px-2.5 text-xs font-bold text-violet-200"><Sparkles size={14} />{credits === null ? '—' : credits}</a>
-      <label className="flex h-10 items-center rounded-xl bg-[#111521] pl-2.5 text-xs font-bold"><select aria-label="Export quality" value={quality} onChange={e => onQuality(e.target.value as '720p' | '1080p' | '2K')} className="bg-transparent pr-1 text-white outline-none"><option className="bg-[#111521]">720p</option><option className="bg-[#111521]">1080p</option><option className="bg-[#111521]">2K</option></select></label>
+      <button type="button" aria-haspopup="dialog" aria-expanded={qualityOpen} aria-label={`Export quality ${quality}`} onClick={() => setQualityOpen(v => !v)} className="h-10 rounded-xl bg-[#111521] px-3 text-xs font-black text-white">{quality}⌄</button>
       <button type="button" disabled={exportDisabled} onClick={onExport} className="h-10 rounded-xl bg-violet-500 px-4 text-sm font-black text-white disabled:opacity-40">Export</button>
     </div>
+    {qualityOpen && <><button type="button" aria-label="Close quality picker" onClick={() => setQualityOpen(false)} className="fixed inset-0 z-[88] bg-black/35"/><section role="dialog" aria-label="Choose export quality" className="absolute right-2 top-12 z-[89] w-44 rounded-2xl border border-white/10 bg-[#111521] p-2 shadow-2xl">{qualities.map(q => <button type="button" key={q} onClick={() => { onQuality(q); setQualityOpen(false); }} className={`flex min-h-11 w-full items-center justify-between rounded-xl px-3 text-sm font-bold ${q === quality ? 'bg-violet-500/20 text-violet-200' : 'text-slate-200'}`}>{q}<span className="text-xs">{q === quality ? '✓ Selected' : q === '720p' ? 'HD' : q === '1080p' ? 'Full HD' : '2K'}</span></button>)}</section></>}
   </header>;
 }
 
@@ -186,7 +192,7 @@ export function Timeline({ compact = false, videoRef, playing, duration, current
 
 export function ToolBar({ active, onSelect }: { active: EditorToolName | ''; onSelect: (t: EditorToolName) => void }) {
   return <nav aria-label="Editor tools" className="flex shrink-0 overflow-x-auto border-t border-white/10 bg-[#080a10] px-1 pb-[max(6px,env(safe-area-inset-bottom))] pt-1" style={{ scrollbarWidth: 'none' }}>
-    {EDITOR_TOOLS.map(({ name, icon: Icon }) => <button key={name} type="button" onClick={() => onSelect(name)} className={`flex min-h-[56px] min-w-[25%] flex-1 shrink-0 flex-col items-center justify-center gap-1 rounded-lg text-[11px] ${active === name ? 'text-violet-300' : 'text-slate-300'}`}><Icon size={22} strokeWidth={active === name ? 2.4 : 1.8} />{name}</button>)}
+    {EDITOR_TOOLS.map(({ name, icon: Icon }) => <button key={name} type="button" onClick={() => onSelect(name)} className={`flex min-h-[56px] min-w-[72px] shrink-0 flex-col items-center justify-center gap-1 rounded-lg text-[11px] ${active === name ? 'text-violet-300' : 'text-slate-300'}`}><Icon size={22} strokeWidth={active === name ? 2.4 : 1.8} />{name}</button>)}
   </nav>;
 }
 

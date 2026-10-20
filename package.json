@@ -19,7 +19,10 @@
     "audit:v32": "node scripts/audit-v32-reliability.mjs",
     "audit:v35": "node scripts/audit-v35-drive-export.mjs",
     "audit:v38": "node scripts/audit-v38-export-parity.mjs",
-    "audit:v42": "node scripts/audit-v42-editor-layout.mjs"
+    "audit:v42": "node scripts/audit-v42-editor-layout.mjs",
+    "audit:storage-cost": "node scripts/audit-storage-cost-guards.mjs",
+    "audit:v51": "node scripts/audit-v51-export-tools.mjs",
+    "audit:v53": "node scripts/audit-v53-image-export.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^5.7.8",

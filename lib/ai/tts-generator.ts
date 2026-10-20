@@ -34,7 +34,7 @@ function buildSrt(beats: NarrativeBeat[]): string {
   }).join('\n');
 }
 /** Generates narration with bounded concurrency to reduce latency without exhausting provider or server resources. */
-export async function generateNarration(beats: NarrativeBeat[], options: { voice?: string } = {}): Promise<NarrationResult> {
+export async function generateNarration(beats: NarrativeBeat[], options: { voice?: string; onProviderStart?: () => void | Promise<void> } = {}): Promise<NarrationResult> {
   if (!beats.length || beats.length > 45) throw new Error('Provide between 1 and 45 beats.');
   if (!process.env.OPENAI_API_KEY && !process.env.DEEPGRAM_API_KEY) throw new Error('Configure OPENAI_API_KEY or DEEPGRAM_API_KEY on the server.');
   const operations = await getAiOperationsConfig();
@@ -70,12 +70,12 @@ export async function generateNarration(beats: NarrativeBeat[], options: { voice
       let audio: Uint8Array;
       let provider: 'openai' | 'deepgram';
       if (process.env.OPENAI_API_KEY) {
-        try { audio = await openAiSpeech(job.text, options.voice || 'onyx', operations.tts.openaiModel); provider = 'openai'; }
-        catch (error) {
-          if (!process.env.DEEPGRAM_API_KEY) throw new Error(`OpenAI TTS failed and Deepgram fallback is not configured: ${error instanceof Error ? error.message : 'unknown error'}`);
-          audio = await deepgramSpeech(job.text, operations.tts.deepgramModel); provider = 'deepgram';
-        }
-      } else { audio = await deepgramSpeech(job.text, operations.tts.deepgramModel); provider = 'deepgram'; }
+        await options.onProviderStart?.();
+        audio = await openAiSpeech(job.text, options.voice || 'onyx', operations.tts.openaiModel); provider = 'openai';
+      } else {
+        await options.onProviderStart?.();
+        audio = await deepgramSpeech(job.text, operations.tts.deepgramModel); provider = 'deepgram';
+      }
       providers.add(provider);
       const id = job.beat.id.replace(/[^a-z0-9_-]/gi, '_').slice(0, 32) || `scene_${job.beat.index}`;
       const suffix = job.parts > 1 ? `_part${String(job.part).padStart(2, '0')}` : '';

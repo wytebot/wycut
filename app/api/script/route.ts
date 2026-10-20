@@ -3,7 +3,7 @@ import { enforceRateLimit } from '@/lib/server/rate-limit';
 import { generateRecapScript } from '@/lib/ai/script-generator';
 import { isAllowedApiOrigin } from '@/lib/server/origin';
 import { verifyGoogleIdentity } from '@/lib/billing/google-identity';
-import { InsufficientCreditsError, JobCancelledError, cleanJobId, markRecapCreditConsumed, refundRecapCredit, reserveRecapCredit } from '@/lib/billing/credits';
+import { InsufficientCreditsError, JobCancelledError, cleanJobId, markRecapCreditConsumed, markRecapCreditStarted, refundRecapCredit, reserveRecapCredit } from '@/lib/billing/credits';
 import { scriptCredits } from '@/lib/billing/pricing';
 export const runtime = 'nodejs';
 export const maxDuration = 120;
@@ -36,17 +36,23 @@ export async function POST(req: NextRequest) {
       code: configFailure ? 'CREDIT_DATABASE_CONFIGURATION' : 'CREDIT_RESERVATION_FAILED',
     }, { status: 503, headers: { 'Cache-Control': 'no-store' } });
   }
+  let providerStarted = false;
   try {
-    const result = await generateRecapScript({ title: body.title, transcript: body.transcript, targetRuntimeSeconds: body.targetRuntimeSeconds ?? 600, beatCount: Math.min(15, Math.max(10, Math.floor(Number(body.beatCount) || 12))) });
+    const result = await generateRecapScript({ title: body.title, transcript: body.transcript, targetRuntimeSeconds: Math.min(3600, Math.max(60, Math.floor(Number(body.targetRuntimeSeconds) || 600))), beatCount: Math.min(70, Math.max(10, Math.floor(Number(body.beatCount) || 12))), onProviderStart: async () => { await markRecapCreditStarted(usageId); providerStarted = true; } });
     await markRecapCreditConsumed(usageId, result.script);
     const srtRanges = [...body.transcript.matchAll(/(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})/g)];
     const vttRanges = [...body.transcript.matchAll(/(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2})\.(\d{3})/g)];
     const hasSourceTimecodes = srtRanges.some(m => Number(m[5]) * 3600 + Number(m[6]) * 60 + Number(m[7]) + Number(m[8]) / 1000 > Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) + Number(m[4]) / 1000) || vttRanges.some(m => Number(m[4]) * 60 + Number(m[5]) + Number(m[6]) / 1000 > Number(m[1]) * 60 + Number(m[2]) + Number(m[3]) / 1000);
     return NextResponse.json({ ...result, recapId: usageId, hasSourceTimecodes }, { headers: { 'Cache-Control': 'no-store' } });
   } catch (e) {
-    await refundRecapCredit(usageId).catch(refundError => {
-      console.error('[api/script] credit refund failed', { usageId, error: refundError instanceof Error ? refundError.message : 'unknown refund error' });
-    });
+    // Once a provider request has been issued, its usage may already be billable. Consume the reservation rather than refunding a cancelled/failed post-start operation.
+    if (providerStarted) {
+      await markRecapCreditConsumed(usageId).catch(consumeError => console.error('[api/script] post-start credit settlement failed', { usageId, error: consumeError instanceof Error ? consumeError.message : 'unknown settlement error' }));
+    } else {
+      await refundRecapCredit(usageId).catch(refundError => {
+        console.error('[api/script] credit refund failed', { usageId, error: refundError instanceof Error ? refundError.message : 'unknown refund error' });
+      });
+    }
     const detail = e instanceof Error ? e.message : 'Unknown provider error';
     console.error('[api/script] generation failed', { usageId, name: e instanceof Error ? e.name : 'UnknownError', message: detail });
     const lower = detail.toLowerCase();
@@ -57,11 +63,11 @@ export async function POST(req: NextRequest) {
     // Order matters: a validation failure must not be reported as a timeout or a config problem.
     const code = invalid ? 'AI_RESPONSE_INVALID' : notConfigured ? 'AI_PROVIDER_NOT_CONFIGURED' : quota ? 'AI_PROVIDER_QUOTA' : timeout ? 'AI_PROVIDER_TIMEOUT' : 'AI_GENERATION_FAILED';
     const validationReason = (detail.match(/\[invalid\]\s*([^|]+)/)?.[1] || '').trim().slice(0, 240);
-    const publicMessage = code === 'AI_PROVIDER_NOT_CONFIGURED' ? 'AI script generation is not configured correctly on the server. Add a valid GEMINI_API_KEY or OPENAI_API_KEY in Vercel Environment Variables and redeploy. Your credits were refunded.'
-      : code === 'AI_PROVIDER_QUOTA' ? 'The AI provider is rate-limited or out of quota right now. Your credits were refunded; wait a minute and retry, or check the provider billing/quota.'
-      : code === 'AI_PROVIDER_TIMEOUT' ? 'The AI provider took too long to respond. Your credits were refunded; retry once, or try a shorter transcript.'
-      : code === 'AI_RESPONSE_INVALID' ? `The AI wrote a script that failed WyCut's checks${validationReason ? ` (${validationReason})` : ''}. Your credits were refunded. Tap Generate again.`
-      : 'WyCut could not complete AI script generation. Your credits were refunded. Check the Vercel function log for "[api/script] generation failed".';
+    const publicMessage = code === 'AI_PROVIDER_NOT_CONFIGURED' ? 'AI script generation is not configured correctly on the server. Add a valid GEMINI_API_KEY or OPENAI_API_KEY in Vercel Environment Variables and redeploy. Your credits are only refunded if the AI provider was not called.'
+      : code === 'AI_PROVIDER_QUOTA' ? 'The AI provider is rate-limited or out of quota right now. If the provider request started, its credits remain charged; wait a minute and retry only if needed, or check provider quota.'
+      : code === 'AI_PROVIDER_TIMEOUT' ? 'The AI provider took too long to respond. If the provider request started, its credits remain charged; try a shorter transcript only if needed.'
+      : code === 'AI_RESPONSE_INVALID' ? `The AI wrote a script that failed WyCut's checks${validationReason ? ` (${validationReason})` : ''}. Your credits are only refunded if the AI provider was not called. Tap Generate again.`
+      : 'WyCut could not complete AI script generation. Your credits are only refunded if the AI provider was not called. Check the Vercel function log for "[api/script] generation failed".';
     return NextResponse.json({ error: publicMessage, code }, { status: 502, headers: { 'Cache-Control': 'no-store' } });
   }
 }

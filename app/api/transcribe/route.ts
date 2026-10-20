@@ -113,20 +113,27 @@ export async function POST(req: NextRequest) {
     console.error('[api/transcribe] credit charge failed', { message: e instanceof Error ? e.message : 'unknown' });
     return NextResponse.json({ error: 'WyCut could not use your credits (billing database). Check Firebase configuration in Vercel logs.', code: 'CREDIT_DATABASE_CONFIGURATION' }, { status: 503 });
   }
-  const refundAll = async () => { await Promise.all([refundCharge(ledgerId), releaseDailyChunk(identity.userId)]).catch(error => console.error('[api/transcribe] refund failed', { message: error instanceof Error ? error.message : 'unknown' })); };
+  let providerStarted = false;
+  const markProviderStarted = async () => {
+    if (providerStarted) return;
+    if (ledgerId) await getAdminDb().collection('wycut_credit_ledger').doc(ledgerId).set({ status: 'started', providerStartedAt: new Date().toISOString() }, { merge: true });
+    providerStarted = true;
+  };
+  const markProviderCompleted = async () => { if (ledgerId && providerStarted) await getAdminDb().collection('wycut_credit_ledger').doc(ledgerId).set({ status: 'consumed', completedAt: new Date().toISOString() }, { merge: true }); };
+  const refundAll = async () => { if (providerStarted) return; await Promise.all([refundCharge(ledgerId), releaseDailyChunk(identity.userId)]).catch(error => console.error('[api/transcribe] refund failed', { message: error instanceof Error ? error.message : 'unknown' })); };
   const headers = { 'Cache-Control': 'no-store', 'X-Credits-Charged': String(ledgerId ? amount : 0) };
   const errors: string[] = [];
   if (process.env.GEMINI_API_KEY) {
-    try { return NextResponse.json({ provider: 'gemini', creditsCharged: ledgerId ? amount : 0, segments: await transcribeWithGemini(body.audioBase64, mimeType, duration) }, { headers }); }
+    try { await markProviderStarted(); const segments = await transcribeWithGemini(body.audioBase64, mimeType, duration); await markProviderCompleted(); return NextResponse.json({ provider: 'gemini', creditsCharged: ledgerId ? amount : 0, segments }, { headers }); }
     catch (e) { errors.push(`Gemini: ${e instanceof Error ? e.message : 'failed'}`); }
   }
-  // Whisper costs about 5x more than Gemini Flash-Lite, so it is a fallback only. Set TRANSCRIBE_ALLOW_WHISPER_FALLBACK=0 to disable it.
-  if (process.env.OPENAI_API_KEY && process.env.TRANSCRIBE_ALLOW_WHISPER_FALLBACK !== '0') {
-    try { return NextResponse.json({ provider: 'whisper', creditsCharged: ledgerId ? amount : 0, segments: await transcribeWithWhisper(body.audioBase64, mimeType) }, { headers }); }
+  // Only choose Whisper when Gemini is not configured. Never invoke a second provider after a potentially billable first attempt.
+  if (!process.env.GEMINI_API_KEY && process.env.OPENAI_API_KEY && process.env.TRANSCRIBE_ALLOW_WHISPER_FALLBACK !== '0') {
+    try { await markProviderStarted(); const segments = await transcribeWithWhisper(body.audioBase64, mimeType); await markProviderCompleted(); return NextResponse.json({ provider: 'whisper', creditsCharged: ledgerId ? amount : 0, segments }, { headers }); }
     catch (e) { errors.push(`Whisper: ${e instanceof Error ? e.message : 'failed'}`); }
   }
   await refundAll();
   console.error('[api/transcribe] failed', { errors });
   if (!process.env.GEMINI_API_KEY && !process.env.OPENAI_API_KEY) return NextResponse.json({ error: 'Transcription is not configured. Add GEMINI_API_KEY (or OPENAI_API_KEY) in Vercel.', code: 'AI_PROVIDER_NOT_CONFIGURED' }, { status: 503 });
-  return NextResponse.json({ error: 'The AI could not transcribe this audio chunk. You were not charged for it. Retry; if it keeps failing check provider quota and Vercel logs for "[api/transcribe] failed".', code: 'TRANSCRIBE_FAILED' }, { status: 502 });
+  return NextResponse.json({ error: 'The AI could not transcribe this audio chunk. Credits are refunded only if no provider request started. Retry only if you want to initiate another billable attempt; check provider quota and Vercel logs for "[api/transcribe] failed".', code: 'TRANSCRIBE_FAILED' }, { status: 502 });
 }

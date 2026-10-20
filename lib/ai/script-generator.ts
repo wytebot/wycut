@@ -5,9 +5,9 @@ import { getAiOperationsConfig } from './operations-config';
 export type DialogueCue = { startSeconds: number; endSeconds: number; quote?: string; instruction: string };
 export type NarrativeBeat = { index: number; id: string; title: string; startSeconds: number; endSeconds: number; narration: string; dialogueCues: DialogueCue[]; act: 1 | 2 | 3 | 4 | 5 };
 export type RecapScript = { title: string; targetRuntimeSeconds: number; beats: NarrativeBeat[]; /** True for a hand-made cut list (no AI script behind it). */ manual?: boolean };
-export type ScriptInput = { title: string; transcript: string; targetRuntimeSeconds?: number; beatCount?: number };
+export type ScriptInput = { title: string; transcript: string; targetRuntimeSeconds?: number; beatCount?: number; onProviderStart?: (provider: 'gemini' | 'openai') => void | Promise<void> };
 
-const schema = `Return ONLY JSON with shape {"title":string,"targetRuntimeSeconds":600,"beats":[{"index":1,"id":"intro","title":"Opening hook","startSeconds":0,"endSeconds":12,"narration":"...","dialogueCues":[{"startSeconds":3,"endSeconds":5,"quote":"...","instruction":"LET MOVIE AUDIO PLAY"}],"act":1}]}. Make 10 to 15 distinct beats for the short-form recap workflow (aim for the requested target count), match the narration word-count target supplied in the prompt, and distribute beats across five acts. Timestamps must refer to the supplied transcript/source timeline and must be nonnegative with endSeconds > startSeconds. Never invent exact source timestamps when the input has no timing data: use estimated ranges and state this in title or beat notes. Dialogue cues are optional and must be short; do not reproduce long copyrighted dialogue. Write original commentary, analysis and transitions, not a substitute for watching the film. Acts must be integers 1 through 5. IDs must be short lowercase snake_case.`;
+const schema = `Return ONLY JSON with shape {"title":string,"targetRuntimeSeconds":600,"beats":[{"index":1,"id":"intro","title":"Opening hook","startSeconds":0,"endSeconds":12,"narration":"...","dialogueCues":[{"startSeconds":3,"endSeconds":5,"quote":"...","instruction":"LET MOVIE AUDIO PLAY"}],"act":1}]}. Make the requested number of distinct beats (10–70 depending on the target runtime), match the narration word-count target supplied in the prompt, and distribute beats across five acts. Timestamps must refer to the supplied transcript/source timeline and must be nonnegative with endSeconds > startSeconds. Never invent exact source timestamps when the input has no timing data: use estimated ranges and state this in title or beat notes. Dialogue cues are optional and must be short; do not reproduce long copyrighted dialogue. Write original commentary, analysis and transitions, not a substitute for watching the film. Acts must be integers 1 through 5. IDs must be short lowercase snake_case.`;
 
 export class ScriptValidationError extends Error { constructor(message: string) { super(message); this.name = 'ScriptValidationError'; } }
 function checkedScript(raw: string, count: number, runtime: number, ranges: SourceCueRange[]): RecapScript {
@@ -34,7 +34,7 @@ function validateScript(value: unknown, requestedCount: number, runtime: number,
   if (!value || typeof value !== 'object') throw new Error('Invalid script object.');
   const v = value as Record<string, unknown>;
   if (typeof v.title !== 'string' || !v.title.trim() || !Array.isArray(v.beats)) throw new Error('Script is missing a title or beats array.');
-  if (requestedCount >= 10 && requestedCount <= 15 ? (v.beats.length < 10 || v.beats.length > 15) : (v.beats.length < Math.max(8, requestedCount - 12) || v.beats.length > Math.min(70, requestedCount + 12))) throw new Error(`Script returned ${v.beats.length} beats; expected about ${requestedCount}.`);
+  if (v.beats.length < Math.max(8, requestedCount - 12) || v.beats.length > Math.min(70, requestedCount + 12)) throw new Error(`Script returned ${v.beats.length} beats; expected about ${requestedCount}.`);
   const beats = v.beats.map((raw, i) => {
     if (!raw || typeof raw !== 'object') throw new Error(`Beat ${i + 1} is invalid.`);
     const b = raw as Record<string, unknown>;
@@ -77,7 +77,7 @@ function validateScript(value: unknown, requestedCount: number, runtime: number,
     if (beats[0].startSeconds > sourceDuration * 0.2 || beats[beats.length - 1].endSeconds < sourceDuration * 0.75) throw new Error('Generated clips do not cover enough of the supplied source timeline. Regenerate using scenes distributed across the full movie, not just its opening.');
   }
   const totalWords = beats.reduce((sum, beat) => sum + beat.narration.split(/\s+/).filter(Boolean).length, 0);
-  const minWords = Math.floor((runtime / 60) * 70);
+  const minWords = Math.floor((runtime / 60) * 55);
   const maxWords = Math.ceil((runtime / 60) * 210);
   if (totalWords < minWords || totalWords > maxWords) throw new Error(`Narration draft has ${totalWords} words for a ${Math.round(runtime / 60)}-minute target; expected roughly ${minWords}–${maxWords}.`);
   return { title: v.title.slice(0, 160), targetRuntimeSeconds: runtime, beats };
@@ -88,8 +88,8 @@ export async function generateRecapScript(input: ScriptInput): Promise<{ script:
   const transcript = input.transcript.trim();
   if (!title || transcript.length < 40) throw new Error('Provide a title and at least 40 characters of transcript/subtitle text.');
   if (transcript.length > 120_000) throw new Error('Transcript exceeds the 120,000-character limit. Split it into sections first.');
-  const runtime = Math.min(900, Math.max(300, Math.floor(input.targetRuntimeSeconds ?? 600)));
-  const count = Math.min(15, Math.max(10, Math.floor(input.beatCount ?? 12)));
+  const runtime = Math.min(3600, Math.max(60, Math.floor(input.targetRuntimeSeconds ?? 300)));
+  const count = Math.min(70, Math.max(10, Math.floor(input.beatCount ?? Math.ceil(runtime / 60 * 1.5))));
   const timestampMatches = [...transcript.matchAll(/(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})/g)];
   const vttMatches = [...transcript.matchAll(/(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2})\.(\d{3})/g)];
   const sourceRanges: SourceCueRange[] = timestampMatches.length
@@ -98,12 +98,13 @@ export async function generateRecapScript(input: ScriptInput): Promise<{ script:
   const validRangesForPrompt = sourceRanges.filter(range => Number.isFinite(range.startSeconds) && Number.isFinite(range.endSeconds) && range.startSeconds >= 0 && range.endSeconds > range.startSeconds);
   const sourceDuration = validRangesForPrompt.length ? Math.max(...validRangesForPrompt.map(range => range.endSeconds)) : undefined;
   const operations = await getAiOperationsConfig();
-  const prompt = `Write a compelling, original, transformative film recap with commentary—not a substitute for the film and not a reproduction of its dialogue or another recap. Explain the important story events, character goals, turning points, cause-and-effect, stakes, climax and resolution so viewers can follow the story and understand why key scenes matter. Prioritize relevant scenes that meet normal viewer expectations, omit repetitive filler, and cover the full timeline rather than only the opening. Use fresh phrasing and concise analysis; do not copy distinctive dialogue, lyrics, screenplay text, or existing summaries. Do not make claims that wording can evade copyright detection or guarantees fair use/monetization. Do not invent facts or visual details not supported by the transcript. Additional writing guidance: ${operations.script.promptGuidance}. Target runtime: ${runtime} seconds (${Math.round(runtime / 60)} minutes); beats: ${count}; target narration length: about ${Math.round(runtime / 60 * 130)}–${Math.round(runtime / 60 * 160)} words. Film/source title: ${title}. Source transcript duration: ${sourceDuration ? `${Math.round(sourceDuration)} seconds` : 'NOT PROVIDED; do not invent exact timestamps and clearly label timing as estimates'}. When timestamped cues are present, align beat boundaries to real subtitle cues, distribute beats across the full source timeline, and never use the recap narration runtime as the source-video timeline. Every beat should contribute a distinct plot fact, character decision, consequence, or useful interpretation. Each beat is ONE cut of the source video from startSeconds to endSeconds, and its narration will be read aloud over exactly that clip, so write it for that clip: describe only what happens in that stretch of the transcript, size it to the clip length (about 2.3 words per second of endSeconds minus startSeconds, never more than 2.6, and fewer words when dialogueCues let the movie audio play), open with a short natural link from the previous clip, keep names and pronouns consistent, and make the clip lengths add up to about ${runtime} seconds so the beats play back as one continuous story.\n\n${schema}\n\nSOURCE TRANSCRIPT / SUBTITLES:\n${transcript}`;
+  const prompt = `Write a compelling, original, transformative film recap with commentary—not a substitute for the film and not a reproduction of its dialogue or another recap. Explain the important story events, character goals, turning points, cause-and-effect, stakes, climax and resolution so viewers can follow the story and understand why key scenes matter. Prioritize relevant scenes that meet normal viewer expectations, omit repetitive filler, and cover the full timeline rather than only the opening. Use fresh phrasing and concise analysis; do not copy distinctive dialogue, lyrics, screenplay text, or existing summaries. Do not make claims that wording can evade copyright detection or guarantees fair use/monetization. Do not invent facts or visual details not supported by the transcript. Additional writing guidance: ${operations.script.promptGuidance}. TARGET FINISHED RECAP DURATION: ${runtime} seconds (${Math.round(runtime / 60)} minutes). This is a hard planning target, not a suggestion. Create ${count} timestamped source clips where practical; use more clips for longer targets. The sum of (endSeconds-startSeconds) across all selected clips must be as close as possible to ${runtime} seconds, ideally within 5% when the source has enough material. Do not exceed the source duration. If the source does not contain enough usable material to meet the target, return the best possible coverage and clearly say so in the title. beats: ${count}; target narration length: about ${Math.round(runtime / 60 * 130)}–${Math.round(runtime / 60 * 160)} words. Film/source title: ${title}. Source transcript duration: ${sourceDuration ? `${Math.round(sourceDuration)} seconds` : 'NOT PROVIDED; do not invent exact timestamps and clearly label timing as estimates'}. When timestamped cues are present, align beat boundaries to real subtitle cues, distribute beats across the full source timeline, and never use the recap narration runtime as the source-video timeline. Every beat should contribute a distinct plot fact, character decision, consequence, or useful interpretation. Each beat is ONE cut of the source video from startSeconds to endSeconds, and its narration will be read aloud over exactly that clip, so write it for that clip: describe only what happens in that stretch of the transcript, size it to the clip length (about 2.3 words per second of endSeconds minus startSeconds, never more than 2.6, and fewer words when dialogueCues let the movie audio play), open with a short natural link from the previous clip, keep names and pronouns consistent, and make the clip lengths add up to about ${runtime} seconds so the beats play back as one continuous story.\n\n${schema}\n\nSOURCE TRANSCRIPT / SUBTITLES:\n${transcript}`;
   const errors: string[] = [];
+  let providerCallStarted = false;
+  const markProviderStart = async (provider: 'gemini' | 'openai') => { providerCallStarted = true; await input.onProviderStart?.(provider); };
+  const outputTokenBudget = Math.min(12_000, Math.max(1_800, Math.ceil((runtime / 60) * 1_000)));
   const timeoutMs = Math.min(90_000, Math.max(12_000, Number(process.env.AI_PROVIDER_TIMEOUT_MS) || 75_000));
-  const startedAt = Date.now();
-  let lastErrorCount = 0;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 1; attempt++) {
     for (const provider of operations.script.providerOrder) {
       if (provider === 'gemini' && process.env.GEMINI_API_KEY) {
         try {
@@ -120,23 +121,26 @@ export async function generateRecapScript(input: ScriptInput): Promise<{ script:
             generationConfig: {
               responseMimeType: 'application/json',
               temperature: operations.script.temperature,
-              maxOutputTokens: 10000,
+              maxOutputTokens: outputTokenBudget,
               thinkingConfig: { thinkingBudget: 0 },
             },
           } as Parameters<typeof model.generateContent>[0];
+          await markProviderStart('gemini');
           const result = await model.generateContent(request);
           return { script: checkedScript(result.response.text(), count, runtime, sourceRanges), provider: 'gemini' };
         } catch (error) {
           errors.push(`Gemini (${operations.script.geminiModel}): ${error instanceof ScriptValidationError ? '[invalid] ' : ''}${error instanceof Error ? error.message : 'request failed'}`);
+          if (providerCallStarted) break; // Do not invoke a second billable provider after the first request has started.
         }
       }
       if (provider === 'openai' && process.env.OPENAI_API_KEY) {
         try {
           const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: timeoutMs, maxRetries: 0 });
+          await markProviderStart('openai');
           const result = await openai.chat.completions.create({
             model: operations.script.openaiModel,
             temperature: operations.script.temperature,
-            max_tokens: 10000,
+            max_tokens: outputTokenBudget,
             response_format: { type: 'json_object' },
             messages: [
               { role: 'system', content: operations.script.systemInstruction },
@@ -148,13 +152,11 @@ export async function generateRecapScript(input: ScriptInput): Promise<{ script:
           return { script: checkedScript(content, count, runtime, sourceRanges), provider: 'openai' };
         } catch (error) {
           errors.push(`OpenAI (${operations.script.openaiModel}): ${error instanceof ScriptValidationError ? '[invalid] ' : ''}${error instanceof Error ? error.message : 'request failed'}`);
+          if (providerCallStarted) break;
         }
       }
     }
-    // Retry once only when a model answered but its script failed validation (models are non-deterministic).
-    const newErrors = errors.slice(lastErrorCount); lastErrorCount = errors.length;
-    const onlyValidation = newErrors.length > 0 && newErrors.every(message => message.includes('[invalid]'));
-    if (!onlyValidation || Date.now() - startedAt > 45_000) break;
+    // A second model request could incur a second provider charge; this operation intentionally makes at most one billable request.
   }
   if (!process.env.GEMINI_API_KEY && !process.env.OPENAI_API_KEY) throw new Error('Configure GEMINI_API_KEY or OPENAI_API_KEY on the server.');
   throw new Error(`AI providers failed. ${errors.join(' | ')}`);

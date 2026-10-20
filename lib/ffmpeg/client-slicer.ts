@@ -76,13 +76,13 @@ async function openSource(ffmpeg: FFmpeg, file: File, name: string): Promise<{ p
 function safeName(value: string): string { return value.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 45) || 'scene'; }
 
 /** Re-encodes each clip to make trim boundaries frame-accurate. This is slower than stream copy and uses more CPU/memory. */
-export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgress?: (progress: number, current: number, total: number) => void, options: { fast?: boolean; aspectRatio?: '9:16' | '16:9' | '1:1' | '4:5'; resolution?: '720p' | '1080p' } = {}): Promise<SlicedClip[]> {
+export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgress?: (progress: number, current: number, total: number) => void, options: { fast?: boolean; aspectRatio?: '9:16' | '16:9' | '1:1' | '4:5'; resolution?: '720p' | '1080p' | '2K' } = {}): Promise<SlicedClip[]> {
   return serialized(async () => {
   if (!file || file.size === 0) throw new Error('Choose a non-empty local video file.');
   const extension = (file.name.split('.').pop() || '').toLowerCase();
   if (!['mp4', 'm4v', 'mov'].includes(extension)) throw new Error('Frame-accurate re-encoding currently supports MP4, M4V, and MOV sources. Convert other containers locally first or choose a supported file.');
   if (file.size > MAX_SOURCE_BYTES) throw new Error(`This video is larger than ${MAX_SOURCE_LABEL}. Split it first, or use a lower-resolution copy.`);
-  if (!ranges.length || ranges.length > 60) throw new Error('Provide between 1 and 60 clip ranges.');
+  if (!ranges.length || ranges.length > 150) throw new Error('Provide between 1 and 150 clip ranges. For very long recaps, split the edit into smaller batches to protect device memory.');
   const sorted = ranges.map((r, i) => ({ ...r, index: Number.isFinite(r.index) ? Math.max(1, Math.floor(r.index)) : i + 1 })).sort((a, b) => a.index - b.index);
   for (const r of sorted) if (!Number.isFinite(r.startSeconds) || !Number.isFinite(r.endSeconds) || r.startSeconds < 0 || r.endSeconds <= r.startSeconds) throw new Error(`Invalid range for ${r.id}.`);
   const ffmpeg = await getFFmpeg();
@@ -106,13 +106,14 @@ export async function sliceVideoLocally(file: File, ranges: ClipRange[], onProgr
       const preciseStart = Math.max(0, range.startSeconds - 0.0005).toFixed(4); const preciseLength = Math.max(0.01, duration - 0.003).toFixed(4); // ffmpeg's -t keeps one frame too many on frame-aligned ends; 3 ms is less than any frame gap up to 240 fps (tested: exact frame counts)
       // Fast cut copies the streams (no re-encode): seconds instead of minutes, but it starts at the nearest earlier keyframe.
       const lowResolution = options.resolution === '720p';
-      const dimensions = options.aspectRatio === '9:16' ? (lowResolution ? '720:1280' : '1080:1920')
-        : options.aspectRatio === '16:9' ? (lowResolution ? '1280:720' : '1920:1080')
-        : options.aspectRatio === '1:1' ? (lowResolution ? '720:720' : '1080:1080')
-        : options.aspectRatio === '4:5' ? (lowResolution ? '720:900' : '1080:1350') : '';
+      const highResolution = options.resolution === '2K';
+      const dimensions = options.aspectRatio === '9:16' ? (highResolution ? '1440:2560' : lowResolution ? '720:1280' : '1080:1920')
+        : options.aspectRatio === '16:9' ? (highResolution ? '2560:1440' : lowResolution ? '1280:720' : '1920:1080')
+        : options.aspectRatio === '1:1' ? (highResolution ? '2048:2048' : lowResolution ? '720:720' : '1080:1080')
+        : options.aspectRatio === '4:5' ? (highResolution ? '2048:2560' : lowResolution ? '720:900' : '1080:1350') : '';
       const vf = dimensions ? `scale=${dimensions}:force_original_aspect_ratio=increase,crop=${dimensions},setsar=1` : '';
       let code = options.fast && !options.aspectRatio ? await ffmpeg.exec(['-ss', start, '-i', source.path, '-t', length, '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', '-sn', '-dn', '-avoid_negative_ts', 'make_zero', '-y', output]) : -1;
-      const encodeArgs = ['-accurate_seek', '-ss', preciseStart, '-i', source.path, '-t', preciseLength, '-map', '0:v:0', '-map', '0:a?', ...(vf ? ['-vf', vf] : []), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-af', 'aresample=async=1:first_pts=0', '-sn', '-dn', '-pix_fmt', 'yuv420p', '-avoid_negative_ts', 'make_zero', '-y', output];
+      const encodeArgs = ['-accurate_seek', '-ss', preciseStart, '-i', source.path, '-t', preciseLength, '-map', '0:v:0', '-map', '0:a?', ...(vf ? ['-vf', vf] : []), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', highResolution ? '20' : '23', '-c:a', 'aac', '-b:a', '128k', '-af', 'aresample=async=1:first_pts=0', '-sn', '-dn', '-pix_fmt', 'yuv420p', '-avoid_negative_ts', 'make_zero', '-y', output];
       if (code !== 0 && !(options.fast && file.size > 150 * 1024 * 1024)) code = await ffmpeg.exec(encodeArgs);
       if (code !== 0) {
         if (options.fast && file.size > 150 * 1024 * 1024) throw new Error(`Fast cutting could not read clip ${filename}. To protect memory on this large source, WyCut did not automatically retry with a memory-heavy re-encode. Try another MP4/MOV copy or disable Fast Cut only for smaller files.`);
@@ -148,7 +149,7 @@ export async function releaseFFmpegMemory(): Promise<void> {
 /** Concatenates already sliced clips locally using the concat demuxer and stream copy. Clips should share compatible codecs/streams. */
 export async function concatenateClipsLocally(clips: SlicedClip[], onProgress?: (progress: number) => void): Promise<Blob> {
   return serialized(async () => {
-  if (!clips.length || clips.length > 60) throw new Error('Provide between 1 and 60 clips to concatenate.');
+  if (!clips.length || clips.length > 150) throw new Error('Provide between 1 and 150 clips to concatenate.');
   const ffmpeg = await getFFmpeg();
   const names: string[] = [];
   const progressHandler = ({ progress }: { progress: number }) => onProgress?.(Math.min(1, Math.max(0, progress)));

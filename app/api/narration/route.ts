@@ -4,7 +4,7 @@ import { generateNarration } from '@/lib/ai/tts-generator';
 import type { NarrativeBeat } from '@/lib/ai/script-generator';
 import { isAllowedApiOrigin } from '@/lib/server/origin';
 import { verifyGoogleIdentity } from '@/lib/billing/google-identity';
-import { InsufficientCreditsError, JobCancelledError, cleanJobId, reserveNarrationBatch, releaseNarrationBatch, type NarrationCharge } from '@/lib/billing/credits';
+import { InsufficientCreditsError, JobCancelledError, cleanJobId, reserveNarrationBatch, releaseNarrationBatch, markNarrationBatchStarted, markNarrationBatchCompleted, type NarrationCharge } from '@/lib/billing/credits';
 
 export const runtime = 'nodejs';
 export const maxDuration = 120;
@@ -31,9 +31,11 @@ export async function POST(req: NextRequest) {
     if (totalCharacters > 3_500) { await releaseNarrationBatch(body.recapId || '', identity.userId, charge).catch(() => undefined); return NextResponse.json({ error: 'Send narration in batches totalling 3,500 characters or fewer.' }, { status: 400 }); }
     const allowedVoices = new Set(['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer']);
     const voice = typeof body.voice === 'string' && allowedVoices.has(body.voice) ? body.voice : 'onyx';
+    let providerStarted = false;
     let result: Awaited<ReturnType<typeof generateNarration>>;
-    try { result = await generateNarration(beats, { voice }); }
-    catch (error) { await releaseNarrationBatch(body.recapId || '', identity.userId, charge).catch(() => undefined); throw error; }
+    try { result = await generateNarration(beats, { voice, onProviderStart: async () => { await markNarrationBatchStarted(body.recapId || '', identity.userId, charge); providerStarted = true; } }); }
+    catch (error) { if (!providerStarted) await releaseNarrationBatch(body.recapId || '', identity.userId, charge).catch(() => undefined); throw error; }
+    await markNarrationBatchCompleted(charge);
     const b64 = (bytes: Uint8Array) => Buffer.from(bytes).toString('base64');
     return NextResponse.json({
       provider: result.provider,

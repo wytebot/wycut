@@ -109,6 +109,20 @@ async function chargeOnce(input: { userId: string; email: string; amount: number
   return ledgerId;
 }
 
+/** Mark a script reservation as started immediately before the first provider request. Started usage is never refunded by stale-reservation cleanup. */
+export async function markRecapCreditStarted(usageId: string) {
+  if (!usageId) return;
+  const db = getAdminDb();
+  const usageRef = db.collection('wycut_usage').doc(usageId);
+  await db.runTransaction(async transaction => {
+    const usage = await transaction.get(usageRef);
+    const data = usage.data();
+    if (!usage.exists || !data || data.status !== 'reserved') return;
+    transaction.set(usageRef, { status: 'started', providerStartedAt: now() }, { merge: true });
+    if (data.ledgerId) transaction.set(db.collection(LEDGER).doc(String(data.ledgerId)), { status: 'started', providerStartedAt: now() }, { merge: true });
+  });
+}
+
 /** Give back a charge (idempotent: a ledger row is refunded at most once). */
 export async function refundCharge(ledgerId: string) {
   if (!ledgerId) return;
@@ -177,7 +191,7 @@ export async function markRecapCreditConsumed(usageId: string, script?: unknown)
   const usageRef = db.collection('wycut_usage').doc(usageId);
   const usage = await usageRef.get();
   // A cancelled (refunded) job must never flip back to consumed, or the refunded script could be narrated for free.
-  if (usage.data()?.status !== 'reserved') return;
+  if (!['reserved', 'started'].includes(String(usage.data()?.status || ''))) return;
   await usageRef.set({ status: 'consumed', ...(script ? { script } : {}), consumedAt: now() }, { merge: true });
   const ledgerId = String(usage.data()?.ledgerId || '');
   if (ledgerId) await db.collection(LEDGER).doc(ledgerId).set({ status: 'consumed' }, { merge: true });
@@ -237,12 +251,33 @@ export async function reserveNarrationBatch(usageId: string, userId: string, ema
     const balance = walletCredits(user.data()).credits;
     if (credits > balance) throw new InsufficientCreditsError(credits, balance);
     if (credits > 0) {
-      transaction.create(db.collection(LEDGER).doc(ledgerId), { userId, kind: 'narration', delta: -credits, status: 'consumed', ref: usageId, jobId: jobId || null, chars, createdAt: now(), createdAtMs: Date.now(), balanceAfter: balance - credits });
+      transaction.create(db.collection(LEDGER).doc(ledgerId), { userId, kind: 'narration', delta: -credits, status: 'reserved', ref: usageId, jobId: jobId || null, chars, createdAt: now(), createdAtMs: Date.now(), balanceAfter: balance - credits });
       writeBalance(db, transaction, userRef, userId, user.data(), balance - credits);
     }
     transaction.set(ref, { narrationCalls: count + 1, narratedChars: totalChars, narrationCreditsBilled: billed + credits, lastNarrationRequestedAt: now() }, { merge: true });
     return { beats, charge: { chars, credits, ledgerId: credits > 0 ? ledgerId : '' } as NarrationCharge };
   });
+}
+
+/** Mark narration as provider-started; cancel/timeout paths must not refund a potentially billable request. */
+export async function markNarrationBatchStarted(usageId: string, userId: string, charge?: NarrationCharge) {
+  const db = getAdminDb();
+  await db.runTransaction(async transaction => {
+    const usageRef = db.collection('wycut_usage').doc(usageId);
+    const usage = await transaction.get(usageRef);
+    if (!usage.exists || usage.data()?.userId !== userId) throw new Error('RECAP_NOT_OWNED');
+    if (charge?.ledgerId) {
+      const ledgerRef = db.collection(LEDGER).doc(charge.ledgerId);
+      const ledger = await transaction.get(ledgerRef);
+      if (ledger.exists && ledger.data()?.status === 'reserved') transaction.set(ledgerRef, { status: 'started', providerStartedAt: now() }, { merge: true });
+    }
+    transaction.set(usageRef, { lastNarrationStartedAt: now() }, { merge: true });
+  });
+}
+
+export async function markNarrationBatchCompleted(charge?: NarrationCharge) {
+  if (!charge?.ledgerId) return;
+  await getAdminDb().collection(LEDGER).doc(charge.ledgerId).set({ status: 'consumed', completedAt: now() }, { merge: true });
 }
 
 /** Undo one narration batch when the provider fails before returning audio: free the slot, the characters and the credits. */
@@ -281,7 +316,7 @@ export async function cancelJob(userId: string, jobId: string): Promise<{ refund
     if (Number(first.delta) >= 0) continue;
     const done = await db.runTransaction(async transaction => {
       const ledgerRef = row.ref; const entry = await transaction.get(ledgerRef); const data = entry.data();
-      if (!entry.exists || !data || data.status === 'refunded' || Number(data.delta) >= 0) return 0;
+      if (!entry.exists || !data || data.status !== 'reserved' || Number(data.delta) >= 0) return 0;
       const userRef = db.collection('wycut_users').doc(userId);
       const usageRef = data.ref && (data.kind === 'script' || data.kind === 'narration') ? db.collection('wycut_usage').doc(String(data.ref)) : null;
       const [user, usage] = await Promise.all([transaction.get(userRef), usageRef ? transaction.get(usageRef) : Promise.resolve(null)]);
