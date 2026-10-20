@@ -24,6 +24,6 @@ assert.match(route, /BACKGROUND_SEGMENTATION_NOT_IMPLEMENTED/);
 assert.match(route, /creditsCharged: 0/);
 assert.doesNotMatch(route, /WY_CUT_BG_REMOVE_API_URL|WY_CUT_BG_REMOVE_API_KEY|chargeCredits/);
 assert.match(workspace, /renderEditPlan\(renderSource, plan,/);
-assert.match(workspace, /undefined, videoOverlay\)/);
+assert.match(workspace, /undefined, videoOverlay, renderOverlays\)/, 'export includes independent timeline visual clips');
 assert.match(workspace, /overlay: true/);
 console.log('WyCut v57 overlay, masking, provider-policy, and persistent-login static audit passed. This is not a browser/APK or live-provider test.');

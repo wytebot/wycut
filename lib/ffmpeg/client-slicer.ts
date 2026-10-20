@@ -233,17 +233,17 @@ export async function extractAudioChunksLocally(file: File, chunkSeconds: number
   });
 }
 
-export type LocalAudioLayer = { blob: Blob; name: string; startSeconds: number; volume: number; loop?: boolean };
+export type LocalAudioLayer = { blob: Blob; name: string; startSeconds: number; volume: number; loop?: boolean; durationSeconds?: number; sourceOffsetSeconds?: number; fadeInSeconds?: number; fadeOutSeconds?: number };
 
 /** Mixes user-provided/generated audio layers into an existing MP4 locally. Guard the caller against huge blobs first. */
 export async function mixAudioTracksLocally(video: Blob, tracks: LocalAudioLayer[], onProgress?: (progress: number) => void): Promise<Blob> {
   return serialized(async () => {
     if (!video.size) throw new Error('The recap video is empty. Re-create the rough cut and try again.');
-    if (!tracks.length || tracks.length > 12) throw new Error('Add between 1 and 12 sound layers before mixing.');
+    if (!tracks.length) throw new Error('Add at least one sound layer before mixing.');
     for (const [i, track] of tracks.entries()) {
       if (!track.blob.size) throw new Error(`Sound layer ${i + 1} is empty. Remove it and add it again.`);
       if (!Number.isFinite(track.startSeconds) || track.startSeconds < 0) throw new Error(`Sound layer ${i + 1} has an invalid start time.`);
-      if (!Number.isFinite(track.volume) || track.volume < 0 || track.volume > 1) throw new Error(`Sound layer ${i + 1} has an invalid volume.`);
+      if (!Number.isFinite(track.volume) || track.volume < 0 || track.volume > 1.5) throw new Error(`Sound layer ${i + 1} has an invalid volume.`);
     }
     const ffmpeg = await getFFmpeg();
     const videoName = `mix_video_${Date.now()}.mp4`;
@@ -262,7 +262,15 @@ export async function mixAudioTracksLocally(video: Blob, tracks: LocalAudioLayer
         if (includeOriginal) { filters.push('[0:a]volume=0.55[baseaudio]'); inputs.push('[baseaudio]'); }
         tracks.forEach((track, i) => {
           const delay = Math.max(0, Math.round(track.startSeconds * 1000));
-          filters.push(`[${i + 1}:a]adelay=${delay}|${delay},volume=${Math.max(0, Math.min(1, track.volume)).toFixed(2)}[fx${i}]`);
+          const sourceOffset = Math.max(0, Number(track.sourceOffsetSeconds || 0));
+          const duration = Math.max(0.05, Number(track.durationSeconds || 0.05));
+          const chain = [`atrim=start=${sourceOffset.toFixed(3)}:duration=${duration.toFixed(3)}`, 'asetpts=PTS-STARTPTS', `volume=${Math.max(0, Math.min(1.5, track.volume)).toFixed(2)}`];
+          const fadeIn = Math.max(0, Math.min(duration / 2, Number(track.fadeInSeconds || 0)));
+          const fadeOut = Math.max(0, Math.min(duration / 2, Number(track.fadeOutSeconds || 0)));
+          if (fadeIn > 0) chain.push(`afade=t=in:st=0:d=${fadeIn.toFixed(3)}`);
+          if (fadeOut > 0) chain.push(`afade=t=out:st=${Math.max(0, duration - fadeOut).toFixed(3)}:d=${fadeOut.toFixed(3)}`);
+          chain.push(`adelay=${delay}|${delay}`);
+          filters.push(`[${i + 1}:a]${chain.join(',')}[fx${i}]`);
           inputs.push(`[fx${i}]`);
         });
         filters.push(`${inputs.join('')}amix=inputs=${inputs.length}:duration=longest:dropout_transition=2,alimiter=limit=0.95[aout]`);

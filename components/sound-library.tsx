@@ -10,11 +10,12 @@ export type WyCutAudioTrack = {
   startSeconds: number;
   durationSeconds: number;
   volume: number;
+  fadeInSeconds?: number;
+  fadeOutSeconds?: number;
   /** 'library' is kept only so projects saved by older versions still open. New audio is always 'device'. */
   source: 'library' | 'device';
 };
 
-export const MAX_AUDIO_LAYERS = 12;
 const AUDIO_NAME_RE = /\.(mp3|wav|m4a|aac|ogg|opus|flac|mp4|3gp)$/i;
 
 export function isAudioFile(file: File): boolean {
@@ -73,6 +74,8 @@ export function SoundLibrary({ tracks, onChange, onAdd, selectedId, onSelect, ma
       <div className="flex items-center justify-between gap-2"><p className="min-w-0 truncate text-sm font-bold">{selected.name}</p><button type="button" disabled={disabled} onClick={() => onChange(tracks.filter(t => t.id !== selected.id))} aria-label={`Remove ${selected.name}`} className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-red-500/15 text-red-200"><Trash2 size={17} /></button></div>
       <label className="flex items-center gap-3 text-xs text-slate-300"><Volume2 size={16} /><span className="w-14 shrink-0">Volume {Math.round(selected.volume * 100)}%</span><input type="range" min="0" max="1.5" step="0.05" value={selected.volume} disabled={disabled} onChange={e => update(selected.id, { volume: Number(e.target.value) })} className="min-w-0 flex-1 accent-violet-400" /></label>
       <label className="flex items-center gap-3 text-xs text-slate-300"><span className="w-[4.5rem] shrink-0">Starts at {selected.startSeconds.toFixed(1)}s</span><input type="range" min="0" max={Math.max(1, Math.ceil(maxStart))} step="0.1" value={selected.startSeconds} disabled={disabled} onChange={e => update(selected.id, { startSeconds: Math.max(0, Number(e.target.value) || 0) })} className="min-w-0 flex-1 accent-violet-400" /></label>
+      <label className="flex items-center gap-3 text-xs text-slate-300"><span className="w-[4.5rem] shrink-0">Fade in {(selected.fadeInSeconds || 0).toFixed(1)}s</span><input type="range" min="0" max={Math.min(10, Math.max(0.1, selected.durationSeconds / 2))} step="0.1" value={selected.fadeInSeconds || 0} disabled={disabled} onChange={e => update(selected.id, { fadeInSeconds: Number(e.target.value) })} className="min-w-0 flex-1 accent-violet-400" /></label>
+      <label className="flex items-center gap-3 text-xs text-slate-300"><span className="w-[4.5rem] shrink-0">Fade out {(selected.fadeOutSeconds || 0).toFixed(1)}s</span><input type="range" min="0" max={Math.min(10, Math.max(0.1, selected.durationSeconds / 2))} step="0.1" value={selected.fadeOutSeconds || 0} disabled={disabled} onChange={e => update(selected.id, { fadeOutSeconds: Number(e.target.value) })} className="min-w-0 flex-1 accent-violet-400" /></label>
     </div>}
   </div>;
 }

@@ -3,7 +3,7 @@ const editor = fs.readFileSync('components/advanced-editor-tools.tsx','utf8') + 
 const workspace = fs.readFileSync('components/dashboard-workspace.tsx','utf8');
 const checks = [
   ['filter presets', /const FILTERS/.test(editor) && /'Filters'/.test(editor)],
-  ['transition selector', /TRANSITIONS/.test(editor) && /Applies after the selected clip/.test(editor)],
+  ['transition selector', /TRANSITIONS/.test(editor) && /onTransitionChange\(k\)/.test(editor) && /Transition choice is applied at supported clip boundaries during export/.test(editor)],
   ['sticker badges', /STICKERS/.test(editor) && /PLOT TWIST/.test(editor)],
   ['expanded sticker collection', /💎/.test(editor) && /TO BE CONTINUED/.test(editor)],
   ['preview filter applied', workspace.includes('previewFilterForPlan({filter:effectPreset})') && workspace.includes('previewEffectForPlan({effect:visualEffect})')],

@@ -91,7 +91,9 @@ function overlayAnimation(animation: string | undefined, duration: number, width
  * Render the shared EditPlan into a real MP4. The WASM build cannot stream encoded output directly to native storage,
  * so the function deliberately applies conservative source-size guards instead of risking WebView OOM.
  */
-export async function renderEditPlan(input: Blob, planInput: EditPlan | unknown, onProgress?: (percent: number) => void, shouldCancel?: () => boolean, videoOverlay?: Blob | null): Promise<Blob> {
+export type TimelineRenderOverlay = { id?: string; blob: Blob; kind: 'video' | 'image'; startSeconds: number; durationSeconds: number };
+
+export async function renderEditPlan(input: Blob, planInput: EditPlan | unknown, onProgress?: (percent: number) => void, shouldCancel?: () => boolean, videoOverlay?: Blob | null, timelineOverlays: TimelineRenderOverlay[] = []): Promise<Blob> {
   const stillImage = input.type.startsWith('image/');
   if (!input.size || (!input.type.startsWith('video/') && !stillImage)) throw new Error('Choose a valid video or image before exporting.');
   if (stillImage && !['image/png','image/jpeg','image/webp'].includes(input.type)) throw new Error('Still-image video export supports PNG, JPEG and WebP images.');
@@ -103,7 +105,7 @@ export async function renderEditPlan(input: Blob, planInput: EditPlan | unknown,
   if (plan.exportQuality === '2K' && duration > (native ? 120 : 180)) throw new Error(`2K export is limited to ${native ? '2 minutes on mobile' : '3 minutes in a browser'} to protect memory and prevent app crashes. Choose 1080p for longer videos.`);
   if (plan.exportQuality === '2K' && input.size > (native ? 40 : 120) * 1024 * 1024) throw new Error(`2K export is limited to sources under ${native ? '40 MB on mobile' : '120 MB in a browser'} to protect memory. Choose 1080p for this video.`);
   const ff = await getEngine();
-  const inputExt = stillImage ? (input.type === 'image/png' ? 'png' : input.type === 'image/webp' ? 'webp' : 'jpg') : 'mp4'; const inputName = `wycut_input_${Date.now()}.${inputExt}`; const outputName = `wycut_render_${Date.now()}.mp4`; const overlayName = `wycut_overlay_${Date.now()}.png`; const manualMaskName = `wycut_manual_mask_${Date.now()}.png`; const overlayExt = videoOverlay?.type.includes('webm') ? 'webm' : videoOverlay?.type.includes('quicktime') ? 'mov' : 'mp4'; const videoOverlayName = `wycut_video_overlay_${Date.now()}.${overlayExt}`;
+  const inputExt = stillImage ? (input.type === 'image/png' ? 'png' : input.type === 'image/webp' ? 'webp' : 'jpg') : 'mp4'; const inputName = `wycut_input_${Date.now()}.${inputExt}`; const outputName = `wycut_render_${Date.now()}.mp4`; const overlayName = `wycut_overlay_${Date.now()}.png`; const manualMaskName = `wycut_manual_mask_${Date.now()}.png`; const overlayExt = videoOverlay?.type.includes('webm') ? 'webm' : videoOverlay?.type.includes('quicktime') ? 'mov' : 'mp4'; const videoOverlayName = `wycut_video_overlay_${Date.now()}.${overlayExt}`; const extraInputNames: string[] = [];
   let handler: ((event: { progress: number }) => void) | null = null;
   try {
     if (shouldCancel?.()) throw new Error('Export cancelled.');
@@ -114,17 +116,27 @@ export async function renderEditPlan(input: Blob, planInput: EditPlan | unknown,
     if (plan.fadeOutSeconds > 0 && outDuration > plan.fadeOutSeconds) vf = [vf, `fade=t=out:st=${Math.max(0, outDuration - plan.fadeOutSeconds).toFixed(3)}:d=${plan.fadeOutSeconds}`].filter(Boolean).join(',');
     const args = stillImage ? ['-loop', '1', '-framerate', '30', '-t', '5', '-i', inputName] : ['-i', inputName];
     const hasVideoOverlay = Boolean(videoOverlay && videoOverlay.size > 0);
+    const validTimelineOverlays = timelineOverlays.filter(item => item?.blob?.size && (item.kind === 'video' || item.kind === 'image') && Number.isFinite(item.startSeconds) && Number.isFinite(item.durationSeconds) && item.startSeconds >= 0 && item.durationSeconds > 0 && item.startSeconds < duration);
     if (hasVideoOverlay) { await ff.writeFile(videoOverlayName, await fetchFile(videoOverlay!)); args.push('-stream_loop', '-1', '-i', videoOverlayName); }
     const dimensions: Record<string, [number, number]> = { '9:16': [plan.exportQuality === '2K' ? 1440 : plan.exportQuality === '1080p' ? 1080 : 720, plan.exportQuality === '2K' ? 2560 : plan.exportQuality === '1080p' ? 1920 : 1280], '1:1': [plan.exportQuality === '2K' ? 2048 : plan.exportQuality === '1080p' ? 1080 : 720, plan.exportQuality === '2K' ? 2048 : plan.exportQuality === '1080p' ? 1080 : 720], '16:9': [plan.exportQuality === '2K' ? 2560 : plan.exportQuality === '1080p' ? 1920 : 1280, plan.exportQuality === '2K' ? 1440 : plan.exportQuality === '1080p' ? 1080 : 720], '4:5': [plan.exportQuality === '2K' ? 2048 : plan.exportQuality === '1080p' ? 1080 : 720, plan.exportQuality === '2K' ? 2560 : plan.exportQuality === '1080p' ? 1350 : 900] };
     const [ow, oh] = dimensions[plan.aspectRatio] || dimensions['9:16'];
+    for (let i = 0; i < validTimelineOverlays.length; i++) {
+      const item = validTimelineOverlays[i];
+      const ext = item.kind === 'image' ? (item.blob.type === 'image/png' ? 'png' : item.blob.type === 'image/webp' ? 'webp' : 'jpg') : (item.blob.type.includes('webm') ? 'webm' : item.blob.type.includes('quicktime') ? 'mov' : 'mp4');
+      const name = `wycut_timeline_overlay_${Date.now()}_${i}.${ext}`;
+      await ff.writeFile(name, await fetchFile(item.blob)); extraInputNames.push(name);
+      if (item.kind === 'image') args.push('-loop', '1', '-framerate', '30', '-i', name); else args.push('-stream_loop', '-1', '-i', name);
+    }
     const manualMask = hasVideoOverlay ? await makeManualMask(plan, ow, oh) : null;
-    if (manualMask) { await ff.writeFile(manualMaskName, await fetchFile(manualMask)); args.push('-loop', '1', '-framerate', '30', '-i', manualMaskName); }
     const videoOverlayIndex = hasVideoOverlay ? 1 : -1;
-    const manualMaskIndex = manualMask ? 2 : -1;
-    const textOverlayIndex = overlay ? (hasVideoOverlay ? (manualMask ? 3 : 2) : 1) : -1;
+    const extraInputStart = hasVideoOverlay ? 2 : 1;
+    let nextInputIndex = extraInputStart + validTimelineOverlays.length;
+    const manualMaskIndex = manualMask ? nextInputIndex++ : -1;
+    const textOverlayIndex = overlay ? nextInputIndex++ : -1;
+    if (manualMask) { await ff.writeFile(manualMaskName, await fetchFile(manualMask)); args.push('-loop', '1', '-framerate', '30', '-i', manualMaskName); }
     if (overlay) { await ff.writeFile(overlayName, await fetchFile(overlay)); args.push('-loop', '1', '-framerate', '30', '-i', overlayName); }
     const audio = audioFilterForPlan(plan, outDuration);
-    if (hasVideoOverlay || overlay) {
+    if (hasVideoOverlay || validTimelineOverlays.length || overlay) {
       const chain: string[] = [];
       chain.push(vf ? `[0:v]${vf}[base0]` : '[0:v]null[base0]');
       let baseLabel = 'base0';
@@ -132,7 +144,7 @@ export async function renderEditPlan(input: Blob, planInput: EditPlan | unknown,
         let overlayFilters = [`scale=${ow}:${oh}:force_original_aspect_ratio=decrease`];
         if (plan.chromaKey.enabled) {
           const key = plan.chromaKey.color.replace('#', '0x');
-          overlayFilters.push(`format=yuv420p`, `chromakey=${key}:${plan.chromaKey.similarity.toFixed(3)}:${plan.chromaKey.blend.toFixed(3)}`, `format=rgba`);
+          overlayFilters.push('format=yuv420p', `chromakey=${key}:${plan.chromaKey.similarity.toFixed(3)}:${plan.chromaKey.blend.toFixed(3)}`, 'format=rgba');
         } else overlayFilters.push('format=rgba');
         overlayFilters.push(`pad=${ow}:${oh}:(ow-iw)/2:(oh-ih)/2:color=black@0`, 'format=rgba');
         chain.push(`[${videoOverlayIndex}:v]${overlayFilters.join(',')}[vidbase]`);
@@ -151,13 +163,25 @@ export async function renderEditPlan(input: Blob, planInput: EditPlan | unknown,
           if (m.invert) maskAlpha = `255-(${maskAlpha})`;
           chain.push(`[vidov0]geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='(${maskAlpha})*a(X,Y)/255[vidov]`);
         } else chain.push('[vidov0]null[vidov]');
-        chain.push(`[${baseLabel}][vidov]overlay=x=(W-w)/2:y=(H-h)/2:format=auto:eof_action=repeat:shortest=1[base1]`); baseLabel = 'base1';
+        chain.push(`[${baseLabel}][vidov]overlay=x=(W-w)/2:y=(H-h)/2:format=auto:eof_action=repeat[base1]`); baseLabel = 'base1';
+      }
+      for (let i = 0; i < validTimelineOverlays.length; i++) {
+        const item = validTimelineOverlays[i]; const inputIndex = extraInputStart + i;
+        const startAt = Math.max(0, item.startSeconds / plan.speed).toFixed(3);
+        const endAt = Math.min(outDuration, (item.startSeconds + item.durationSeconds) / plan.speed).toFixed(3);
+        if (Number(endAt) <= Number(startAt)) continue;
+        const setPts = item.kind === 'video' && plan.speed !== 1 ? `setpts=${(1 / plan.speed).toFixed(4)}*PTS,` : '';
+        const prep = `[${inputIndex}:v]${setPts}scale=${Math.round(ow * 0.66)}:${Math.round(oh * 0.66)}:force_original_aspect_ratio=decrease,format=rgba,pad=${ow}:${oh}:(ow-iw)/2:(oh-ih)/2:color=black@0,format=rgba[tlov${i}]`;
+        const nextLabel = `base_tl_${i}`;
+        chain.push(prep);
+        chain.push(`[${baseLabel}][tlov${i}]overlay=x=0:y=0:format=auto:eof_action=repeat:enable='between(t\\,${startAt}\\,${endAt})'[${nextLabel}]`);
+        baseLabel = nextLabel;
       }
       if (overlay) {
         const anim = overlayAnimation(plan.text?.animation, outDuration, ow, oh, Number(plan.text?.x ?? 50), Number(plan.text?.y ?? 50));
         const overlayFilterChain = anim.filters.length ? anim.filters.join(',') : 'null';
         chain.push(`[${textOverlayIndex}:v]${overlayFilterChain}[txtov]`);
-        chain.push(`[${baseLabel}][txtov]overlay=x='${anim.x}':y='${anim.y}':format=auto:eof_action=repeat:shortest=1[vout]`);
+        chain.push(`[${baseLabel}][txtov]overlay=x='${anim.x}':y='${anim.y}':format=auto:eof_action=repeat[vout]`);
       } else chain.push(`[${baseLabel}]null[vout]`);
       args.push('-filter_complex', `${chain.join(';')}`);
     } else if (vf) args.push('-vf', vf);
@@ -170,7 +194,7 @@ export async function renderEditPlan(input: Blob, planInput: EditPlan | unknown,
     onProgress?.(100); return new Blob([new Uint8Array(data as Uint8Array)], { type: 'video/mp4' });
   } finally {
     if (handler) ff.off('progress', handler);
-    for (const name of [inputName, outputName, overlayName, manualMaskName, videoOverlayName]) { try { await ff.deleteFile(name); } catch { /* best effort cleanup */ } }
+    for (const name of [inputName, outputName, overlayName, manualMaskName, videoOverlayName, ...extraInputNames]) { try { await ff.deleteFile(name); } catch { /* best effort cleanup */ } }
   }
 }
 export function cancelEditExport() { try { engine?.terminate(); } catch { /* no active engine */ } engine = null; loadTask = null; }

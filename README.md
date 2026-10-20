@@ -146,3 +146,69 @@ A YouTube watch-page URL is not a direct video-file URL. WyCut does not bypass Y
 ### Recap-writing standards
 
 The AI is instructed to create original, transformative commentary grounded in the supplied subtitles; explain story cause-and-effect, character decisions, important turns, climax and resolution; distribute beats across the full source timeline; prioritize scenes viewers need to understand the story; and avoid long verbatim dialogue, lyrics, copied summaries, invented details, or claims that any wording guarantees copyright clearance. This is a writing-quality safeguard, not a guarantee against copyright claims or a legal determination of fair use.
+
+
+## Reproducible build and verification
+
+Use Node.js 20+ and npm. Install dependencies with `npm ci` after a `package-lock.json` has been generated and committed for the exact dependency set. The current source archive did not include a lockfile, so `npm install` may resolve newer compatible versions until the lockfile is checked in.
+
+```bash
+npm install
+npm run lint
+npm run typecheck
+npm run test:timeline
+npm run build
+```
+
+For a Capacitor static web build, set `NEXT_PUBLIC_API_BASE_URL` to the deployed HTTPS API origin and `NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID` to the configured Google Web OAuth client ID:
+
+```bash
+npm run build:capacitor-web
+npm run android:debug
+```
+
+`android:debug` runs the static web build, generates the Android project if missing, runs `npx cap sync android`, and invokes Gradle `assembleDebug`. A release build additionally requires a stable signing keystore and registered Firebase SHA fingerprints. Do not treat a successful static audit as proof of Android runtime compatibility. Run on-device tests for Google sign-in, media import, timeline editing, background/restore, audio sync, export, and payment flows before release.
+
+## Timeline model (schema v1)
+
+`lib/editor/timeline-model.ts` introduces a renderer-neutral, versioned timeline model with fixed lane ordering, typed clips, compatibility-checked moves, main-lane conversion protection, split, trim, duplicate, delete/ripple-delete, selection toggling, and undo/redo primitives. It is a migration foundation; the current editor UI and export renderer still use legacy project/edit-plan state in several paths. Do not claim the new multi-track model is fully integrated into the UI or export until those paths are migrated and parity tests pass.
+
+Run its focused invariants with:
+
+```bash
+npm run test:timeline
+```
+
+## v64 timeline interaction wiring
+
+The editor timeline supports long-press dragging for video beats and sound clips, frame-snapping toggle, fit-to-screen zoom, haptic feedback, and tap-again-to-deselect behavior. Video beat drags update the beat's source interval; sound drags update the sound track's actual start time. Run `npm run audit:v64` for a static wiring check and `npm run test:timeline` for timeline-model unit tests. These checks do not replace Android touch testing or prove full preview/export parity.
+
+
+## v65 timeline reliability update
+
+The editor now renders each audio clip on its own timeline row, keeps the add-audio action available after the first track, commits clip drags on release, and persists versioned undo/redo history with project data in IndexedDB. History stores audio blobs once per track ID and snapshots refer to those IDs. Very long histories can still hit browser/WebView storage quotas; verify long sessions on target Android devices.
+
+### Verification commands
+
+```bash
+npm run test:timeline
+npm run audit:v64
+npm run audit:v65
+npm run typecheck
+npm run lint
+npm run build
+npm run build:capacitor-web
+npx cap sync android
+npm run android:debug
+```
+
+The final five build/device commands require dependency installation and a complete native Android project. They are not represented as passed by the static audit suite.
+
+## v68 integrated timeline and media export
+
+- Added a versioned timeline model snapshot to saved editor state, a dedicated visual-overlay lane, timed video/image compositing, synchronized audio preview, and export mixing with per-track trim/source offset/fades.
+- Export billing now rejects replay of a previously refunded export attempt ID. Flutterwave v4 remains the credit purchase provider; Google Play Billing is not enabled.
+- Run `npm run test:all-static` for timeline model tests, FFmpeg motion/audio fixtures, billing contract checks and static audits.
+- `npm run test:export-motion` uses a local FFmpeg binary to prove two independently timed overlays create changing output frames. `npm run test:audio-mix` checks audio mix filters using a local FFmpeg fixture.
+- Before building the Android app, install dependencies and configure `NEXT_PUBLIC_API_BASE_URL`, `NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID`, the Firebase Android config and the required server-side Flutterwave/Firebase credentials. Then run `npm run lint`, `npm run typecheck`, `npm run build`, `npm run build:capacitor-web`, and `npm run android:debug`.
+- See `VERIFICATION-REPORT-v68.md` for the checks that passed and the build/live-service checks blocked in the current environment.

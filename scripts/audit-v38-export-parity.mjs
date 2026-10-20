@@ -9,7 +9,7 @@ const checks = [
  ['editor export wired to renderer', 'components/dashboard-workspace.tsx', /renderEditPlan\(renderSource/],
  ['Drive manifest stores versioned plan', 'components/dashboard-workspace.tsx', /editPlan:\s*normalizeEditPlan/],
  ['pricing declares server-billed premium asset policy', 'config/credit-pricing.json', /"billing": "unlock_on_apply"/],
- ['no client-side premium charge claim', 'config/credit-pricing.json', /server-side \/api\/editor\/assets\/unlock endpoint/],
+ ['server-side premium billing policy', 'config/credit-pricing.json', /charged server-side only after render succeeds/],
  ['2K export separately priced', 'config/credit-pricing.json', /"premiumExportCostCredits": 5/],
 ];
 let fail=0; for (const [label,file,pattern] of checks) { const ok=fs.existsSync(file)&&pattern.test(fs.readFileSync(file,'utf8')); console.log(`${ok?'PASS':'FAIL'} ${label}`); if(!ok) fail++; }

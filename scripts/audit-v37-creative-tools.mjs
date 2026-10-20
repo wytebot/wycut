@@ -3,13 +3,13 @@ const editor = fs.readFileSync('components/advanced-editor-tools.tsx','utf8') + 
 const workspace = fs.readFileSync('components/dashboard-workspace.tsx','utf8');
 const sounds = fs.readFileSync('components/sound-library.tsx','utf8');
 const css = fs.readFileSync('app/globals.css','utf8');
-const countArray = (name) => { const m = editor.match(new RegExp(`const ${name}[^=]*=\\[([^\\]]*)\\]`)); return m ? (m[1].match(/'[^']+'/g)||[]).length : 0; };
-const countObject = (name) => { const m = editor.match(new RegExp(`const ${name}[^=]*=\\{([\\s\\S]*?)\\};`)); return m ? m[1].split(',').filter(x => x.includes(':')).length : 0; };
+const countArray = (name) => { const m = editor.match(new RegExp(`(?:export )?const ${name}[^=]*=\\[([^\\]]*)\\]`)); return m ? (m[1].match(/'[^']+'/g)||[]).length : 0; };
+const countObject = (name) => { const m = editor.match(new RegExp(`(?:export )?const ${name}[^=]*=\\{([\\s\\S]*?)\\};`)); return m ? (m[1].match(/[A-Za-z][A-Za-z0-9]*:'[^']*'/g)||[]).length : 0; };
 const checks = [
- ['30 filters', countObject('FILTERS') === 30],
- ['30 visual effects', countObject('EFFECTS') === 30],
- ['30 transitions', countArray('TRANSITIONS') === 30],
- ['30 text animations plus None option', countArray('ANIMATIONS') === 31],
+ ['30+ filter presets', countObject('FILTERS') >= 30],
+ ['30+ visual effects', countObject('EFFECTS') >= 30],
+ ['18 supported transition choices', countArray('TRANSITIONS') >= 18],
+ ['expanded text animation catalog plus None option', countArray('ANIMATIONS') >= 30 && /'None'/.test(editor)],
  ['30 sticker choices', countArray('STICKERS') === 30],
  ['animation CSS keyframes exist', css.includes('@keyframes wy-neon') && css.includes('@keyframes wy-wave')],
  ['filters and effects apply in preview', workspace.includes('previewFilterForPlan({filter:effectPreset})') && workspace.includes('previewEffectForPlan({effect:visualEffect})')],

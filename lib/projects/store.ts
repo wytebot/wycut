@@ -1,7 +1,6 @@
 /**
- * Local project history (IndexedDB). Holds only what is needed to resume work after the app is closed:
- * progress, the transcript, the script and narration parts. Finished kits live in the user's Google Drive and are read
- * from there for display, so once a project is exported its heavy local data is dropped.
+ * Local project history (IndexedDB) stores resumable editor state and local media Blobs so users can continue after
+ * navigating away or restarting the browser/APK. Finished production kits can additionally be exported to Google Drive.
  */
 import type { RecapScript } from '@/lib/ai/script-generator';
 
@@ -12,13 +11,25 @@ export type ProjectRecord = {
   createdAt: number; updatedAt: number; stage?: string; progress?: number; error?: string;
   sourceName?: string; sourceSize?: number; videoUrl?: string; subtitleUrl?: string;
   transcript?: string; script?: RecapScript; recapId?: string; hasSourceTimecodes?: boolean;
+  /** Local resumable editor payloads are stored as IndexedDB Blobs, never sent to the WyCut server. */
+  sourceBlob?: Blob; editState?: Record<string, unknown>;
+  /** Versioned editor undo/redo snapshots persisted in IndexedDB. Snapshots may include Blob-backed audio tracks. */
+  editHistory?: { version: 1; stack: unknown[]; index: number };
+  /** Unique audio blobs referenced by persisted history snapshots; stored once per track ID. */
+  editHistoryMediaData?: Array<{ id: string; name: string; category: string; blob: Blob; startSeconds: number; durationSeconds: number; volume: number; source: 'library' | 'device' }>; 
+  timelineAssetsData?: Array<{ name: string; type: string; blob: Blob }>;
+  videoOverlayData?: { name: string; type: string; blob: Blob };
+  soundTracksData?: Array<{ id: string; name: string; category: string; blob: Blob; startSeconds: number; durationSeconds: number; volume: number; source: 'library' | 'device' }>;
+  clipsData?: Array<{ filename: string; blob: Blob; size: number }>; roughCutBlob?: Blob;
   narrationReady?: boolean; narrationParts?: number; clipCount?: number; roughCut?: boolean;
   drive?: DriveKitRef;
 };
 export type NarrationPart = { id: string; text: string; audioBase64: string };
 type Patch = { [K in keyof Omit<ProjectRecord, 'id'>]?: ProjectRecord[K] | null };
 
-const DB_NAME = 'wycut-projects'; const DB_VERSION = 2;
+const DB_NAME = 'wycut-projects'; const DB_VERSION = 3;
+const MEDIA_KEYS = ['sourceBlob','timelineAssetsData','videoOverlayData','soundTracksData','clipsData','roughCutBlob','editHistoryMediaData'] as const;
+type ProjectMedia = { id: string; sourceBlob?: Blob; timelineAssetsData?: ProjectRecord['timelineAssetsData']; videoOverlayData?: ProjectRecord['videoOverlayData']; soundTracksData?: ProjectRecord['soundTracksData']; clipsData?: ProjectRecord['clipsData']; roughCutBlob?: Blob; editHistoryMediaData?: ProjectRecord['editHistoryMediaData'] };
 /** Projects whose job is running in THIS session. A "running" record that is not in this set was interrupted (app closed/killed). */
 export const liveProjects = new Set<string>();
 export const PROJECTS_CHANGED = 'wycut:projects-changed';
@@ -38,6 +49,7 @@ function openDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains('narration')) db.createObjectStore('narration', { keyPath: 'key' });
       if (!db.objectStoreNames.contains('chunks')) db.createObjectStore('chunks', { keyPath: 'key' });
       if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings', { keyPath: 'key' });
+      if (!db.objectStoreNames.contains('projectMedia')) db.createObjectStore('projectMedia', { keyPath: 'id' });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => { dbPromise = null; reject(request.error || new Error('Could not open local storage.')); };
@@ -63,22 +75,48 @@ export function saveProject(id: string, patch: Patch): Promise<void> {
   return enqueue(async () => {
     try {
       const previous = await tx<ProjectRecord>('projects', 'readonly', s => s.get(id));
+      const previousMedia = await tx<ProjectMedia>('projectMedia', 'readonly', s => s.get(id));
       const next: Record<string, unknown> = { title: 'Untitled project', mode: 'subtitles', status: 'idle', createdAt: Date.now(), ...(previous || {}) };
-      for (const [key, value] of Object.entries(patch)) { if (value === null) delete next[key]; else if (value !== undefined) next[key] = value; }
+      const mediaNext: Record<string, unknown> = { id, ...previousMedia };
+      let mediaTouched = false;
+      // Migrate any blobs stored inline by earlier app versions, then keep them in their own record so every edit
+      // does not rewrite a potentially hundreds-of-megabytes source video.
+      for (const key of MEDIA_KEYS) {
+        if (mediaNext[key] === undefined && previous && previous[key] !== undefined) { mediaNext[key] = previous[key]; mediaTouched = true; }
+        delete next[key];
+      }
+      for (const [key, value] of Object.entries(patch)) {
+        if ((MEDIA_KEYS as readonly string[]).includes(key)) {
+          if (value === null) { delete mediaNext[key]; mediaTouched = true; } else if (value !== undefined) { mediaNext[key] = value; mediaTouched = true; }
+        } else if (value === null) delete next[key]; else if (value !== undefined) next[key] = value;
+      }
       next.id = id; next.updatedAt = Date.now();
       await tx('projects', 'readwrite', s => s.put(next));
+      if (mediaTouched) {
+        const hasMedia = MEDIA_KEYS.some(key => mediaNext[key] !== undefined);
+        if (hasMedia) await tx('projectMedia', 'readwrite', s => s.put(mediaNext));
+        else await tx('projectMedia', 'readwrite', s => s.delete(id));
+      }
       notify();
-    } catch (error) { storageError('save-project', error); /* do not break the generation pipeline, but surface the storage failure to the UI */ }
+    } catch (error) { storageError('save-project', error); }
   });
 }
-export async function getProject(id: string): Promise<ProjectRecord | null> { try { return (await tx<ProjectRecord>('projects', 'readonly', s => s.get(id))) || null; } catch { return null; } }
+export async function getProject(id: string): Promise<ProjectRecord | null> {
+  try {
+    const [record, media] = await Promise.all([tx<ProjectRecord>('projects', 'readonly', s => s.get(id)), tx<ProjectMedia>('projectMedia', 'readonly', s => s.get(id))]);
+    if (!record) return null;
+    return { ...record, ...(media || {}) } as ProjectRecord;
+  } catch { return null; }
+}
 export async function listProjects(): Promise<ProjectRecord[]> {
+  // History lists only small metadata. Do not pull large source/output Blobs into memory until a user opens a project.
   try { const all = (await tx<ProjectRecord[]>('projects', 'readonly', s => s.getAll())) || []; return all.sort((a, b) => b.updatedAt - a.updatedAt); } catch { return []; }
 }
 export function deleteProject(id: string): Promise<void> {
   return enqueue(async () => {
     try {
       await tx('projects', 'readwrite', s => s.delete(id));
+      await tx('projectMedia', 'readwrite', s => s.delete(id));
       await deleteNarrationParts(id);
       liveProjects.delete(id); notify();
     } catch { /* ignore */ }

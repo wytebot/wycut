@@ -17,7 +17,7 @@ assert.match(credits, /claims\.some\(snap => snap\.exists\)/);
 assert.match(credits, /db\.runTransaction/);
 assert.match(env, /FREE_TRIAL_DAILY_CAP=60/);
 // Every paid action charges credits and can refund.
-assert.match(scriptRoute, /reserveRecapCredit\([^)]*scriptCredits/);
+assert.match(scriptRoute, /reserveRecapCredit\([^)]*requiredCredits/);
 assert.match(scriptRoute, /refundRecapCredit/);
 assert.match(transcribe, /chargeCredits/);
 assert.match(transcribe, /refundCharge/);

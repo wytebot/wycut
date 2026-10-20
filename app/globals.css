@@ -1,3 +1,4 @@
+@import url('https://fonts.googleapis.com/css2?family=Anton&family=Archivo+Black&family=Bebas+Neue&family=Cormorant+Garamond:wght@400;700&family=DM+Sans:wght@400;700;900&family=League+Spartan:wght@400;700;900&family=Lato:wght@400;700;900&family=Manrope:wght@400;700;800&family=Merriweather:wght@400;700;900&family=Montserrat:wght@400;700;900&family=Nunito:wght@400;700;900&family=Open+Sans:wght@400;700;800&family=Oswald:wght@400;600;700&family=Playfair+Display:wght@400;700;900&family=Poppins:wght@400;700;900&family=Raleway:wght@400;700;900&family=Roboto:wght@400;700;900&family=Rubik:wght@400;700;900&family=Ubuntu:wght@400;700&display=swap');
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -52,3 +53,61 @@ body.wycut-editor-open { overflow: hidden; overscroll-behavior: none; }
 .wy-asset-preview { animation: wy-asset-preview 850ms ease-in-out both; }
 .wy-transition-preview { animation: wy-transition-preview 850ms ease-in-out both; }
 @media (prefers-reduced-motion: reduce) { .wy-asset-preview, .wy-transition-preview { animation-duration: 1ms; } }
+
+
+/* Live visual-effect previews inspired by mobile creator editors. These affect preview only; export uses the matching FFmpeg effect mapping. */
+@keyframes wy-effect-shake { 0%,100%{translate:0 0} 20%{translate:-2px 1px} 40%{translate:2px -1px} 60%{translate:-1px -1px} 80%{translate:2px 1px} }
+@keyframes wy-effect-glitch { 0%,100%{translate:0 0;filter:hue-rotate(0deg)} 25%{translate:-3px 0;filter:hue-rotate(80deg)} 50%{translate:2px 1px;filter:hue-rotate(-70deg)} 75%{translate:-1px -1px;filter:contrast(1.7)} }
+@keyframes wy-effect-flash { 0%,45%,100%{filter:brightness(1)} 50%,58%{filter:brightness(1.9)} }
+@keyframes wy-effect-flicker { 0%,100%{opacity:1} 23%{opacity:.78} 26%{opacity:1} 61%{opacity:.68} 65%{opacity:1} }
+@keyframes wy-effect-shimmer { 0%,100%{filter:brightness(1) saturate(1)} 50%{filter:brightness(1.28) saturate(1.45)} }
+@keyframes wy-effect-flare { 0%,100%{filter:brightness(1) contrast(1)} 50%{filter:brightness(1.35) contrast(1.08)} }
+@keyframes wy-effect-leak { 0%,100%{filter:sepia(.05) brightness(1)} 50%{filter:sepia(.22) brightness(1.22) saturate(1.3)} }
+@keyframes wy-effect-motion { 0%,100%{translate:0 0} 50%{translate:1px 0} }
+@keyframes wy-effect-zoom { 0%,100%{scale:1} 50%{scale:1.035} }
+@keyframes wy-effect-punch { 0%,100%{scale:1} 42%{scale:1.065} 58%{scale:.99} }
+@keyframes wy-effect-heat { 0%,100%{filter:hue-rotate(0deg) saturate(1.2)} 50%{filter:hue-rotate(12deg) saturate(1.6)} }
+@keyframes wy-effect-ghost { 0%,100%{opacity:1} 50%{opacity:.72} }
+@keyframes wy-effect-night { 0%,100%{filter:hue-rotate(65deg) saturate(1.6)} 50%{filter:hue-rotate(90deg) saturate(2) brightness(1.15)} }
+@keyframes wy-effect-vhs { 0%,100%{translate:0 0;filter:saturate(.8)} 30%{translate:1px 0;filter:saturate(1.1) contrast(1.15)} 60%{translate:-1px 0;filter:saturate(.7)} }
+
+@keyframes wy-spin-out { from{transform:rotate(0) scale(1);opacity:1} to{transform:rotate(180deg) scale(.2);opacity:0} }
+@keyframes wy-flip-out { from{transform:rotateY(0);opacity:1} to{transform:rotateY(90deg);opacity:0} }
+@keyframes wy-blur-out { from{filter:blur(0);opacity:1} to{filter:blur(8px);opacity:0} }
+
+/* Live text template / animation previews. Animations are intentionally continuous in the editor preview. */
+@keyframes wy-template-glow{0%,100%{background-position:0% 50%;filter:saturate(1)}50%{background-position:100% 50%;filter:saturate(1.4)}}
+@keyframes wy-glide{0%,100%{transform:translateX(-5px);opacity:.65}50%{transform:translateX(5px);opacity:1}}
+@keyframes wy-glitch-reveal{0%,100%{transform:translateX(0);text-shadow:2px 0 #fb7185,-2px 0 #67e8f9}25%{transform:translateX(-2px);text-shadow:-3px 0 #fb7185,3px 0 #67e8f9}50%{transform:translateX(2px);text-shadow:2px 0 #c084fc,-2px 0 #67e8f9}}
+@keyframes wy-word-reveal{0%,100%{clip-path:inset(0 100% 0 0);opacity:.5}50%{clip-path:inset(0 0 0 0);opacity:1}}
+@keyframes wy-tracking{0%,100%{letter-spacing:.02em;opacity:.7}50%{letter-spacing:.2em;opacity:1}}
+@keyframes wy-karaoke{0%,100%{filter:brightness(.8);text-shadow:none}50%{filter:brightness(1.4);text-shadow:0 0 12px #a78bfa}}
+@keyframes wy-gradient-shimmer{0%,100%{filter:hue-rotate(0deg) brightness(1)}50%{filter:hue-rotate(35deg) brightness(1.35);text-shadow:0 0 14px #c084fc}}
+@keyframes wy-outline-pulse{0%,100%{-webkit-text-stroke:0 transparent;text-shadow:0 0 2px #fff}50%{-webkit-text-stroke:1px #c4b5fd;text-shadow:0 0 12px #a78bfa}}
+@keyframes wy-3d-flip{0%,100%{transform:perspective(500px) rotateY(-12deg)}50%{transform:perspective(500px) rotateY(12deg)}}
+@keyframes wy-slam{0%,100%{transform:scale(1);text-shadow:0 0 0 transparent}15%{transform:scale(1.25);text-shadow:0 4px 0 #6d28d9}35%{transform:scale(.96)}}
+@keyframes wy-whip-in{0%,100%{transform:translateX(-8px) skewX(-8deg);opacity:.6}50%{transform:translateX(0) skewX(0);opacity:1}}
+@keyframes wy-whip-out{0%,100%{transform:translateX(0);opacity:1}50%{transform:translateX(8px) skewX(10deg);opacity:.65}}
+@keyframes wy-spin-bounce{0%,100%{transform:rotate(-5deg) scale(.96)}50%{transform:rotate(5deg) scale(1.08)}}
+@keyframes wy-pixel-dissolve{0%,100%{filter:contrast(1) blur(0)}50%{filter:contrast(1.7) blur(1px);opacity:.72}}
+@keyframes wy-digital-scan{0%,100%{text-shadow:0 0 0 #67e8f9}50%{text-shadow:2px 0 #67e8f9,-2px 0 #c084fc}}
+@keyframes wy-sparkle{0%,100%{filter:brightness(1);text-shadow:0 0 2px #fff}50%{filter:brightness(1.5);text-shadow:0 0 8px #fff,0 0 18px #f0abfc}}
+@keyframes wy-stretch{0%,100%{transform:scaleX(1)}50%{transform:scaleX(1.16)}}
+@keyframes wy-compress{0%,100%{transform:scale(.96)}50%{transform:scale(1.08,.88)}}
+@keyframes wy-orbit{0%,100%{transform:rotate(-3deg) translateY(0)}50%{transform:rotate(3deg) translateY(-5px)}}
+@keyframes wy-pendulum{0%,100%{transform:rotate(-7deg)}50%{transform:rotate(7deg)}}
+@keyframes wy-ink-reveal{0%,100%{filter:blur(3px);opacity:.55}50%{filter:blur(0);opacity:1}}
+@keyframes wy-stamp{0%,100%{transform:scale(1) rotate(0)}15%{transform:scale(1.18) rotate(-4deg)}30%{transform:scale(.95) rotate(2deg)}}
+@keyframes wy-social-pop{0%,100%{transform:scale(1) translateY(0)}30%{transform:scale(1.14) translateY(-4px)}60%{transform:scale(.97) translateY(1px)}}
+@keyframes wy-subscribe-pulse{0%,100%{transform:scale(1);filter:brightness(1);text-shadow:0 0 2px #f87171}50%{transform:scale(1.07);filter:brightness(1.3);text-shadow:0 0 14px #ef4444}}
+@keyframes wy-like-burst{0%,100%{transform:scale(1) rotate(0)}25%{transform:scale(1.16) rotate(-4deg)}50%{transform:scale(1.08) rotate(4deg)}}
+@keyframes wy-confetti{0%,100%{transform:translateY(4px) rotate(-2deg)}50%{transform:translateY(-6px) rotate(2deg);filter:saturate(1.7)}}
+@keyframes wy-soft-reveal{0%,100%{opacity:.65;filter:blur(1px)}50%{opacity:1;filter:blur(0)}}
+@keyframes wy-mask-wipe{0%,100%{clip-path:inset(0 0 0 0)}50%{clip-path:inset(0 0 0 35%)}}
+@keyframes wy-focus-snap{0%,100%{filter:blur(0);transform:scale(1)}50%{filter:blur(1px);transform:scale(1.04)}}
+@keyframes wy-neon-flicker{0%,100%{opacity:1;text-shadow:0 0 5px #c084fc,0 0 14px #a78bfa}35%{opacity:.78;text-shadow:0 0 2px #c084fc}50%{opacity:1;text-shadow:0 0 18px #e9d5ff}}
+@keyframes wy-hologram{0%,100%{opacity:1;filter:hue-rotate(0deg)}50%{opacity:.8;filter:hue-rotate(45deg)}}
+@keyframes wy-ticker{0%,100%{transform:translateX(-4px)}50%{transform:translateX(4px)}}
+@keyframes wy-vertical-type{0%,100%{clip-path:inset(100% 0 0 0)}50%{clip-path:inset(0 0 0 0)}}
+@keyframes wy-underline-draw{0%,100%{text-decoration:underline;text-decoration-color:transparent}50%{text-decoration-color:#c4b5fd;text-decoration-thickness:3px}}
+@keyframes wy-split-reveal{0%,100%{letter-spacing:-.08em;opacity:.65}50%{letter-spacing:.08em;opacity:1}}

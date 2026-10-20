@@ -2,14 +2,16 @@
 
 import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import creditPricing from '@/config/credit-pricing.json';
 import { Cloud, UploadCloud, Scissors, Download, Music2, CheckCircle2, ArrowLeft, Image as ImageIcon, Film, X, Type, Captions } from 'lucide-react';
 import { sliceVideoLocally, concatenateClipsLocally, mixAudioTracksLocally, abortFFmpeg, warmFFmpeg, releaseFFmpegMemory, MAX_SOURCE_BYTES, MAX_SOURCE_LABEL, type SlicedClip } from '@/lib/ffmpeg/client-slicer';
-import { renderEditPlan, cancelEditExport } from '@/lib/ffmpeg/edit-export';
+import { renderEditPlan, cancelEditExport, type TimelineRenderOverlay } from '@/lib/ffmpeg/edit-export';
 import { normalizeEditPlan, previewFilterForPlan, previewEffectForPlan, previewAdjustForPlan, NO_ADJUST, type Adjust, type OverlayMask, type ChromaKey, type ManualMaskStroke } from '@/lib/editor/edit-plan';
+import { createTimelineProject, addTimelineClip, sortLanes, type TimelineProject } from '@/lib/editor/timeline-model';
 import { splitAt, trimEdge, gapsOf, playbackJump, segmentAt, snapToFrame, normalizeFps, editedLength, sourceToEdited, DEFAULT_FPS, type Segment } from '@/lib/editor/manual-cuts';
-import { ANIMATION_CSS } from '@/lib/editor/asset-catalog';
-import { EditorTopBar, PreviewStage, PlaybackBar, TrackRail, Timeline, ToolBar, ToolSheet, AIQuickSheet, useVideoThumbs, type EditorToolName } from '@/components/editor-v42-layout';
-import { SoundLibrary, readDeviceAudioTrack, MAX_AUDIO_LAYERS, type WyCutAudioTrack } from '@/components/sound-library';
+import { ANIMATION_CSS, LIVE_EFFECT_ANIMATIONS } from '@/lib/editor/asset-catalog';
+import { EditorTopBar, PreviewStage, PlaybackBar, TrackRail, Timeline, ToolBar, ToolSheet, AIQuickSheet, useVideoThumbs, type EditorToolName, type TimelineVisualAsset } from '@/components/editor-v42-layout';
+import { SoundLibrary, readDeviceAudioTrack, type WyCutAudioTrack } from '@/components/sound-library';
 import AdvancedEditorTools from '@/components/advanced-editor-tools';
 import { exportProductionKit, type DriveExportFile } from '@/lib/drive/export';
 import { fetchDriveBlob, fetchDriveText, loadProductionKit } from '@/lib/drive/read';
@@ -41,6 +43,8 @@ function clipFit(beat: { startSeconds: number; endSeconds: number; narration: st
   return `${words} words · ~${Math.round(read)}s read · ${tag}`;
 }
 const MAX_SUBTITLE_URL_BYTES = 5 * 1024 * 1024;
+function timelineAssetKey(file: Pick<File, 'name'|'size'|'type'>) { return `${file.name}::${file.size}::${file.type}`; }
+type TimelineAssetPlacement = { startSeconds: number; durationSeconds: number };
 const DRIVE_TOKEN_KEY = 'wycut_drive_access_token';
 const DRIVE_TOKEN_EXPIRY_KEY = 'wycut_drive_access_token_expiry';
 function persistDriveToken(token: string, expiresIn = 3600) { try { localStorage.setItem(DRIVE_TOKEN_KEY, token); localStorage.setItem(DRIVE_TOKEN_EXPIRY_KEY, String(Date.now() + Math.max(60, expiresIn - 120) * 1000)); window.dispatchEvent(new Event(DRIVE_TOKEN_EVENT)); } catch { /* storage may be disabled */ } }
@@ -132,8 +136,43 @@ async function readMediaDuration(blob: Blob): Promise<number> {
   finally { URL.revokeObjectURL(url); }
 }
 
+function TimelineAssetPreview({ file, startSeconds, durationSeconds, playheadSeconds, playing }: { file: File; startSeconds: number; durationSeconds: number; playheadSeconds: number; playing: boolean }) {
+  const [url, setUrl] = useState('');
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  useEffect(() => { const next = URL.createObjectURL(file); setUrl(next); return () => URL.revokeObjectURL(next); }, [file]);
+  const active = playheadSeconds >= startSeconds && playheadSeconds < startSeconds + durationSeconds;
+  useEffect(() => {
+    const el = videoRef.current; if (!el || !active) return;
+    if (Number.isFinite(el.duration) && el.duration > 0) { const target = Math.max(0, (playheadSeconds - startSeconds) % el.duration); if (Math.abs(el.currentTime - target) > 0.25) el.currentTime = target; }
+    if (playing) void el.play().catch(() => undefined); else el.pause();
+  }, [active, playheadSeconds, startSeconds, playing, url]);
+  if (!url || !active) return null;
+  const cls = 'pointer-events-none absolute inset-0 m-auto h-2/3 w-2/3 object-contain';
+  return file.type.startsWith('image/') ? <img src={url} alt="Timeline overlay preview" className={cls} /> : <video ref={videoRef} src={url} muted playsInline loop className={cls} aria-label="Timeline video overlay preview" />;
+}
+
+function TimelineAudioPreview({ track, playheadSeconds, playing, playbackRate }: { track: WyCutAudioTrack; playheadSeconds: number; playing: boolean; playbackRate: number }) {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [url, setUrl] = useState('');
+  useEffect(() => { const next = URL.createObjectURL(track.blob); setUrl(next); return () => URL.revokeObjectURL(next); }, [track.blob]);
+  useEffect(() => {
+    const audio = audioRef.current; if (!audio || !url) return;
+    const elapsed = playheadSeconds - track.startSeconds; const duration = Math.max(0.05, track.durationSeconds || audio.duration || 0.05);
+    const active = elapsed >= 0 && elapsed < duration;
+    if (!active) { audio.pause(); return; }
+    if (Number.isFinite(audio.duration) && audio.duration > 0 && Math.abs(audio.currentTime - elapsed) > 0.3) audio.currentTime = Math.min(audio.duration, elapsed);
+    audio.playbackRate = Math.max(0.25, Math.min(2, playbackRate || 1));
+    const fadeIn = Math.max(0, track.fadeInSeconds || 0); const fadeOut = Math.max(0, track.fadeOutSeconds || 0);
+    const fadeInGain = fadeIn > 0 ? Math.min(1, elapsed / fadeIn) : 1;
+    const fadeOutGain = fadeOut > 0 ? Math.min(1, Math.max(0, (duration - elapsed) / fadeOut)) : 1;
+    audio.volume = Math.max(0, Math.min(1, track.volume * Math.min(fadeInGain, fadeOutGain)));
+    if (playing) void audio.play().catch(() => undefined); else audio.pause();
+  }, [url, track.startSeconds, track.durationSeconds, track.volume, track.fadeInSeconds, track.fadeOutSeconds, playheadSeconds, playing, playbackRate]);
+  return url ? <audio ref={audioRef} src={url} preload="auto" /> : null;
+}
+
 export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: SourceMode }) {
-  const [mode, setMode] = useState<SourceMode>('file'); const [url, setUrl] = useState(''); const [subtitleUrl, setSubtitleUrl] = useState(''); const [file, setFile] = useState<File | null>(null); const [video, setVideo] = useState<File | null>(null); const [timelineAssets, setTimelineAssets] = useState<File[]>([]); const [exportChoiceOpen, setExportChoiceOpen] = useState(false); const [exportPage, setExportPage] = useState(false); const [exportDone, setExportDone] = useState(false); const [exportProgress, setExportProgress] = useState(0); const [exportStage, setExportStage] = useState(''); const [title, setTitle] = useState('My Movie');
+  const [mode, setMode] = useState<SourceMode>('file'); const [url, setUrl] = useState(''); const [subtitleUrl, setSubtitleUrl] = useState(''); const [file, setFile] = useState<File | null>(null); const [video, setVideo] = useState<File | null>(null); const [timelineAssets, setTimelineAssets] = useState<File[]>([]); const [timelineProject, setTimelineProject] = useState<TimelineProject>(() => createTimelineProject()); const [timelineAssetPlacements, setTimelineAssetPlacements] = useState<Record<string, TimelineAssetPlacement>>({}); const [exportChoiceOpen, setExportChoiceOpen] = useState(false); const [exportPage, setExportPage] = useState(false); const [exportDone, setExportDone] = useState(false); const [exportProgress, setExportProgress] = useState(0); const [exportStage, setExportStage] = useState(''); const [title, setTitle] = useState('My Movie');
   const [notice, setNotice] = useState(''); const [busy, setBusy] = useState(false); const [authEmail, setAuthEmail] = useState(''); const [credits, setCredits] = useState<number | null>(null); const [freeAccess, setFreeAccess] = useState(false); const [needsTopUp, setNeedsTopUp] = useState(false); const [videoSeconds, setVideoSeconds] = useState(0);
   const narrationCache = useRef(new Map<string, { id: string; text: string; audioBase64: string }>()); const [stage, setStage] = useState(''); const [progress, setProgress] = useState(0);
   useEffect(() => { setMode('file'); }, [initialFlow]);
@@ -158,7 +197,7 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
   // Bring new status/errors into view so a tap never looks like it did nothing.
   useEffect(() => { if (notice && !busy) noticeRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, [notice, busy]);
   const [editorSearchOpen, setEditorSearchOpen] = useState(false); const [editorSearch, setEditorSearch] = useState(''); const [beatMarkers, setBeatMarkers] = useState<number[]>([]); const [keyframes, setKeyframes] = useState<{time:number;scale:number;rotation:number}[]>([]); const [targetMinutes, setTargetMinutes] = useState('5'); const [durationPromptOpen, setDurationPromptOpen] = useState(false); const [quality, setQuality] = useState<'720p'|'1080p'|'2K'>('720p'); const [aiSheetOpen, setAiSheetOpen] = useState(false); const [toolSheet, setToolSheet] = useState(''); const [closeConfirm, setCloseConfirm] = useState(false); const [playheadSeconds, setPlayheadSeconds] = useState(0); const [previewFullscreen, setPreviewFullscreen] = useState(false); const [editorMuted, setEditorMuted] = useState(false);
-  const [script, setScript] = useState<RecapScript | null>(null); const [videoOverlay, setVideoOverlay] = useState<File | null>(null); const [overlayMask, setOverlayMask] = useState<OverlayMask>({shape:'none',x:50,y:50,width:80,height:80,feather:0,invert:false}); const [chromaKey, setChromaKey] = useState<ChromaKey>({enabled:false,color:'#00ff00',similarity:0.12,blend:0.08}); const [manualMaskStrokes, setManualMaskStrokes] = useState<ManualMaskStroke[]>([]); const [aiRemovingBackground, setAiRemovingBackground] = useState(false); const [soundTracks, setSoundTracks] = useState<WyCutAudioTrack[]>([]); const [selectedClipIndex, setSelectedClipIndex] = useState(0); const [timelineZoom, setTimelineZoom] = useState(1); const [adjust, setAdjust] = useState<Adjust>(NO_ADJUST); const [clipVolume, setClipVolume] = useState(100); const [fadeIn, setFadeIn] = useState(0); const [fadeOut, setFadeOut] = useState(0); const [fps, setFps] = useState(DEFAULT_FPS); const [mirrorPreview, setMirrorPreview] = useState(false); const [cropMode, setCropMode] = useState('contain'); const [textOverlay, setTextOverlay] = useState(''); const [textPosition, setTextPosition] = useState<'top'|'center'|'bottom'>('center'); const [textX, setTextX] = useState(50); const [textY, setTextY] = useState(50); const [textScale, setTextScale] = useState(1); const [textRotation, setTextRotation] = useState(0); const [emojiOverlay, setEmojiOverlay] = useState(''); const [overlayFont, setOverlayFont] = useState('Inter'); const [showWatermark, setShowWatermark] = useState(true); const [effectPreset, setEffectPreset] = useState('Original'); const [visualEffect, setVisualEffect] = useState('None'); const [textAnimation, setTextAnimation] = useState('None'); const [transition, setTransition] = useState('Cut'); const [sticker, setSticker] = useState(''); const [recapId, setRecapId] = useState(''); const [idToken, setIdToken] = useState(''); const [clips, setClips] = useState<SlicedClip[]>([]); const [roughCut, setRoughCut] = useState<Blob | null>(null); const [driveToken, setDriveToken] = useState(''); const [driveFolder, setDriveFolder] = useState(''); const [googleReady, setGoogleReady] = useState(false); const [googleLoadError, setGoogleLoadError] = useState(''); const [hasSourceTimecodes, setHasSourceTimecodes] = useState(false); const [showClipDownloads, setShowClipDownloads] = useState(false);
+  const [script, setScript] = useState<RecapScript | null>(null); const [videoOverlay, setVideoOverlay] = useState<File | null>(null); const [overlayMask, setOverlayMask] = useState<OverlayMask>({shape:'none',x:50,y:50,width:80,height:80,feather:0,invert:false}); const [chromaKey, setChromaKey] = useState<ChromaKey>({enabled:false,color:'#00ff00',similarity:0.12,blend:0.08}); const [manualMaskStrokes, setManualMaskStrokes] = useState<ManualMaskStroke[]>([]); const [aiRemovingBackground, setAiRemovingBackground] = useState(false); const [soundTracks, setSoundTracks] = useState<WyCutAudioTrack[]>([]); const [selectedClipIndex, setSelectedClipIndex] = useState(0); const [selectedVisualAssetId, setSelectedVisualAssetId] = useState(''); const [timelineZoom, setTimelineZoom] = useState(1); const [adjust, setAdjust] = useState<Adjust>(NO_ADJUST); const [clipVolume, setClipVolume] = useState(100); const [fadeIn, setFadeIn] = useState(0); const [fadeOut, setFadeOut] = useState(0); const [fps, setFps] = useState(DEFAULT_FPS); const [mirrorPreview, setMirrorPreview] = useState(false); const [cropMode, setCropMode] = useState('contain'); const [textOverlay, setTextOverlay] = useState(''); const [textPosition, setTextPosition] = useState<'top'|'center'|'bottom'>('center'); const [textX, setTextX] = useState(50); const [textY, setTextY] = useState(50); const [textScale, setTextScale] = useState(1); const [textRotation, setTextRotation] = useState(0); const [emojiOverlay, setEmojiOverlay] = useState(''); const [overlayFont, setOverlayFont] = useState('Inter'); const [showWatermark, setShowWatermark] = useState(true); const [effectPreset, setEffectPreset] = useState('Original'); const [visualEffect, setVisualEffect] = useState('None'); const [textAnimation, setTextAnimation] = useState('None'); const [transition, setTransition] = useState('Cut'); const [sticker, setSticker] = useState(''); const [recapId, setRecapId] = useState(''); const [idToken, setIdToken] = useState(''); const [clips, setClips] = useState<SlicedClip[]>([]); const [roughCut, setRoughCut] = useState<Blob | null>(null); const [driveToken, setDriveToken] = useState(''); const [driveFolder, setDriveFolder] = useState(''); const [googleReady, setGoogleReady] = useState(false); const [googleLoadError, setGoogleLoadError] = useState(''); const [hasSourceTimecodes, setHasSourceTimecodes] = useState(false); const [showClipDownloads, setShowClipDownloads] = useState(false);
   const videoOverlayPreviewUrl = useMemo(() => videoOverlay ? URL.createObjectURL(videoOverlay) : '', [videoOverlay]); const [videoOverlayThumb, setVideoOverlayThumb] = useState('');
   const overlayPreviewRef = useRef<HTMLVideoElement | null>(null);
   useEffect(() => () => { if (videoOverlayPreviewUrl) URL.revokeObjectURL(videoOverlayPreviewUrl); }, [videoOverlayPreviewUrl]);
@@ -228,7 +267,7 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
   }
   useEffect(() => { if (Capacitor.isNativePlatform()) return; let active = true; void loadGoogleIdentityServices().then(() => { if (active) { setGoogleReady(true); setGoogleLoadError(''); } }).catch(error => { if (active) setGoogleLoadError(error instanceof Error ? error.message : 'Google Drive sign-in could not load.'); }); return () => { active = false; }; }, []);
   useEffect(() => { if (!googleReady || Capacitor.isNativePlatform()) return; let connected = false; let expires = 0; try { connected = Boolean(localStorage.getItem(DRIVE_TOKEN_KEY)); expires = Number(localStorage.getItem(DRIVE_TOKEN_EXPIRY_KEY) || 0); } catch { return; } if (!connected || expires > Date.now() || !window.google?.accounts?.oauth2) return; const clientId = process.env.NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID; if (!clientId || !clientId.endsWith('.apps.googleusercontent.com')) return; const client = window.google.accounts.oauth2.initTokenClient({ client_id: clientId, scope: 'https://www.googleapis.com/auth/drive.file', callback: (response) => { if (response.access_token && !response.error) { persistDriveToken(response.access_token, response.expires_in || 3600); setDriveToken(response.access_token); setNotice('Google Drive connection refreshed automatically.'); } else { setNotice('Your Google Drive connection is saved, but Google requires you to reconnect to renew permission. Tap Reconnect Drive.'); } } }); try { client.requestAccessToken({ prompt: '' }); } catch { /* silent refresh can be blocked; keep saved connection and offer manual reconnect */ } }, [googleReady]);
-  const clearGeneratedOutputs = () => { projectIdRef.current = ''; keepOutputs.current = false; exportedRef.current = false; restoredTranscript.current = null; setScript(null); setRecapId(''); setHasSourceTimecodes(false); setClips([]); setRoughCut(null); setSoundTracks([]); };
+  const clearGeneratedOutputs = (preserveProject = false) => { if (!preserveProject) { projectIdRef.current = ''; keepOutputs.current = false; exportedRef.current = false; restoredTranscript.current = null; } setScript(null); setRecapId(''); setHasSourceTimecodes(false); setClips([]); setRoughCut(null); setSoundTracks([]); };
   const selectFile = (candidate?: File) => {
     if (!candidate) return;
     if (!/\.(srt|vtt|txt)$/i.test(candidate.name) && !['text/plain','text/vtt','application/x-subrip'].includes(candidate.type)) {
@@ -270,15 +309,19 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
       void saveProject(id, {
         title: title.trim() || candidate.name.replace(/\.[^.]+$/, ''),
         mode: 'file', status: 'idle', stage: null, progress: null, error: null,
-        sourceName: candidate.name, sourceSize: candidate.size,
+        sourceName: candidate.name, sourceSize: candidate.size, sourceBlob: candidate,
       });
     }
-    if (keepOutputs.current && projectIdRef.current) { setClips([]); setRoughCut(null); setNotice(isImage ? 'Image ready. Export it as an image or create a 5-second video from it.' : 'Video ready. Your saved project was restored, so you can slice clips now.'); checkpoint({ sourceName: candidate.name, sourceSize: candidate.size }); }
+    if (keepOutputs.current && projectIdRef.current) { setClips([]); setRoughCut(null); setNotice(isImage ? 'Image ready. Export it as an image or create a 5-second video from it.' : 'Video ready. Your saved project was restored, so you can slice clips now.'); checkpoint({ sourceName: candidate.name, sourceSize: candidate.size, sourceBlob: candidate }); }
     else { clearGeneratedOutputs(); setNotice(isImage ? 'Image added to the editor. Choose Export to save an edited image or create a 5-second video.' : ''); }
   }
-  async function downloadFile(blob: Blob, name: string) {
+  async function downloadFile(blob: Blob, name: string, throwOnError = false) {
     try { await download(blob, name); }
-    catch (error) { setNotice(error instanceof Error ? error.message : `Could not save ${name}.`); }
+    catch (error) {
+      const message = error instanceof Error ? error.message : `Could not save ${name}.`;
+      setNotice(message);
+      if (throwOnError) throw error instanceof Error ? error : new Error(message);
+    }
   }
   async function openDriveFolder() {
     if (!driveFolder) return;
@@ -503,7 +546,7 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
       if (!manifestFile) throw new Error('This Drive project has no editable Project.json manifest. Older exports can still be viewed and downloaded, but cannot restore their timeline automatically.');
       const manifest = JSON.parse(await fetchDriveText(driveToken, manifestFile.id)) as { title?: string; recapId?: string; script?: RecapScript; editPlan?: unknown; settings?: Record<string, unknown>; sourceFileName?: string; mediaAssets?: Array<{ fileName: string; name: string; kind: 'video'|'image'; overlay?: boolean }>; sounds?: Array<{ name?: string; fileName?: string; category?: string; startSeconds?: number; durationSeconds?: number; volume?: number; source?: string }> };
       if (!manifest.script || !Array.isArray(manifest.script.beats) || manifest.script.beats.length < 1 || manifest.script.beats.length > 100) throw new Error('The saved project manifest is invalid or incomplete.');
-      clearGeneratedOutputs(); setVideo(null); setFile(null); setTimelineAssets([]); setVideoOverlay(null); setManualMaskStrokes([]); setNeedsTopUp(false);
+      clearGeneratedOutputs(); setVideo(null); setFile(null); setTimelineAssets([]); setTimelineAssetPlacements({}); setVideoOverlay(null); setManualMaskStrokes([]); setNeedsTopUp(false);
       const localId = newProjectId(); projectIdRef.current = localId; keepOutputs.current = true; exportedRef.current = false;
       setTitle(String(manifest.title || manifest.script.title || 'Restored project')); setMode('file'); setScript(manifest.script); setRecapId(String(manifest.recapId || '')); setHasSourceTimecodes(true);
       const legacySettings = manifest.settings || {};
@@ -556,16 +599,58 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
     if (busy) { setNotice('Wait for the current generation to finish before opening another project.'); return; }
     const record = await getProject(id);
     if (!record) { setNotice('That project is no longer stored on this device.'); return; }
-    clearGeneratedOutputs(); setVideo(null); setFile(null); setTimelineAssets([]); setVideoOverlay(null); setManualMaskStrokes([]); setNeedsTopUp(false);
+    clearGeneratedOutputs(); setVideo(null); setFile(null); setTimelineAssets([]); setTimelineAssetPlacements({}); setVideoOverlay(null); setManualMaskStrokes([]); setNeedsTopUp(false);
     projectIdRef.current = record.id; keepOutputs.current = true; exportedRef.current = record.status === 'exported';
+    if (record.editHistory?.version === 1 && Array.isArray(record.editHistory.stack) && record.editHistory.stack.length > 0) {
+      const mediaById = new Map((record.editHistoryMediaData || []).map(track => [track.id, track]));
+      const stack = record.editHistory.stack.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && 'aspectRatio' in (item as Record<string, unknown>))).map(item => {
+        const ids = Array.isArray(item.soundTrackIds) ? item.soundTrackIds.map(String) : [];
+        const soundTracks = ids.map(id => mediaById.get(id)).filter((track): track is WyCutAudioTrack => Boolean(track));
+        return { ...item, soundTracks } as unknown as EditSnap;
+      });
+      if (stack.length) { const index = Math.max(0, Math.min(stack.length - 1, Number(record.editHistory.index) || 0)); histRef.current = { stack, index }; setHistState({ canUndo: index > 0, canRedo: index < stack.length - 1 }); }
+    }
     setTitle(record.title); setMode(record.mode); setSubtitleUrl(record.subtitleUrl || ''); setUrl(record.videoUrl || '');
     restoredTranscript.current = record.transcript || null;
-    if (record.script) {
-      
-      setScript(record.script); setRecapId(record.recapId || ''); setHasSourceTimecodes(record.hasSourceTimecodes === true);
-      setNotice(`Project restored: your script is back. ${record.sourceName ? `To slice clips, choose the source video again (${record.sourceName}).` : 'Choose the source video again to slice clips.'}`);
-    } else if (record.transcript) setNotice('Project restored. Your transcript is saved, so tap Generate to continue without paying for transcription again.');
-    else setNotice(`Project restored. ${record.sourceName ? `Choose ${record.sourceName} again and tap Generate to continue; transcription parts already paid for are reused.` : 'Add your source and tap Generate to continue.'}`);
+    if (record.script) { setScript(record.script); setRecapId(record.recapId || ''); setHasSourceTimecodes(record.hasSourceTimecodes === true); }
+    const saved = record.editState || {};
+    if (saved.timelineAssetPlacements && typeof saved.timelineAssetPlacements === 'object') setTimelineAssetPlacements(saved.timelineAssetPlacements as Record<string, TimelineAssetPlacement>);
+    if (typeof saved.aspectRatio === 'string' && ['9:16','16:9','1:1','4:5'].includes(saved.aspectRatio)) setAspectRatio(saved.aspectRatio as '9:16'|'16:9'|'1:1'|'4:5');
+    if (typeof saved.applyAspectRatio === 'boolean') setApplyAspectRatio(saved.applyAspectRatio);
+    if (typeof saved.quality === 'string' && ['720p','1080p','2K'].includes(saved.quality)) setQuality(saved.quality as '720p'|'1080p'|'2K');
+    if (typeof saved.playbackRate === 'string') setPlaybackRate(saved.playbackRate);
+    if (typeof saved.editorMuted === 'boolean') setEditorMuted(saved.editorMuted);
+    if (typeof saved.fastCut === 'boolean') setFastCut(saved.fastCut);
+    if (typeof saved.mirrorPreview === 'boolean') setMirrorPreview(saved.mirrorPreview);
+    if (typeof saved.cropMode === 'string') setCropMode(saved.cropMode);
+    if (typeof saved.textOverlay === 'string') setTextOverlay(saved.textOverlay);
+    if (['top','center','bottom'].includes(String(saved.textPosition))) setTextPosition(saved.textPosition as 'top'|'center'|'bottom');
+    for (const [key, setter] of [['textX',setTextX],['textY',setTextY],['textScale',setTextScale],['textRotation',setTextRotation],['clipVolume',setClipVolume],['fadeIn',setFadeIn],['fadeOut',setFadeOut]] as const) { const value = Number(saved[key]); if (Number.isFinite(value)) setter(value); }
+    if (typeof saved.emojiOverlay === 'string') setEmojiOverlay(saved.emojiOverlay);
+    if (typeof saved.overlayFont === 'string') setOverlayFont(saved.overlayFont);
+    if (typeof saved.showWatermark === 'boolean') setShowWatermark(saved.showWatermark);
+    if (typeof saved.effectPreset === 'string') setEffectPreset(saved.effectPreset);
+    if (typeof saved.visualEffect === 'string') setVisualEffect(saved.visualEffect);
+    if (typeof saved.textAnimation === 'string') setTextAnimation(saved.textAnimation);
+    if (typeof saved.transition === 'string') setTransition(saved.transition);
+    if (typeof saved.sticker === 'string') setSticker(saved.sticker);
+    if (saved.adjust && typeof saved.adjust === 'object') setAdjust(saved.adjust as Adjust);
+    if (saved.overlayMask && typeof saved.overlayMask === 'object') setOverlayMask(saved.overlayMask as OverlayMask);
+    if (saved.chromaKey && typeof saved.chromaKey === 'object') setChromaKey(saved.chromaKey as ChromaKey);
+    if (Array.isArray(saved.manualMaskStrokes)) setManualMaskStrokes(saved.manualMaskStrokes as ManualMaskStroke[]);
+    if (Array.isArray(saved.beatMarkers)) setBeatMarkers(saved.beatMarkers.map(Number).filter(n=>Number.isFinite(n)&&n>=0));
+    if (Array.isArray(saved.keyframes)) setKeyframes(saved.keyframes as {time:number;scale:number;rotation:number}[]);
+    if (record.sourceBlob) setVideo(new File([record.sourceBlob], record.sourceName || 'restored-source.mp4', { type: record.sourceBlob.type || 'video/mp4', lastModified: Date.now() }));
+    if (record.timelineAssetsData?.length) setTimelineAssets(record.timelineAssetsData.map(a => new File([a.blob], a.name, { type: a.type || a.blob.type || 'video/mp4', lastModified: Date.now() })));
+    if (record.videoOverlayData) setVideoOverlay(new File([record.videoOverlayData.blob], record.videoOverlayData.name, { type: record.videoOverlayData.type || record.videoOverlayData.blob.type || 'video/mp4', lastModified: Date.now() }));
+    if (record.soundTracksData?.length) setSoundTracks(record.soundTracksData);
+    if (record.clipsData?.length) setClips(record.clipsData.map(c => ({ filename: c.filename, blob: c.blob, size: c.size || c.blob.size })));
+    if (record.roughCutBlob) setRoughCut(record.roughCutBlob);
+    if (typeof saved.playheadSeconds === 'number') setPlayheadSeconds(Math.max(0, saved.playheadSeconds));
+    if (typeof saved.selectedClipIndex === 'number') setSelectedClipIndex(saved.selectedClipIndex < 0 ? -1 : saved.selectedClipIndex);
+    if (typeof saved.timelineZoom === 'number') setTimelineZoom(Math.max(0.5, Math.min(3, saved.timelineZoom)));
+    setEditorTab('Edit'); setToolSheet('');
+    setNotice(record.sourceBlob ? 'Project restored with its original source, script, media layers, sound tracks and saved editing settings. Continue editing without starting over.' : record.script ? `Project restored with its script and editing settings. Select the original source${record.sourceName ? ` (${record.sourceName})` : ''} once to continue.` : record.transcript ? 'Project restored. Your transcript is saved, so you can continue without paying for transcription again.' : 'Project restored. Add the missing source to continue.');
   }
   const openProjectRef = useRef(openProject); openProjectRef.current = openProject;
   const connectDriveRef = useRef(connectDrive); connectDriveRef.current = connectDrive;
@@ -635,15 +720,43 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
       setExportDone(false); setExportStage(e instanceof Error ? e.message : 'Drive export failed.'); setNotice(e instanceof Error ? e.message : 'Drive export failed.');
     } finally { setBusy(false); setStage(''); setActiveKind(''); }
   }
+  function materializeTimelineProject(): TimelineProject {
+    let project = createTimelineProject();
+    if (script?.beats?.length) {
+      for (const beat of script.beats) {
+        const start = Math.max(0, Number(beat.startSeconds) || 0); const end = Math.max(start + 0.01, Number(beat.endSeconds) || start + 0.01);
+        project = addTimelineClip(project, { id: `beat_${String(beat.id).replace(/[^A-Za-z0-9_-]/g, '_')}`, sourceId: 'main-source', kind: 'video', name: beat.title || 'Video clip', sourceStart: start, sourceEnd: end, start, duration: end - start, effects: [] });
+      }
+    } else if (video) {
+      project = addTimelineClip(project, { id: 'main-source-clip', sourceId: 'main-source', kind: video.type.startsWith('image/') ? 'image' : 'video', name: video.name, sourceStart: 0, sourceEnd: Math.max(0.01, videoSeconds || 5), start: 0, duration: Math.max(0.01, videoSeconds || 5) });
+    }
+    for (const [index, asset] of timelineAssets.entries()) {
+      const key = timelineAssetKey(asset); const placement = timelineAssetPlacements[key] || { startSeconds: 0, durationSeconds: asset.type.startsWith('image/') ? 5 : videoSeconds || 5 };
+      const id = `asset_${index}_${asset.size}_${asset.type.startsWith('image/') ? 'image' : 'video'}`;
+      project = addTimelineClip(project, { id, sourceId: key, kind: asset.type.startsWith('image/') ? 'image' : 'video', name: asset.name, sourceStart: 0, sourceEnd: Math.max(0.1, placement.durationSeconds), start: Math.max(0, placement.startSeconds), duration: Math.max(0.1, placement.durationSeconds) });
+    }
+    for (const track of soundTracks) {
+      project = addTimelineClip(project, { id: `sound_${track.id.replace(/[^A-Za-z0-9_-]/g, '_')}`, sourceId: track.id, kind: 'audio', name: track.name, sourceStart: 0, sourceEnd: Math.max(0.1, track.durationSeconds), start: Math.max(0, track.startSeconds), duration: Math.max(0.1, track.durationSeconds), audio: { volume: Math.max(0, Math.min(200, track.volume * 100)), fadeIn: track.fadeInSeconds || 0, fadeOut: track.fadeOutSeconds || 0 } });
+    }
+    if (effectPreset !== 'Original' || visualEffect !== 'None') project = addTimelineClip(project, { id: 'filter_global', kind: 'filter', name: `${effectPreset} · ${visualEffect}`, sourceStart: 0, sourceEnd: Math.max(0.1, videoSeconds || 5), start: 0, duration: Math.max(0.1, videoSeconds || 5), effects: [{ id: visualEffect, params: { preset: effectPreset } }] });
+    if (textOverlay || emojiOverlay || sticker) project = addTimelineClip(project, { id: 'template_global', kind: 'text', name: textOverlay || emojiOverlay || sticker || 'Text', sourceStart: 0, sourceEnd: Math.max(0.1, videoSeconds || 5), start: 0, duration: Math.max(0.1, videoSeconds || 5), keyframes: keyframes.map(k => ({ time: k.time, property: 'transform', value: `${k.scale},${k.rotation}` })) });
+    project.duration = Math.max(project.duration, videoSeconds || 0); project.lanes = sortLanes(project.lanes); project.updatedAt = Date.now();
+    setTimelineProject(project);
+    return project;
+  }
+  useEffect(() => { if (video) materializeTimelineProject(); }, [video, script, videoSeconds, timelineAssets, timelineAssetPlacements, soundTracks, effectPreset, visualEffect, textOverlay, emojiOverlay, sticker, keyframes]);
+
   function addTimelineMedia(files?: FileList | null) {
     if (!files?.length) return;
     const additions = Array.from(files).filter(f => f.type.startsWith('video/') || f.type.startsWith('image/'));
     if (!additions.length) { setNotice('Choose a video or image file.'); return; }
-    if (timelineAssets.length + additions.length > 20) { setNotice('A project can hold up to 20 extra video/image timeline assets.'); return; }
     const tooLarge = additions.find(f => f.size > 100 * 1024 * 1024);
     if (tooLarge) { setNotice(`${tooLarge.name} is over the 100 MB per-extra-asset limit. Add a smaller file.`); return; }
     setTimelineAssets(current => [...current, ...additions]);
-    setNotice(`${additions.length} media asset${additions.length === 1 ? '' : 's'} added to the project timeline. Assets are saved to Drive on export; this build does not yet composite extra images/videos into the final MP4.`);
+    const defaults: Record<string, TimelineAssetPlacement> = {};
+    additions.forEach(asset => { defaults[timelineAssetKey(asset)] = { startSeconds: 0, durationSeconds: asset.type.startsWith('image/') ? 5 : Math.max(0.1, videoSeconds || 5) }; });
+    setTimelineAssetPlacements(current => ({ ...current, ...defaults }));
+    setNotice(`${additions.length} media clip${additions.length === 1 ? '' : 's'} added. Set each clip's start and duration below; they will be composited into the final video.`);
   }
   async function downloadRecapScript(format: 'txt'|'json' = 'txt') {
     if (!script) return;
@@ -696,8 +809,15 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
     const kind = isStillImage ? outputKind : 'video';
     if (isStillImage && !kind) { setExportChoiceOpen(true); return; }
     if (busy) return;
+    const exportCosts = (creditPricing.editorAssets as { exportCostsCredits?: Record<string, number> }).exportCostsCredits || {};
+    const estimatedExportCost = (quality === '1080p' ? Number(exportCosts['1080p'] ?? 3) : quality === '2K' ? Number(exportCosts['2K'] ?? creditPricing.editorAssets.premiumExportCostCredits ?? 5) : 0) + (!showWatermark ? Number(exportCosts.watermarkRemoval ?? 2) : 0);
+    if (!freeAccess && estimatedExportCost > 0) {
+      const options = [quality !== '720p' ? `${quality}: ${quality === '1080p' ? exportCosts['1080p'] ?? 3 : exportCosts['2K'] ?? 5} credits` : '', !showWatermark ? `watermark removal: ${exportCosts.watermarkRemoval ?? 2} credits` : ''].filter(Boolean).join(' + ');
+      if (!window.confirm(`This export costs ${estimatedExportCost} credits (${options}). Credits are charged only after rendering succeeds. Continue?`)) return;
+    }
     setExportPage(true); setExportDone(false); setExportProgress(0); setExportStage('Preparing export…');
     setBusy(true); setStage('Preparing files for export…');
+    let settledExportId = ''; let settledAuthToken = ''; let exportChargeSettled = false; let outputDelivered = false;
     try {
       // Cut the clips now if the edit changed since the last cut, so the export always matches the timeline.
       let renderSource: Blob;
@@ -711,30 +831,77 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
         renderSource = await concatenateClipsLocally(cut, percent => { setExportProgress(45 + Math.round(percent * 5)); setExportStage(`Joining clips… ${Math.round(percent * 100)}%`); });
         setRoughCut(renderSource); cutSigRef.current = cutSignature();
       }
+      const currentTimeline = materializeTimelineProject();
+      const mainVideoClips = (currentTimeline.lanes.find(lane => lane.type === 'video')?.clipIds || []).map(id => currentTimeline.clips[id]).filter(clip => clip?.sourceId === 'main-source');
+      const soundClips = (currentTimeline.lanes.find(lane => lane.type === 'sound')?.clipIds || []).map(id => currentTimeline.clips[id]).filter(Boolean);
+      if (!isStillImage && soundClips.length) {
+        setExportStage('Mixing audio tracks and fades…');
+        const mappedAudio: Array<WyCutAudioTrack & { loop?: boolean; sourceOffsetSeconds?: number }> = [];
+        if (mainVideoClips.length) {
+          let cursor = 0;
+          for (const videoClip of mainVideoClips) {
+            const beatStart = videoClip.start; const beatEnd = videoClip.start + videoClip.duration;
+            for (const soundClip of soundClips) {
+              const track = soundTracks.find(item => item.id === soundClip.sourceId); if (!track) continue;
+              const trackStart = soundClip.start; const trackEnd = soundClip.start + soundClip.duration;
+              const overlapStart = Math.max(trackStart, beatStart); const overlapEnd = Math.min(trackEnd, beatEnd);
+              if (overlapEnd > overlapStart) mappedAudio.push({ ...track, id: `${track.id}_${videoClip.id}`, startSeconds: cursor + overlapStart - beatStart, durationSeconds: overlapEnd - overlapStart, sourceOffsetSeconds: overlapStart - trackStart, fadeInSeconds: soundClip.audio?.fadeIn || track.fadeInSeconds || 0, fadeOutSeconds: soundClip.audio?.fadeOut || track.fadeOutSeconds || 0, loop: track.category === 'Background Music' || track.category === 'Ambience' });
+            }
+            cursor += videoClip.duration;
+          }
+        } else mappedAudio.push(...soundTracks.map(track => ({ ...track, loop: track.category === 'Background Music' || track.category === 'Ambience' })));
+        if (mappedAudio.length) renderSource = await mixAudioTracksLocally(renderSource, mappedAudio, percent => { setExportProgress(Math.min(48, 35 + Math.round(percent * 13))); setExportStage(`Mixing sound layer… ${Math.round(percent * 100)}%`); });
+      }
       // Keyframes are placed against the source timeline. Map them into the assembled cut timeline so deleted/trimmed ranges do not shift animations incorrectly.
       const mappedKeyframes = (isStillImage ? [] : keyframes).map(k => { let mapped: number | null = null; let cursor = 0; for (const b of (script?.beats || [])) { const length = Math.max(0, b.endSeconds - b.startSeconds); if (k.time >= b.startSeconds && k.time <= b.endSeconds) { mapped = cursor + Math.max(0, Math.min(length, k.time - b.startSeconds)); break; } cursor += length; } return mapped === null ? null : { ...k, time: mapped }; }).filter((k): k is { time: number; scale: number; rotation: number } => Boolean(k)).sort((a,b)=>a.time-b.time);
       const transitionCuts: number[] = []; let cutElapsed = 0; (isStillImage ? [] : (script?.beats || [])).forEach((b, i, all) => { cutElapsed += Math.max(0, b.endSeconds - b.startSeconds); if (i < all.length - 1) transitionCuts.push(cutElapsed); });
       const plan = buildPlan(mappedKeyframes, transitionCuts);
       setExportStage(isStillImage && kind === 'image' ? 'Rendering edited still image…' : 'Rendering filters, overlays, keyframes and audio settings…'); setExportProgress(50);
-      const finalVideo = isStillImage ? (kind === 'video' ? await renderEditPlan(video, {...plan, speed:1, volume:0}, percent => { setExportProgress(Math.min(95, 50 + Math.round(percent * .45))); setExportStage(`Rendering 5-second image video… ${percent}%`); }, undefined, videoOverlay) : await renderStillImage(false)) : await renderEditPlan(renderSource, plan, percent => { setExportProgress(Math.min(95, 50 + Math.round(percent * .45))); setExportStage(`Rendering edited MP4… ${percent}%`); }, undefined, videoOverlay);
-      if (quality === '2K') {
-        setExportStage('Charging 2K export credits…');
+      const renderOverlays: TimelineRenderOverlay[] = currentTimeline.lanes.flatMap(lane => lane.clipIds.map(id => currentTimeline.clips[id]).filter(clip => clip && (clip.kind === 'video' || clip.kind === 'image') && clip.sourceId && clip.sourceId !== 'main-source').flatMap(clip => {
+        const asset = timelineAssets.find(candidate => timelineAssetKey(candidate) === clip.sourceId); if (!asset) return [];
+        const base = { id: clip.id, blob: asset, kind: (clip.kind === 'image' ? 'image' : 'video') as 'image'|'video' };
+        const sourceStart = clip.start; const sourceEnd = clip.start + clip.duration;
+        if (isStillImage || !mainVideoClips.length) return [{ ...base, startSeconds: sourceStart, durationSeconds: Math.max(0.1, Math.min(sourceEnd, isStillImage ? 5 : videoSeconds || 5) - sourceStart) }].filter(item => item.durationSeconds > 0 && item.startSeconds < (isStillImage ? 5 : videoSeconds || 5));
+        // Map the model's source-timeline placement into the concatenated kept ranges, splitting layers at cuts.
+        const mapped: TimelineRenderOverlay[] = []; let cursor = 0;
+        for (const videoClip of mainVideoClips) { const beatStart = videoClip.start; const beatEnd = videoClip.start + videoClip.duration; const overlapStart = Math.max(sourceStart, beatStart); const overlapEnd = Math.min(sourceEnd, beatEnd); if (overlapEnd > overlapStart) mapped.push({ ...base, id: `${base.id}-${videoClip.id}`, startSeconds: cursor + overlapStart - beatStart, durationSeconds: overlapEnd - overlapStart }); cursor += videoClip.duration; }
+        return mapped;
+      }));
+      const finalVideo = isStillImage ? (kind === 'video' ? await renderEditPlan(video, {...plan, speed:1, volume:0}, percent => { setExportProgress(Math.min(95, 50 + Math.round(percent * .45))); setExportStage(`Rendering 5-second image video… ${percent}%`); }, undefined, videoOverlay, renderOverlays) : await renderStillImage(false)) : await renderEditPlan(renderSource, plan, percent => { setExportProgress(Math.min(95, 50 + Math.round(percent * .45))); setExportStage(`Rendering edited MP4… ${percent}%`); }, undefined, videoOverlay, renderOverlays);
+      if (!freeAccess && estimatedExportCost > 0) {
+        setExportStage('Settling export credits…');
         const fallback = localStorage.getItem('wycut_google_id_token') || sessionStorage.getItem('wycut_google_id_token') || '';
-        const idToken = await getAuthToken(fallback);
-        if (!exportAttemptIdRef.current) exportAttemptIdRef.current = `2k-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+        const authToken = await getAuthToken(fallback);
+        settledAuthToken = authToken;
+        if (!exportAttemptIdRef.current) exportAttemptIdRef.current = `exp-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
         const exportId = exportAttemptIdRef.current;
-        const chargeResponse = await fetch('/api/editor/export/charge', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idToken, exportId, quality }), cache: 'no-store' });
-        const chargeData = await chargeResponse.json().catch(() => ({})) as { error?: string; credits?: number; cost?: number };
-        if (!chargeResponse.ok) throw new Error(chargeData.error || 'Could not authorize the 2K export. Your video has not been downloaded.');
+        settledExportId = exportId;
+        const chargeResponse = await fetch('/api/editor/export/charge', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idToken: authToken, exportId, quality, watermarkRemoved: !showWatermark }), cache: 'no-store' });
+        const chargeData = await chargeResponse.json().catch(() => ({})) as { error?: string; credits?: number; cost?: number; alreadyCharged?: boolean };
+        if (!chargeResponse.ok) throw new Error(chargeData.error || 'Could not settle the export charge. Your rendered file has not been delivered.');
         if (typeof chargeData.credits === 'number') setCredits(chargeData.credits);
-        setNotice(`2K export completed. ${chargeData.cost || 0} export credits charged.`);
+        exportChargeSettled = Number(chargeData.cost || 0) > 0;
+        setNotice(`Export completed. ${chargeData.cost || 0} credits charged${chargeData.alreadyCharged ? ' (already settled)' : ''}.`);
       }
-      await downloadFile(finalVideo, `${safeName(title || script.title)}_${quality}_edit.${isStillImage && kind === 'image' ? 'png' : 'mp4'}`);
-      if (quality === '2K') exportAttemptIdRef.current = '';
+      await downloadFile(finalVideo, `${safeName(title || script.title)}_${quality}_edit.${isStillImage && kind === 'image' ? 'png' : 'mp4'}`, true);
+      outputDelivered = true;
+      if (estimatedExportCost > 0) exportAttemptIdRef.current = '';
       if (!isStillImage && !script.manual) await downloadRecapScript('txt');
       if (driveToken) await exportDrive(finalVideo);
       else { setExportProgress(100); setExportStage('Saved to this device'); setExportDone(true); }
-    } catch (error) { setExportStage(error instanceof Error ? error.message : 'Export failed.'); setExportDone(false); }
+    } catch (error) {
+      let message = error instanceof Error ? error.message : 'Export failed.';
+      if (exportChargeSettled && !outputDelivered && settledExportId && settledAuthToken) {
+        setExportStage('The file could not be saved. Refunding export credits…');
+        try {
+          const refundResponse = await fetch('/api/editor/export/refund', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idToken: settledAuthToken, exportId: settledExportId, reason: 'device_delivery_failed' }), cache: 'no-store' });
+          const refundData = await refundResponse.json().catch(() => ({})) as { error?: string; credits?: number; refunded?: boolean; alreadyRefunded?: boolean };
+          if (refundResponse.ok) { if (typeof refundData.credits === 'number') setCredits(refundData.credits); message += refundData.refunded || refundData.alreadyRefunded ? ' Export credits were refunded.' : ''; exportAttemptIdRef.current = ''; }
+          else message += ` Automatic refund needs support review: ${refundData.error || 'refund endpoint failed'}. Export attempt: ${settledExportId}`;
+        } catch { message += ` Automatic refund could not be confirmed. Contact support with export attempt ID ${settledExportId}.`; }
+      }
+      setExportStage(message); setExportDone(false);
+    }
     finally { setBusy(false); setStage(''); }
   }
   const previewRef = useRef<HTMLVideoElement>(null);
@@ -762,7 +929,7 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
     setScript({ ...script, beats: reindexBeats(beats, script.manual) }); setSelectedClipIndex(i + 1); setNotice('');
   }
   function deleteSelectedClip() {
-    if (!script || busy) return;
+    if (!script || busy || selectedClipIndex < 0 || selectedClipIndex >= script.beats.length) return;
     if (script.beats.length <= 1) { setNotice('Keep at least one clip. To remove the whole video, close the editor.'); return; }
     const beats = script.beats.filter((_, i) => i !== selectedClipIndex);
     setScript({ ...script, beats: reindexBeats(beats, script.manual) }); setSelectedClipIndex(Math.min(selectedClipIndex, beats.length - 1)); setNotice('');
@@ -807,6 +974,48 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
   // Undo / redo over every edit setting (script, audio layers, text, looks, canvas).
   type EditSnap = { script: RecapScript | null; soundTracks: WyCutAudioTrack[]; textOverlay: string; textPosition: 'top'|'center'|'bottom'; textX: number; textY: number; textScale: number; textRotation: number; emojiOverlay: string; overlayFont: string; effectPreset: string; visualEffect: string; textAnimation: string; transition: string; sticker: string; aspectRatio: '9:16'|'16:9'|'1:1'|'4:5'; cropMode: string; mirrorPreview: boolean; playbackRate: string; adjust: Adjust; clipVolume: number; fadeIn: number; fadeOut: number };
   const editSnap = useMemo<EditSnap>(() => ({ script, soundTracks, textOverlay, textPosition, textX, textY, textScale, textRotation, emojiOverlay, overlayFont, effectPreset, visualEffect, textAnimation, transition, sticker, aspectRatio, cropMode, mirrorPreview, playbackRate, adjust, clipVolume, fadeIn, fadeOut }), [script, soundTracks, textOverlay, textPosition, textX, textY, textScale, textRotation, emojiOverlay, overlayFont, effectPreset, visualEffect, textAnimation, transition, sticker, aspectRatio, cropMode, mirrorPreview, playbackRate, adjust, clipVolume, fadeIn, fadeOut]);
+  // Autosave the editable settings separately from media so changing a filter never rewrites a large video Blob.
+  useEffect(() => {
+    const id = projectIdRef.current;
+    if (!id || !video || busy) return;
+    const timer = window.setTimeout(() => {
+      const editState: Record<string, unknown> = {
+        aspectRatio, applyAspectRatio, quality, playbackRate, fastCut, mirrorPreview, cropMode,
+        textOverlay, textPosition, textX, textY, textScale, textRotation, emojiOverlay, overlayFont,
+        showWatermark, effectPreset, visualEffect, textAnimation, transition, sticker,
+        beatMarkers, keyframes, editorMuted, adjust, clipVolume, fadeIn, fadeOut, overlayMask, chromaKey, manualMaskStrokes, playheadSeconds, selectedClipIndex, timelineZoom, timelineAssetPlacements, timelineProject,
+      };
+      void saveProject(id, { title: title.trim() || video.name.replace(/\.[^.]+$/, ''), mode, sourceName: video.name, sourceSize: video.size, script, recapId, hasSourceTimecodes, editState });
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [video, busy, title, mode, script, recapId, hasSourceTimecodes, aspectRatio, applyAspectRatio, quality, playbackRate, fastCut, mirrorPreview, cropMode, textOverlay, textPosition, textX, textY, textScale, textRotation, emojiOverlay, overlayFont, showWatermark, effectPreset, visualEffect, textAnimation, transition, sticker, beatMarkers, keyframes, editorMuted, adjust, clipVolume, fadeIn, fadeOut, overlayMask, chromaKey, manualMaskStrokes, playheadSeconds, selectedClipIndex, timelineZoom, timelineAssetPlacements, timelineProject]);
+
+  // Persist the source binary only when the selected source changes, not on every editing action.
+  useEffect(() => {
+    const id = projectIdRef.current;
+    if (!id || !video) return;
+    const timer = window.setTimeout(() => { void saveProject(id, { sourceBlob: video, sourceName: video.name, sourceSize: video.size }); }, 250);
+    return () => window.clearTimeout(timer);
+  }, [video]);
+
+  // Store other heavy binary assets once per asset/output change in a separate IndexedDB object store.
+  useEffect(() => {
+    const id = projectIdRef.current;
+    if (!id || !video || busy) return;
+    const timer = window.setTimeout(() => {
+      const generatedOutputBytes = clips.reduce((sum, clip) => sum + clip.size, 0) + (roughCut?.size || 0);
+      const retainGeneratedOutputs = generatedOutputBytes <= 60 * 1024 * 1024;
+      void saveProject(id, {
+        timelineAssetsData: timelineAssets.map(asset => ({ name: asset.name, type: asset.type, blob: asset })),
+        videoOverlayData: videoOverlay ? { name: videoOverlay.name, type: videoOverlay.type, blob: videoOverlay } : null,
+        soundTracksData: soundTracks,
+        clipsData: retainGeneratedOutputs && clips.length ? clips.map(clip => ({ filename: clip.filename, blob: clip.blob, size: clip.size })) : null,
+        roughCutBlob: retainGeneratedOutputs && roughCut ? roughCut : null,
+      });
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [video, busy, timelineAssets, videoOverlay, soundTracks, clips, roughCut]);
+
   const histRef = useRef<{ stack: EditSnap[]; index: number }>({ stack: [], index: -1 });
   const [histState, setHistState] = useState({ canUndo: false, canRedo: false });
   useEffect(() => {
@@ -815,14 +1024,19 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
     const timer = window.setTimeout(() => {
       const cur = h.stack[h.index];
       if (cur && (Object.keys(editSnap) as (keyof EditSnap)[]).every(k => cur[k] === editSnap[k])) return;
-      h.stack = h.stack.slice(0, h.index + 1); h.stack.push(editSnap); if (h.stack.length > 60) h.stack.shift(); h.index = h.stack.length - 1;
+      // Keep the complete history in IndexedDB instead of truncating after 60 edits. IndexedDB supports
+      // structured-clone snapshots (including Blob-backed audio tracks); if the device quota is reached,
+      // the current project state is still autosaved separately and the failure is surfaced by project storage.
+      h.stack = h.stack.slice(0, h.index + 1); h.stack.push(editSnap); h.index = h.stack.length - 1;
       setHistState({ canUndo: h.index > 0, canRedo: false });
+      const projectId = projectIdRef.current;
+      if (projectId) { const media = new Map<string, WyCutAudioTrack>(); for (const snap of h.stack) for (const track of snap.soundTracks) media.set(track.id, track); const stack = h.stack.map(snap => { const { soundTracks, ...rest } = snap; return { ...rest, soundTrackIds: soundTracks.map(track => track.id) }; }); void saveProject(projectId, { editHistory: { version: 1, stack, index: h.index }, editHistoryMediaData: [...media.values()] }); }
     }, 350);
     return () => window.clearTimeout(timer);
   }, [editSnap, video]);
   function applySnap(s: EditSnap) { setScript(s.script); setSoundTracks(s.soundTracks); setTextOverlay(s.textOverlay); setTextPosition(s.textPosition); setTextX(s.textX); setTextY(s.textY); setTextScale(s.textScale); setTextRotation(s.textRotation); setEmojiOverlay(s.emojiOverlay); setOverlayFont(s.overlayFont); setEffectPreset(s.effectPreset); setVisualEffect(s.visualEffect); setTextAnimation(s.textAnimation); setTransition(s.transition); setSticker(s.sticker); setAspectRatio(s.aspectRatio); setCropMode(s.cropMode); setMirrorPreview(s.mirrorPreview); setPlaybackRate(s.playbackRate); setAdjust(s.adjust); setClipVolume(s.clipVolume); setFadeIn(s.fadeIn); setFadeOut(s.fadeOut); }
-  function undoEdit() { const h = histRef.current; if (h.index <= 0) return; h.index -= 1; applySnap(h.stack[h.index]); setHistState({ canUndo: h.index > 0, canRedo: true }); }
-  function redoEdit() { const h = histRef.current; if (h.index >= h.stack.length - 1) return; h.index += 1; applySnap(h.stack[h.index]); setHistState({ canUndo: true, canRedo: h.index < h.stack.length - 1 }); }
+  function undoEdit() { const h = histRef.current; if (h.index <= 0) return; h.index -= 1; applySnap(h.stack[h.index]); setHistState({ canUndo: h.index > 0, canRedo: true }); const id = projectIdRef.current; if (id) { const media = new Map<string, WyCutAudioTrack>(); for (const snap of h.stack) for (const track of snap.soundTracks) media.set(track.id, track); const stack = h.stack.map(snap => { const { soundTracks, ...rest } = snap; return { ...rest, soundTrackIds: soundTracks.map(track => track.id) }; }); void saveProject(id, { editHistory: { version: 1, stack, index: h.index }, editHistoryMediaData: [...media.values()] }); } }
+  function redoEdit() { const h = histRef.current; if (h.index >= h.stack.length - 1) return; h.index += 1; applySnap(h.stack[h.index]); setHistState({ canUndo: true, canRedo: h.index < h.stack.length - 1 }); const id = projectIdRef.current; if (id) { const media = new Map<string, WyCutAudioTrack>(); for (const snap of h.stack) for (const track of snap.soundTracks) media.set(track.id, track); const stack = h.stack.map(snap => { const { soundTracks, ...rest } = snap; return { ...rest, soundTrackIds: soundTracks.map(track => track.id) }; }); void saveProject(id, { editHistory: { version: 1, stack, index: h.index }, editHistoryMediaData: [...media.values()] }); } }
 
   useEffect(() => { const v = previewRef.current; if (v) v.playbackRate = Number(playbackRate) || 1; }, [playbackRate, previewUrl]);
   useEffect(() => { const v = previewRef.current; if (v) v.muted = editorMuted; }, [editorMuted, previewUrl]);
@@ -831,7 +1045,6 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
   function togglePreviewPlay() { const v = previewRef.current; if (!v) return; if (v.paused) { if (v.ended || (Number.isFinite(v.duration) && v.currentTime >= v.duration - 0.05)) v.currentTime = 0; void v.play().catch(() => undefined); } else v.pause(); }
   async function addAudioFromDevice(file?: File) {
     if (!file) return;
-    if (soundTracks.length >= MAX_AUDIO_LAYERS) { setAudioMessage(`You can add up to ${MAX_AUDIO_LAYERS} audio layers. Remove one first.`); setToolSheet('Audio'); return; }
     setAudioBusy(true); setAudioMessage('Reading audio…');
     try { const track = await readDeviceAudioTrack(file, playheadSeconds); setSoundTracks(current => [...current, track]); setSelectedAudioId(track.id); setAudioMessage(`${track.name} added at ${playheadSeconds.toFixed(1)}s.`); }
     catch (error) { setAudioMessage(error instanceof Error ? error.message : 'Could not read this audio file.'); }
@@ -867,8 +1080,10 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
       <div className="mx-auto flex h-full min-h-0 w-full max-w-xl flex-col">
         <EditorTopBar onClose={()=>setCloseConfirm(true)} credits={credits} quality={quality} onQuality={setQuality} exportDisabled={busy||(!script&&!roughCut&&!clips.length)} onExport={()=>void exportToDeviceAndDrive()} />
         <PreviewStage ratio={aspectRatio}>
-          {isStillImage ? <img src={previewUrl} alt="Image being edited" className="h-full w-full" style={{ objectFit: cropMode==='cover'?'cover':'contain', transform: `${mirrorPreview?'scaleX(-1) ':''}scale(${keyframes.length ? ([...keyframes].sort((a,b)=>a.time-b.time).filter(k=>k.time<=playheadSeconds).slice(-1)[0]?.scale||1) : 1}) rotate(${keyframes.length ? ([...keyframes].sort((a,b)=>a.time-b.time).filter(k=>k.time<=playheadSeconds).slice(-1)[0]?.rotation||0) : 0}deg)`, filter: [previewFilterForPlan({filter:effectPreset}),previewEffectForPlan({effect:visualEffect}),previewAdjustForPlan(adjust)].filter(v=>v&&v!=='none').join(' ')||'none' }} /> : <video ref={previewRef} src={previewUrl} controls={false} playsInline className="h-full w-full" style={{ objectFit: cropMode==='cover'?'cover':'contain', transform: (() => { const sorted = [...keyframes].sort((a,b)=>a.time-b.time); let scale = 1, rotation = 0; if (sorted.length) { const before = [...sorted].reverse().find(k=>k.time<=playheadSeconds) || {time:0,scale:1,rotation:0}; const after = sorted.find(k=>k.time>playheadSeconds); if (after && after.time>before.time) { const f=Math.max(0,Math.min(1,(playheadSeconds-before.time)/(after.time-before.time))); scale=before.scale+(after.scale-before.scale)*f; rotation=before.rotation+(after.rotation-before.rotation)*f; } else { scale=before.scale; rotation=before.rotation; } } return `${mirrorPreview?'scaleX(-1) ':''}scale(${scale}) rotate(${rotation}deg)`; })(), filter: [previewFilterForPlan({filter:effectPreset}),previewEffectForPlan({effect:visualEffect}),previewAdjustForPlan(adjust)].filter(v=>v&&v!=='none').join(' ')||'none' }} onPlay={()=>setPreviewPlaying(true)} onPause={()=>setPreviewPlaying(false)} onEnded={()=>setPreviewPlaying(false)} onTimeUpdate={e=>{setPlayheadSeconds(e.currentTarget.currentTime);}} onLoadedMetadata={e=>{e.currentTarget.playbackRate=Number(playbackRate);e.currentTarget.muted=editorMuted;}} />}
-          {videoOverlay && toolSheet === 'Overlay' && <video ref={overlayPreviewRef} src={videoOverlayPreviewUrl} muted playsInline loop className="pointer-events-none absolute inset-0 m-auto h-2/3 w-2/3 object-contain" style={{ opacity: 0.92 }} aria-label="Video overlay preview" />}
+          {isStillImage ? <img src={previewUrl} alt="Image being edited" className="h-full w-full" style={{ objectFit: cropMode==='cover'?'cover':'contain', transform: `${mirrorPreview?'scaleX(-1) ':''}scale(${keyframes.length ? ([...keyframes].sort((a,b)=>a.time-b.time).filter(k=>k.time<=playheadSeconds).slice(-1)[0]?.scale||1) : 1}) rotate(${keyframes.length ? ([...keyframes].sort((a,b)=>a.time-b.time).filter(k=>k.time<=playheadSeconds).slice(-1)[0]?.rotation||0) : 0}deg)`, filter: [previewFilterForPlan({filter:effectPreset}),previewEffectForPlan({effect:visualEffect}),previewAdjustForPlan(adjust)].filter(v=>v&&v!=='none').join(' ')||'none', animation: LIVE_EFFECT_ANIMATIONS[visualEffect] }} /> : <video ref={previewRef} src={previewUrl} controls={false} playsInline className="h-full w-full" style={{ objectFit: cropMode==='cover'?'cover':'contain', transform: (() => { const sorted = [...keyframes].sort((a,b)=>a.time-b.time); let scale = 1, rotation = 0; if (sorted.length) { const before = [...sorted].reverse().find(k=>k.time<=playheadSeconds) || {time:0,scale:1,rotation:0}; const after = sorted.find(k=>k.time>playheadSeconds); if (after && after.time>before.time) { const f=Math.max(0,Math.min(1,(playheadSeconds-before.time)/(after.time-before.time))); scale=before.scale+(after.scale-before.scale)*f; rotation=before.rotation+(after.rotation-before.rotation)*f; } else { scale=before.scale; rotation=before.rotation; } } return `${mirrorPreview?'scaleX(-1) ':''}scale(${scale}) rotate(${rotation}deg)`; })(), filter: [previewFilterForPlan({filter:effectPreset}),previewEffectForPlan({effect:visualEffect}),previewAdjustForPlan(adjust)].filter(v=>v&&v!=='none').join(' ')||'none', animation: LIVE_EFFECT_ANIMATIONS[visualEffect] }} onPlay={()=>setPreviewPlaying(true)} onPause={()=>setPreviewPlaying(false)} onEnded={()=>setPreviewPlaying(false)} onTimeUpdate={e=>{setPlayheadSeconds(e.currentTarget.currentTime);}} onLoadedMetadata={e=>{e.currentTarget.playbackRate=Number(playbackRate);e.currentTarget.muted=editorMuted;}} />}
+          {videoOverlay && <video ref={overlayPreviewRef} src={videoOverlayPreviewUrl} muted playsInline loop className="pointer-events-none absolute inset-0 m-auto h-2/3 w-2/3 object-contain" style={{ opacity: 0.92 }} aria-label="Video overlay preview" />}
+          {timelineAssets.map((asset, index) => { const placement = timelineAssetPlacements[timelineAssetKey(asset)] || { startSeconds: 0, durationSeconds: asset.type.startsWith('image/') ? 5 : videoSeconds || 5 }; return <TimelineAssetPreview key={`${timelineAssetKey(asset)}-${index}`} file={asset} startSeconds={placement.startSeconds} durationSeconds={placement.durationSeconds} playheadSeconds={playheadSeconds} playing={previewPlaying} />; })}
+          {soundTracks.map(track => <TimelineAudioPreview key={track.id} track={track} playheadSeconds={playheadSeconds} playing={previewPlaying} playbackRate={Number(playbackRate)||1} />)}
           {adjust.vignette>0 && <div aria-hidden className="pointer-events-none absolute inset-0" style={{ background: `radial-gradient(ellipse at center, transparent ${Math.round(75-adjust.vignette*0.45)}%, rgba(0,0,0,${(adjust.vignette/100*0.85).toFixed(2)}) 100%)` }} />}
           {(textOverlay||emojiOverlay||sticker||showWatermark) && <div className={`absolute inset-0 flex flex-col items-center justify-center gap-2 p-3 text-center ${toolSheet === 'Text' ? 'pointer-events-auto touch-none' : 'pointer-events-none'}`} onPointerDown={textPointerDown} onPointerMove={textPointerMove} onPointerUp={textPointerUp} onPointerCancel={textPointerUp} style={{ fontFamily: overlayFont }}>
             <div className="absolute flex max-w-full cursor-move flex-col items-center justify-center gap-2" style={{ left: `${textX}%`, top: `${textY}%`, transform: `translate(-50%, -50%) scale(${textScale}) rotate(${textRotation}deg)` }}>
@@ -880,9 +1095,11 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
           </div>}
         </PreviewStage>
         <PlaybackBar playing={previewPlaying} onPlay={togglePreviewPlay} onFullscreen={()=>{const el=previewRef.current?.parentElement; if(el?.requestFullscreen) void el.requestFullscreen().catch(()=>undefined);}} current={script?sourceToEdited(segments,playheadSeconds):playheadSeconds} duration={script?editedLength(segments):videoSeconds} canUndo={histState.canUndo} canRedo={histState.canRedo} onUndo={undoEdit} onRedo={redoEdit} />
-        <Timeline compact={Boolean(toolSheet)} videoRef={previewRef} playing={previewPlaying} duration={videoSeconds} current={playheadSeconds} zoom={timelineZoom} onZoom={setTimelineZoom} onSeek={seekPreview} thumbs={videoThumbs} fps={fps} gaps={gapsOf(segments,videoSeconds)} canCut={Boolean(script)&&!busy&&videoSeconds>0} onTrim={trimClip} onSplit={splitAtPlayhead} onDelete={deleteSelectedClip} onStep={frameStep}
-          clips={script?.beats.map(b=>({start:b.startSeconds,end:b.endSeconds,label:b.title}))||[]} selectedClip={selectedClipIndex} onSelectClip={i=>{setSelectedClipIndex(i);}}
-          audio={soundTracks.map(t=>({id:t.id,name:t.name,start:t.startSeconds,duration:t.durationSeconds}))} selectedAudio={selectedAudioId} onSelectAudio={id=>{setSelectedAudioId(id);setToolSheet('Audio');}} onAddAudio={f=>void addAudioFromDevice(f)} audioBusy={audioBusy}
+        <Timeline compact={Boolean(toolSheet)} videoRef={previewRef} playing={previewPlaying} duration={videoSeconds} current={playheadSeconds} zoom={timelineZoom} onZoom={setTimelineZoom} onSeek={seekPreview} thumbs={videoThumbs} fps={fps} gaps={gapsOf(segments,videoSeconds)} canCut={Boolean(script)&&!busy&&videoSeconds>0} onTrim={trimClip} onSplit={splitAtPlayhead} onDelete={deleteSelectedClip} onStep={frameStep} onOpenTransitions={()=>setToolSheet('Transitions')}
+          clips={script?.beats.map(b=>({start:b.startSeconds,end:b.endSeconds,label:b.title}))||[]} selectedClip={selectedClipIndex} onSelectClip={i=>{setSelectedClipIndex(current => current === i ? -1 : i);setSelectedAudioId('');setSelectedVisualAssetId('');}}
+          onMoveClip={(i, start) => { setScript(current => { if (!current?.beats[i] || !current.beats.length) return current; const beats = [...current.beats]; const [moving] = beats.splice(i, 1); const insertAt = Math.max(0, Math.min(beats.length, beats.findIndex(b => b.startSeconds > start) < 0 ? beats.length : beats.findIndex(b => b.startSeconds > start))); beats.splice(insertAt, 0, moving); let cursor = 0; const next = beats.map(beat => { const length = Math.max(0.01, beat.endSeconds - beat.startSeconds); const shifted = { ...beat, startSeconds: cursor, endSeconds: cursor + length }; cursor += length; return shifted; }); return { ...current, beats: next }; }); }}
+          audio={soundTracks.map(t=>({id:t.id,name:t.name,start:t.startSeconds,duration:t.durationSeconds}))} selectedAudio={selectedAudioId} onSelectAudio={id=>{const next = selectedAudioId === id ? '' : id;setSelectedAudioId(next);setSelectedClipIndex(-1);setSelectedVisualAssetId('');if (next) setToolSheet('Audio');}} onMoveAudio={(id, start) => setSoundTracks(current => current.map(track => track.id === id ? { ...track, startSeconds: Math.min(Math.max(0, start), Math.max(0, videoSeconds - track.durationSeconds)) } : track))} onAddAudio={f=>void addAudioFromDevice(f)} audioBusy={audioBusy}
+          visualAssets={timelineAssets.map(asset=>{const key=timelineAssetKey(asset);const placement=timelineAssetPlacements[key]||{startSeconds:0,durationSeconds:asset.type.startsWith('image/')?5:videoSeconds||5};return {id:key,name:asset.name,kind:asset.type.startsWith('image/')?'image' as const:'video' as const,start:placement.startSeconds,duration:placement.durationSeconds};})} selectedVisualAsset={selectedVisualAssetId} onSelectVisualAsset={id=>{setSelectedVisualAssetId(current=>current===id?'':id);setSelectedAudioId('');setSelectedClipIndex(-1);}} onMoveVisualAsset={(id,start)=>setTimelineAssetPlacements(current=>({...current,[id]:{...(current[id]||{durationSeconds:5}),startSeconds:Math.max(0,Math.min(videoSeconds||3600,start))}}))}
           text={textOverlay} onText={()=>setToolSheet('Text')} sticker={sticker||emojiOverlay} onSticker={()=>setToolSheet('Stickers')} onAddMedia={()=>mediaInputRef.current?.click()}
           rail={<TrackRail muted={editorMuted} onMute={()=>setEditorMuted(v=>!v)} onAI={()=>setAiSheetOpen(true)} busy={busy} />} />
         <input ref={mediaInputRef} type="file" accept="video/*,image/*" multiple disabled={busy} onChange={e=>{addTimelineMedia(e.target.files);e.currentTarget.value='';}} className="sr-only" />
@@ -893,8 +1110,8 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
         {toolSheet ? <ToolSheet title={toolSheet} onClose={()=>setToolSheet('')}>
           {toolSheet==='Audio'
             ? <SoundLibrary tracks={soundTracks} onChange={setSoundTracks} onAdd={f=>void addAudioFromDevice(f)} selectedId={selectedAudioId} onSelect={setSelectedAudioId} maxStart={Math.max(1,videoSeconds)} disabled={busy||audioBusy} message={audioMessage} />
-            : <AdvancedEditorTools section={toolSheet==='Text'?'text':toolSheet==='Stickers'?'stickers':toolSheet==='Effects'?'effects':toolSheet==='Filters'?'filters':toolSheet==='Canvas'?'canvas':toolSheet==='Adjust'?'adjust':toolSheet==='Beat'?'beat':toolSheet==='Keyframe'?'keyframe':toolSheet==='Speed'?'speed':toolSheet==='In/Out'?'inout':toolSheet==='Combo'?'combo':toolSheet==='Overlay'?'overlay':toolSheet==='Captions'?'captions':toolSheet==='Voice'?'voice':'edit'} onSplitAtPlayhead={splitAtPlayhead} onFrameStep={frameStep} fps={fps} videoDuration={videoSeconds} adjust={adjust} onAdjustChange={setAdjust} clipVolume={clipVolume} onClipVolumeChange={setClipVolume} fadeIn={fadeIn} onFadeInChange={setFadeIn} fadeOut={fadeOut} onFadeOutChange={setFadeOut} script={script} onScriptChange={setScript} selected={selectedClipIndex} onSelect={setSelectedClipIndex} watermark={showWatermark} onWatermarkChange={setShowWatermark} mirror={mirrorPreview} onMirrorChange={setMirrorPreview} crop={cropMode} onCropChange={setCropMode} textOverlay={textOverlay} onTextOverlayChange={setTextOverlay} textPosition={textPosition} onTextPositionChange={v=>{setTextPosition(v);setTextY(v==='top'?15:v==='bottom'?85:50);}} textX={textX} onTextXChange={setTextX} textY={textY} onTextYChange={setTextY} textScale={textScale} onTextScaleChange={setTextScale} textRotation={textRotation} onTextRotationChange={setTextRotation} emoji={emojiOverlay} onEmojiChange={setEmojiOverlay} font={overlayFont} onFontChange={setOverlayFont} aspectRatio={aspectRatio} onAspectRatioChange={setAspectRatio} applyAspectRatio={applyAspectRatio} onApplyAspectRatioChange={setApplyAspectRatio} playbackRate={playbackRate} onPlaybackRateChange={setPlaybackRate} thumb={videoThumbs[0]} effectPreset={effectPreset} onEffectPresetChange={setEffectPreset} visualEffect={visualEffect} onVisualEffectChange={setVisualEffect} animation={textAnimation} onAnimationChange={setTextAnimation} transition={transition} onTransitionChange={setTransition} sticker={sticker} onStickerChange={setSticker} playheadSeconds={playheadSeconds} beatMarkers={beatMarkers} onBeatMarkersChange={setBeatMarkers} keyframes={keyframes} onKeyframesChange={setKeyframes} onDownloadCaptions={downloadCaptions} videoOverlayName={videoOverlay?.name || ''} videoOverlayThumb={videoOverlayThumb} onVideoOverlayChange={setVideoOverlay} overlayMask={overlayMask} onOverlayMaskChange={setOverlayMask} chromaKey={chromaKey} onChromaKeyChange={setChromaKey} manualMaskStrokes={manualMaskStrokes} onManualMaskStrokesChange={setManualMaskStrokes} onAiBackgroundRemove={()=>void removeOverlayBackgroundWithAI()} aiRemovingBackground={aiRemovingBackground} disabled={busy} />}
-        </ToolSheet> : <ToolBar active={toolSheet as import('@/components/editor-v42-layout').EditorToolName || ''} onSelect={t=>{setEditorTab(t as typeof editorTab);setToolSheet(t);}} />}
+            : <AdvancedEditorTools section={toolSheet==='Transitions'?'transitions':toolSheet==='Text'?'text':toolSheet==='Stickers'?'stickers':toolSheet==='Effects'?'effects':toolSheet==='Filters'?'filters':toolSheet==='Canvas'?'canvas':toolSheet==='Adjust'?'adjust':toolSheet==='Beat'?'beat':toolSheet==='Keyframe'?'keyframe':toolSheet==='Speed'?'speed':toolSheet==='In/Out'?'inout':toolSheet==='Combo'?'combo':toolSheet==='Overlay'?'overlay':toolSheet==='Captions'?'captions':toolSheet==='Voice'?'voice':'edit'} onSplitAtPlayhead={splitAtPlayhead} onFrameStep={frameStep} fps={fps} videoDuration={videoSeconds} adjust={adjust} onAdjustChange={setAdjust} clipVolume={clipVolume} onClipVolumeChange={setClipVolume} fadeIn={fadeIn} onFadeInChange={setFadeIn} fadeOut={fadeOut} onFadeOutChange={setFadeOut} script={script} onScriptChange={setScript} selected={Math.max(0, selectedClipIndex)} onSelect={setSelectedClipIndex} watermark={showWatermark} onWatermarkChange={setShowWatermark} mirror={mirrorPreview} onMirrorChange={setMirrorPreview} crop={cropMode} onCropChange={setCropMode} textOverlay={textOverlay} onTextOverlayChange={setTextOverlay} textPosition={textPosition} onTextPositionChange={v=>{setTextPosition(v);setTextY(v==='top'?15:v==='bottom'?85:50);}} textX={textX} onTextXChange={setTextX} textY={textY} onTextYChange={setTextY} textScale={textScale} onTextScaleChange={setTextScale} textRotation={textRotation} onTextRotationChange={setTextRotation} emoji={emojiOverlay} onEmojiChange={setEmojiOverlay} font={overlayFont} onFontChange={setOverlayFont} aspectRatio={aspectRatio} onAspectRatioChange={setAspectRatio} applyAspectRatio={applyAspectRatio} onApplyAspectRatioChange={setApplyAspectRatio} playbackRate={playbackRate} onPlaybackRateChange={setPlaybackRate} thumb={videoThumbs[0]} effectPreset={effectPreset} onEffectPresetChange={setEffectPreset} visualEffect={visualEffect} onVisualEffectChange={setVisualEffect} animation={textAnimation} onAnimationChange={setTextAnimation} transition={transition} onTransitionChange={setTransition} sticker={sticker} onStickerChange={setSticker} playheadSeconds={playheadSeconds} beatMarkers={beatMarkers} onBeatMarkersChange={setBeatMarkers} keyframes={keyframes} onKeyframesChange={setKeyframes} onDownloadCaptions={downloadCaptions} videoOverlayName={videoOverlay?.name || ''} videoOverlayThumb={videoOverlayThumb} onVideoOverlayChange={setVideoOverlay} overlayMask={overlayMask} onOverlayMaskChange={setOverlayMask} chromaKey={chromaKey} onChromaKeyChange={setChromaKey} manualMaskStrokes={manualMaskStrokes} onManualMaskStrokesChange={setManualMaskStrokes} onAiBackgroundRemove={()=>void removeOverlayBackgroundWithAI()} aiRemovingBackground={aiRemovingBackground} disabled={busy} />}
+        </ToolSheet> : <ToolBar active={toolSheet as import('@/components/editor-v42-layout').EditorToolName || ''} context={selectedAudioId ? 'audio' : (selectedClipIndex >= 0 || Boolean(selectedVisualAssetId)) ? 'video' : 'none'} onSelect={t=>{setEditorTab(t as typeof editorTab);setToolSheet(t);}} />}
       </div>
     </div>}
     {durationPromptOpen && <div role="dialog" aria-modal="true" aria-labelledby="target-duration-title" className="fixed inset-0 z-[80] grid place-items-center bg-black/80 p-4"><section className="w-full max-w-md rounded-3xl border border-violet-400/30 bg-[#111521] p-5 shadow-2xl sm:p-6"><div className="flex items-start justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-widest text-violet-300">AI recap cut</p><h2 id="target-duration-title" className="mt-1 text-xl font-black">How long should the finished recap be?</h2></div><button type="button" aria-label="Close duration prompt" onClick={()=>setDurationPromptOpen(false)} className="grid h-9 w-9 place-items-center rounded-xl bg-white/5"><X size={18}/></button></div><p className="mt-2 text-sm leading-6 text-slate-300">Choose the target runtime. WyCut will ask AI to select timestamped scenes whose combined duration is as close as possible to your target, then you can cut them locally.</p><label className="mt-4 block text-sm font-semibold">Desired duration (minutes)<input autoFocus type="number" inputMode="numeric" min={1} max={60} step={1} value={targetMinutes} onChange={e=>setTargetMinutes(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'){const n=Number(targetMinutes);if(n>=1&&n<=60){setDurationPromptOpen(false);void generateScript(n);}}}} className="mt-2 h-14 w-full rounded-xl border border-white/15 bg-black/30 px-4 text-lg font-bold text-white outline-none focus:border-violet-400"/><span className="mt-1 block text-xs text-slate-400">1–60 minutes. Scene boundaries follow source subtitles when timestamps are available; exact duration cannot be guaranteed to the second.</span></label><div className="mt-5 grid grid-cols-2 gap-2"><button type="button" onClick={()=>setDurationPromptOpen(false)} className="min-h-12 rounded-xl border border-white/15 px-4 text-sm font-bold">Cancel</button><button type="button" onClick={()=>{const n=Number(targetMinutes);if(!Number.isFinite(n)||n<1||n>60){setNotice('Enter a target duration from 1 to 60 whole minutes.');return;}setDurationPromptOpen(false);void generateScript(n);}} className="min-h-12 rounded-xl bg-violet-500 px-4 text-sm font-black">Generate for {Math.max(1,Math.min(60,Math.floor(Number(targetMinutes)||5)))} min</button></div></section></div>}
@@ -913,7 +1130,7 @@ export function DashboardWorkspace({ initialFlow = 'file' }: { initialFlow?: Sou
           <label className="flex items-start gap-2 text-xs leading-5 text-slate-300"><input type="checkbox" checked={fastCut} disabled={busy} onChange={e=>setFastCut(e.target.checked)} className="mt-1 accent-violet-400"/><span><strong>Fast cut</strong> <span className="text-slate-500">Copies the video without re-encoding. Quicker, but a clip can start up to a couple of seconds early. Leave off for exact, frame-accurate cuts.</span></span></label>
           <div className="grid grid-cols-2 gap-2"><button type="button" onClick={()=>void connectDrive()} className="min-h-12 rounded-xl border border-white/10 px-3 text-sm font-bold"><Cloud size={14} className={`mr-1 inline ${driveToken?'text-emerald-300':''}`}/>{driveToken?'Reconnect Drive':'Connect Drive'}</button>{driveFolder?<button type="button" onClick={()=>void openDriveFolder()} className="min-h-12 rounded-xl border border-white/10 px-3 text-sm font-bold text-emerald-300">Open Drive folder</button>:<span/>}</div>
         </div>
-        {timelineAssets.length>0 && <div className="space-y-1.5 border-t border-white/10 pt-3"><p className="text-xs font-semibold text-slate-400">Added media</p>{timelineAssets.map((asset,i)=><div key={`${asset.name}-${i}`} className="flex items-center gap-2 rounded-xl bg-black/20 p-2"><span className="grid h-8 w-8 place-items-center rounded-lg bg-violet-500/15 text-violet-200">{asset.type.startsWith('image/')?<ImageIcon size={16}/>:<Film size={16}/>}</span><span className="min-w-0 flex-1 truncate text-xs">{asset.name}</span><button type="button" disabled={busy} onClick={()=>setTimelineAssets(current=>current.filter((_,j)=>j!==i))} aria-label={`Remove ${asset.name}`} className="grid h-9 w-9 place-items-center text-red-300">×</button></div>)}</div>}
+        {timelineAssets.length>0 && <div className="space-y-2 border-t border-white/10 pt-3"><p className="text-xs font-semibold text-slate-400">Video / image timeline clips · exported as overlays</p>{timelineAssets.map((asset,i)=>{const key=timelineAssetKey(asset);const placement=timelineAssetPlacements[key]||{startSeconds:0,durationSeconds:asset.type.startsWith('image/')?5:videoSeconds||5};return <div key={`${key}-${i}`} className="rounded-xl bg-black/20 p-2"><div className="flex items-center gap-2"><span className="grid h-8 w-8 place-items-center rounded-lg bg-violet-500/15 text-violet-200">{asset.type.startsWith('image/')?<ImageIcon size={16}/>:<Film size={16}/>}</span><span className="min-w-0 flex-1 truncate text-xs">{asset.name}</span><button type="button" disabled={busy} onClick={()=>{setTimelineAssets(current=>current.filter((_,j)=>j!==i));setTimelineAssetPlacements(current=>{const next={...current};delete next[key];return next;});}} aria-label={`Remove ${asset.name}`} className="grid h-9 w-9 place-items-center text-red-300">×</button></div><div className="mt-2 grid grid-cols-2 gap-2"><label className="text-[10px] text-slate-400">Start (seconds)<input type="number" min="0" max={Math.max(0,videoSeconds)} step="0.1" disabled={busy} value={placement.startSeconds} onChange={e=>setTimelineAssetPlacements(current=>({...current,[key]:{...placement,startSeconds:Math.max(0,Math.min(videoSeconds||3600,Number(e.target.value)||0))}}))} className="mt-1 w-full rounded-lg border border-white/10 bg-black/30 px-2 py-2 text-xs text-white" /></label><label className="text-[10px] text-slate-400">Duration (seconds)<input type="number" min="0.1" max={Math.max(0.1,videoSeconds||3600)} step="0.1" disabled={busy} value={placement.durationSeconds} onChange={e=>setTimelineAssetPlacements(current=>({...current,[key]:{...placement,durationSeconds:Math.max(0.1,Math.min(videoSeconds||3600,Number(e.target.value)||0.1))}}))} className="mt-1 w-full rounded-lg border border-white/10 bg-black/30 px-2 py-2 text-xs text-white" /></label></div></div>})}</div>}
         {clips.length>0 && <div className="space-y-1.5 border-t border-white/10 pt-3"><p className="text-xs font-semibold text-slate-400">Cut clips</p>{clips.map((clip,i)=><div key={clip.filename} className="flex items-center justify-between gap-2 rounded-xl bg-black/20 p-2"><span className="min-w-0 truncate text-xs text-slate-300">{i+1}. {(clip.size/1024/1024).toFixed(1)} MB</span><button type="button" onClick={()=>void downloadFile(clip.blob,clip.filename)} className="min-h-9 rounded-lg bg-white/10 px-3 text-xs">Save clip</button></div>)}</div>}
       </div>
     </AIQuickSheet>
